@@ -6,6 +6,8 @@ use std::time::Instant;
 use clap::{Parser, ValueEnum};
 use serde::Serialize;
 
+const PROTOCOL_VERSION: u8 = 1;
+
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Dialect {
     Warframe,
@@ -35,6 +37,10 @@ struct Cli {
     #[arg(long, value_name = "FORMAT", value_parser = ["json"])]
     diagnostics: Option<String>,
 
+    /// Describe the machine interface as JSON and exit.
+    #[arg(long)]
+    describe: bool,
+
     #[arg(long)]
     dont_reuse_var: bool,
 
@@ -58,9 +64,32 @@ struct Diagnostic<'a> {
     error: Option<&'a str>,
 }
 
+#[derive(Serialize)]
+struct Description {
+    protocol: u8,
+    tool: &'static str,
+    version: &'static str,
+    dialects: [&'static str; 2],
+    diagnostics: [&'static str; 1],
+}
+
 fn main() {
     luau_lifter::install_quiet_panic_hook();
     let cli = Cli::parse();
+    if cli.describe {
+        let description = Description {
+            protocol: PROTOCOL_VERSION,
+            tool: "wf-luau-decompiler",
+            version: env!("CARGO_PKG_VERSION"),
+            dialects: ["warframe", "luau"],
+            diagnostics: ["json"],
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&description).expect("static description must serialize")
+        );
+        return;
+    }
     let started = Instant::now();
     let dialect = match cli.dialect {
         Dialect::Warframe => "warframe",
@@ -131,7 +160,7 @@ fn emit_diagnostic(
         return;
     }
     let diagnostic = Diagnostic {
-        protocol: 1,
+        protocol: PROTOCOL_VERSION,
         tool: "wf-luau-decompiler",
         version: env!("CARGO_PKG_VERSION"),
         ok: error.is_none(),

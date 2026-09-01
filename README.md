@@ -14,6 +14,7 @@ standard error:
 ```sh
 wf-luau-decompiler normalized.wflu
 wf-luau-decompiler - --diagnostics json < normalized.wflu
+wf-luau-decompiler --describe
 ```
 
 Resource extraction and build-specific opcode mapping remain outside this

@@ -1,8 +1,8 @@
-use super::{function::Function, list::parse_list, parse_string};
-use nom::{IResult, bytes::complete::take};
+use super::{Dialect, function::Function, list::parse_list, parse_string};
 use nom::character::complete::char;
 use nom::multi::many_till;
 use nom::number::complete::le_u8;
+use nom::{IResult, bytes::complete::take};
 use nom_leb128::leb128_usize;
 
 #[derive(Debug)]
@@ -14,7 +14,12 @@ pub struct Chunk {
 }
 
 impl Chunk {
-    pub(crate) fn parse(input: &[u8], encode_key: u8, version: u8) -> IResult<&[u8], Self> {
+    pub(crate) fn parse(
+        input: &[u8],
+        encode_key: u8,
+        version: u8,
+        dialect: Dialect,
+    ) -> IResult<&[u8], Self> {
         let (input, types_version) = if version >= 4 {
             le_u8(input)?
         } else {
@@ -34,7 +39,7 @@ impl Chunk {
         };
         let (input, functions) = parse_list(input, |i| {
             if version < 12 {
-                return Function::parse(i, encode_key, version);
+                return Function::parse(i, encode_key, version, dialect);
             }
 
             // v12+ prefixes every prototype with its exact encoded size. Parse
@@ -48,7 +53,7 @@ impl Chunk {
                 )));
             }
             let (rest, proto) = take(proto_size)(input)?;
-            let (unconsumed, function) = Function::parse(proto, encode_key, version)?;
+            let (unconsumed, function) = Function::parse(proto, encode_key, version, dialect)?;
             // A declared size smaller than the known proto body is rejected by
             // Function::parse above. Any remaining bytes are unknown extension
             // fields and are intentionally skipped at the proto boundary.

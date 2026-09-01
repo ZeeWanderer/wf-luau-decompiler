@@ -349,7 +349,7 @@ impl<'a> Lifter<'a> {
                     }
                     OpCode::LOP_GETGLOBAL => {
                         let value = self.register(a as _);
-                        let global_name = self.constant(aux as _).into_string().unwrap();
+                        let global_name = self.constant_name(aux as _);
                         statements.push(
                             ast::Assign::new(
                                 vec![value.into()],
@@ -360,7 +360,7 @@ impl<'a> Lifter<'a> {
                     }
                     OpCode::LOP_SETGLOBAL => {
                         let value = self.register(a as _);
-                        let global_name = self.constant(aux as _).into_string().unwrap();
+                        let global_name = self.constant_name(aux as _);
                         statements.push(
                             ast::Assign::new(
                                 vec![ast::Global::new(global_name).into()],
@@ -864,12 +864,9 @@ impl<'a> Lifter<'a> {
                         let target = self.register(a as _);
                         let import_len = (aux >> 30) & 3;
                         assert!(import_len <= 3);
-                        let mut import_expression: ast::RValue = ast::Global::new(
-                            self.constant(((aux >> 20) & 1023) as usize)
-                                .into_string()
-                                .unwrap(),
-                        )
-                        .into();
+                        let mut import_expression: ast::RValue =
+                            ast::Global::new(self.constant_name(((aux >> 20) & 1023) as usize))
+                                .into();
                         if import_len > 1 {
                             import_expression = ast::Index::new(
                                 import_expression,
@@ -1519,6 +1516,7 @@ impl<'a> Lifter<'a> {
         {
             BytecodeConstant::Nil => ast::Literal::Nil,
             BytecodeConstant::Boolean(v) => ast::Literal::Boolean(*v),
+            BytecodeConstant::Atom(v) => ast::Literal::String(atom_name(*v)),
             BytecodeConstant::Number(v) => ast::Literal::Number(*v),
             BytecodeConstant::String(v) => {
                 // A string-constant index of 0 is the "no string" sentinel (the
@@ -1542,6 +1540,15 @@ impl<'a> Lifter<'a> {
             .clone()
     }
 
+    fn constant_name(&self, index: usize) -> Vec<u8> {
+        match self.function_list[self.function.id].constants.get(index) {
+            Some(BytecodeConstant::String(0)) => Vec::new(),
+            Some(BytecodeConstant::String(value)) => self.string_table[*value - 1].clone(),
+            Some(BytecodeConstant::Atom(value)) => atom_name(*value),
+            _ => format!("__wf_constant_{index}").into_bytes(),
+        }
+    }
+
     // Reconstructs an arbitrary constant (including nested constant tables) as an
     // rvalue. Used to materialize DUPTABLE templates whose field values are baked
     // into the bytecode constant pool.
@@ -1552,6 +1559,7 @@ impl<'a> Lifter<'a> {
         }
         let shape = match self.function_list[self.function.id].constants.get(index) {
             Some(BytecodeConstant::Boolean(v)) => Shape::Literal(ast::Literal::Boolean(*v)),
+            Some(BytecodeConstant::Atom(v)) => Shape::Literal(ast::Literal::String(atom_name(*v))),
             Some(BytecodeConstant::Number(v)) => Shape::Literal(ast::Literal::Number(*v)),
             Some(BytecodeConstant::Integer(v)) => Shape::Literal(ast::Literal::Number(*v as f64)),
             Some(BytecodeConstant::String(v)) => Shape::Literal(if *v == 0 {
@@ -1622,4 +1630,8 @@ impl<'a> Lifter<'a> {
             Instruction::E { op_code, .. } => matches!(op_code, OpCode::LOP_JUMPX),
         }
     }
+}
+
+fn atom_name(value: u32) -> Vec<u8> {
+    format!("__wf_atom_{value:08x}").into_bytes()
 }

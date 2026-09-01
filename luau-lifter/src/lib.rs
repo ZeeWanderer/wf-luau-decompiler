@@ -34,6 +34,7 @@ use triomphe::Arc;
 
 use std::{collections::BTreeMap, sync::Once};
 
+pub use deserializer::Dialect as BytecodeDialect;
 use deserializer::bytecode::Bytecode;
 
 pub const DONT_REUSE_VAR: u32 = 1 << 0;
@@ -237,8 +238,43 @@ pub fn try_decompile_bytecode_with_options(
     script_name: Option<&str>,
     options: DecompileOptions,
 ) -> Result<String, String> {
-    try_decompile_bytecode_internal(bytecode, encode_key, script_name, options, false)
-        .map(|artifact| artifact.source)
+    try_decompile_bytecode_with_dialect(
+        bytecode,
+        encode_key,
+        script_name,
+        options,
+        BytecodeDialect::Luau,
+    )
+}
+
+pub fn try_decompile_warframe_bytecode_with_options(
+    bytecode: &[u8],
+    script_name: Option<&str>,
+    options: DecompileOptions,
+) -> Result<String, String> {
+    try_decompile_bytecode_with_dialect(
+        bytecode,
+        1,
+        script_name,
+        options,
+        BytecodeDialect::Warframe,
+    )
+}
+
+fn try_decompile_bytecode_with_dialect(
+    bytecode: &[u8],
+    encode_key: u8,
+    script_name: Option<&str>,
+    options: DecompileOptions,
+    dialect: BytecodeDialect,
+) -> Result<String, String> {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        try_decompile_bytecode_internal(bytecode, encode_key, script_name, options, false, dialect)
+    }));
+    match caught {
+        Ok(result) => result.map(|artifact| artifact.source),
+        Err(payload) => Err(format!("panicked: {}", panic_payload_message(&payload))),
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -266,7 +302,14 @@ pub fn try_decompile_bytecode_artifact_with_options(
     script_name: Option<&str>,
     options: DecompileOptions,
 ) -> Result<DecompileArtifact, String> {
-    try_decompile_bytecode_internal(bytecode, encode_key, script_name, options, true)
+    try_decompile_bytecode_internal(
+        bytecode,
+        encode_key,
+        script_name,
+        options,
+        true,
+        BytecodeDialect::Luau,
+    )
 }
 
 fn try_decompile_bytecode_internal(
@@ -275,6 +318,7 @@ fn try_decompile_bytecode_internal(
     script_name: Option<&str>,
     options: DecompileOptions,
     emit_upvalue_analysis: bool,
+    dialect: BytecodeDialect,
 ) -> Result<DecompileArtifact, String> {
     // Reset the per-thread local-id sequence so this decompilation's `RcLocal`
     // ids (and thus the FxHash-iteration order that depends on them, and the
@@ -283,8 +327,8 @@ fn try_decompile_bytecode_internal(
     // even though each file is processed on a single thread. See ast::RcLocal.
     ast::reset_local_ids();
     let deser_timer = prof::Timer::new(&prof::DESER_LIFT);
-    let chunk =
-        deserializer::deserialize(bytecode, encode_key).map_err(|e| format!("deserialize: {e}"))?;
+    let chunk = deserializer::deserialize_with_dialect(bytecode, encode_key, dialect)
+        .map_err(|e| format!("deserialize: {e}"))?;
     match chunk {
         Bytecode::Error(msg) => Ok(DecompileArtifact {
             source: msg,
@@ -1135,6 +1179,46 @@ mod option_tests {
             DONT_REUSE_VAR | NO_SYNTH_HELPERS | ASSUME_NO_NAN
         );
         assert!(DecompileOptions::from_flag_bits(1 << 31).is_none());
+    }
+}
+
+#[cfg(test)]
+mod warframe_fixtures {
+    use super::{DecompileOptions, try_decompile_warframe_bytecode_with_options};
+
+    fn word(opcode: u8, a: u8, b: u8, c: u8) -> [u8; 4] {
+        (u32::from(opcode)
+            | (u32::from(a) << 8)
+            | (u32::from(b) << 16)
+            | (u32::from(c) << 24))
+            .to_le_bytes()
+    }
+
+    #[test]
+    fn decompiles_atom_global_without_panicking() {
+        let mut bytecode = vec![
+            9, 3, // bytecode and type versions
+            0, // strings
+            0, // userdata remaps
+            1, // prototypes
+            1, 0, 0, 0, // stack, parameters, upvalues, vararg
+            0, 0, // flags, type information
+            3, // instruction words
+        ];
+        bytecode.extend(word(7, 0, 0, 0)); // GETGLOBAL R0
+        bytecode.extend(0u32.to_le_bytes()); // constant index
+        bytecode.extend(word(22, 0, 2, 0)); // RETURN R0
+        bytecode.extend([1, 1]); // one constant, tag 1
+        bytecode.extend(0x2fdd25fcu32.to_le_bytes());
+        bytecode.extend([0, 0, 0, 0, 0, 0]); // children through main prototype
+
+        let source = try_decompile_warframe_bytecode_with_options(
+            &bytecode,
+            None,
+            DecompileOptions::default(),
+        )
+        .unwrap();
+        assert!(source.contains("__wf_atom_2fdd25fc"));
     }
 }
 

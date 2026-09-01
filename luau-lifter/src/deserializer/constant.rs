@@ -5,6 +5,8 @@ use nom::{
 };
 use nom_leb128::leb128_usize;
 
+use super::Dialect;
+
 const CONSTANT_NIL: u8 = 0;
 const CONSTANT_BOOLEAN: u8 = 1;
 const CONSTANT_NUMBER: u8 = 2;
@@ -23,6 +25,7 @@ const CONSTANT_VECTORD: u8 = 11;
 pub enum Constant {
     Nil,
     Boolean(bool),
+    Atom(u32),
     Number(f64),
     String(usize),
     Import(usize),
@@ -37,14 +40,24 @@ pub enum Constant {
 }
 
 impl Constant {
-    pub(crate) fn parse(input: &[u8], version: u8) -> IResult<&[u8], Self> {
+    pub(crate) fn parse(input: &[u8], version: u8, dialect: Dialect) -> IResult<&[u8], Self> {
         let (input, tag) = le_u8(input)?;
         match tag {
             CONSTANT_NIL => Ok((input, Constant::Nil)),
-            CONSTANT_BOOLEAN => {
-                let (input, value) = le_u8(input)?;
-                Ok((input, Constant::Boolean(value != 0u8)))
-            }
+            CONSTANT_BOOLEAN => match dialect {
+                Dialect::Luau => {
+                    let (input, value) = le_u8(input)?;
+                    Ok((input, Constant::Boolean(value != 0)))
+                }
+                Dialect::Warframe => {
+                    let (input, value) = le_u32(input)?;
+                    if value <= 1 {
+                        Ok((input, Constant::Boolean(value != 0)))
+                    } else {
+                        Ok((input, Constant::Atom(value)))
+                    }
+                }
+            },
             CONSTANT_NUMBER => {
                 let (input, value) = le_f64(input)?;
                 Ok((input, Constant::Number(value)))
@@ -121,5 +134,33 @@ impl Constant {
                 nom::error::ErrorKind::Verify,
             ))),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Constant, Dialect};
+
+    #[test]
+    fn luau_boolean_uses_one_byte_payload() {
+        let (rest, constant) = Constant::parse(&[1, 1, 0xaa], 9, Dialect::Luau).unwrap();
+        assert!(matches!(constant, Constant::Boolean(true)));
+        assert_eq!(rest, &[0xaa]);
+    }
+
+    #[test]
+    fn warframe_boolean_uses_four_byte_payload() {
+        let (rest, constant) =
+            Constant::parse(&[1, 1, 0, 0, 0, 0xaa], 9, Dialect::Warframe).unwrap();
+        assert!(matches!(constant, Constant::Boolean(true)));
+        assert_eq!(rest, &[0xaa]);
+    }
+
+    #[test]
+    fn warframe_non_boolean_tag_one_is_atom() {
+        let (rest, constant) =
+            Constant::parse(&[1, 0xfc, 0x25, 0xdd, 0x2f, 0xaa], 9, Dialect::Warframe).unwrap();
+        assert!(matches!(constant, Constant::Atom(0x2fdd25fc)));
+        assert_eq!(rest, &[0xaa]);
     }
 }

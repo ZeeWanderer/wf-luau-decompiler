@@ -5,6 +5,7 @@ use nom::{
 use nom_leb128::leb128_usize;
 
 use super::{
+    Dialect,
     constant::Constant,
     list::{parse_list, parse_list_len},
 };
@@ -128,7 +129,12 @@ impl Function {
         Ok(v)
     }
 
-    pub(crate) fn parse(input: &[u8], encode_key: u8, version: u8) -> IResult<&[u8], Self> {
+    pub(crate) fn parse(
+        input: &[u8],
+        encode_key: u8,
+        version: u8,
+        dialect: Dialect,
+    ) -> IResult<&[u8], Self> {
         let (input, max_stack_size) = le_u8(input)?;
         let (input, num_parameters) = le_u8(input)?;
         let (input, num_upvalues) = le_u8(input)?;
@@ -149,7 +155,7 @@ impl Function {
             Self::parse_instructions(&u32_instructions, encode_key).map_err(|_| {
                 nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
             })?;
-        let (input, constants) = parse_list(input, |i| Constant::parse(i, version))?;
+        let (input, constants) = parse_list(input, |i| Constant::parse(i, version, dialect))?;
         let (input, functions) = parse_list(input, leb128_usize)?;
         let (input, line_defined) = leb128_usize(input)?;
         let (input, function_name) = leb128_usize(input)?;
@@ -291,7 +297,7 @@ impl Function {
 
 #[cfg(test)]
 mod tests {
-    use super::Function;
+    use super::{Dialect, Function};
 
     fn leb128(mut value: usize) -> Vec<u8> {
         let mut out = Vec::new();
@@ -329,7 +335,8 @@ mod tests {
         bytes.extend(leb128(3));
         bytes.extend(leb128(4));
 
-        let (rest, function) = Function::parse(&bytes, 1, 9).expect("function must parse");
+        let (rest, function) =
+            Function::parse(&bytes, 1, 9, Dialect::Luau).expect("function must parse");
         assert!(rest.is_empty());
         assert_eq!(function.debug_locals.len(), 1);
         let local = &function.debug_locals[0];
@@ -346,7 +353,7 @@ mod tests {
         bytes.extend(leb128(0)); // type info
         bytes.extend(leb128(0)); // instruction count
 
-        assert!(Function::parse(&bytes, 1, 9).is_err());
+        assert!(Function::parse(&bytes, 1, 9, Dialect::Luau).is_err());
     }
 
     #[test]
@@ -373,6 +380,6 @@ mod tests {
         bytes.push(1); // has line info
         bytes.push(u8::MAX); // invalid shift amount
 
-        assert!(Function::parse(&bytes, 1, 9).is_err());
+        assert!(Function::parse(&bytes, 1, 9, Dialect::Luau).is_err());
     }
 }

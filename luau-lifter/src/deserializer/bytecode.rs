@@ -1,6 +1,6 @@
 use nom::{IResult, bytes::complete::take, number::complete::le_u8};
 
-use super::chunk::Chunk;
+use super::{Dialect, chunk::Chunk};
 
 #[derive(Debug)]
 pub enum Bytecode {
@@ -9,7 +9,7 @@ pub enum Bytecode {
 }
 
 impl Bytecode {
-    pub fn parse(input: &[u8], encode_key: u8) -> IResult<&[u8], Bytecode> {
+    pub fn parse(input: &[u8], encode_key: u8, dialect: Dialect) -> IResult<&[u8], Bytecode> {
         let (input, status_code) = le_u8(input)?;
         match status_code {
             0 => {
@@ -24,7 +24,7 @@ impl Bytecode {
             // and a per-proto feedback-vector section; v12 adds size-prefixed
             // prototypes and v13 adds double-precision vector constants.
             4..=13 => {
-                let (input, chunk) = Chunk::parse(input, encode_key, status_code)?;
+                let (input, chunk) = Chunk::parse(input, encode_key, status_code, dialect)?;
                 Ok((input, Bytecode::Chunk(chunk)))
             }
             _ => Err(nom::Err::Failure(nom::error::Error::new(

@@ -1,5 +1,24 @@
 # Tovek
 
+## Warframe fork
+
+This fork adds a narrow `wf-luau-decompiler` frontend for opcode-normalized
+Warframe Luau. Warframe stores four-byte values under constant tag 1; values
+other than 0 and 1 are preserved as atom identifiers instead of being coerced
+into ordinary Luau booleans or numbers.
+
+`wf-luau-decompiler` reads a file or standard input, writes reconstructed source
+to standard output, and can write one protocol-versioned JSON diagnostic to
+standard error:
+
+```sh
+wf-luau-decompiler normalized.wflu
+wf-luau-decompiler - --diagnostics json < normalized.wflu
+```
+
+Resource extraction and build-specific opcode mapping remain outside this
+project. The upstream Tovek behavior and interfaces remain available below.
+
 **A high-readability, high-performance Luau decompiler.** `v0.9.0-beta`
 
 [**💬 Join the Tovek Discord →**](https://discord.gg/phY6VUDSF7)

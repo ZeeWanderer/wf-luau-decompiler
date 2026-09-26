@@ -261,6 +261,29 @@ pub fn try_decompile_warframe_bytecode_with_options(
     )
 }
 
+pub fn try_decompile_warframe_bytecode_with_symbols(
+    bytecode: &[u8],
+    script_name: Option<&str>,
+    options: DecompileOptions,
+    symbols: &BTreeMap<u32, String>,
+) -> Result<String, String> {
+    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        try_decompile_bytecode_internal(
+            bytecode,
+            1,
+            script_name,
+            options,
+            false,
+            BytecodeDialect::Warframe,
+            symbols,
+        )
+    }));
+    match caught {
+        Ok(result) => result.map(|artifact| artifact.source),
+        Err(payload) => Err(format!("panicked: {}", panic_payload_message(&payload))),
+    }
+}
+
 fn try_decompile_bytecode_with_dialect(
     bytecode: &[u8],
     encode_key: u8,
@@ -269,7 +292,15 @@ fn try_decompile_bytecode_with_dialect(
     dialect: BytecodeDialect,
 ) -> Result<String, String> {
     let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        try_decompile_bytecode_internal(bytecode, encode_key, script_name, options, false, dialect)
+        try_decompile_bytecode_internal(
+            bytecode,
+            encode_key,
+            script_name,
+            options,
+            false,
+            dialect,
+            &BTreeMap::new(),
+        )
     }));
     match caught {
         Ok(result) => result.map(|artifact| artifact.source),
@@ -309,6 +340,7 @@ pub fn try_decompile_bytecode_artifact_with_options(
         options,
         true,
         BytecodeDialect::Luau,
+        &BTreeMap::new(),
     )
 }
 
@@ -319,6 +351,7 @@ fn try_decompile_bytecode_internal(
     options: DecompileOptions,
     emit_upvalue_analysis: bool,
     dialect: BytecodeDialect,
+    symbols: &BTreeMap<u32, String>,
 ) -> Result<DecompileArtifact, String> {
     // Reset the per-thread local-id sequence so this decompilation's `RcLocal`
     // ids (and thus the FxHash-iteration order that depends on them, and the
@@ -327,8 +360,21 @@ fn try_decompile_bytecode_internal(
     // even though each file is processed on a single thread. See ast::RcLocal.
     ast::reset_local_ids();
     let deser_timer = prof::Timer::new(&prof::DESER_LIFT);
-    let chunk = deserializer::deserialize_with_dialect(bytecode, encode_key, dialect)
+    let mut chunk = deserializer::deserialize_with_dialect(bytecode, encode_key, dialect)
         .map_err(|e| format!("deserialize: {e}"))?;
+    if let Bytecode::Chunk(chunk) = &mut chunk {
+        use deserializer::constant::Constant;
+        for function in &mut chunk.functions {
+            for constant in &mut function.constants {
+                if let Constant::Atom(hash) = constant {
+                    if let Some(name) = symbols.get(hash) {
+                        chunk.string_table.push(name.as_bytes().to_vec());
+                        *constant = Constant::String(chunk.string_table.len());
+                    }
+                }
+            }
+        }
+    }
     match chunk {
         Bytecode::Error(msg) => Ok(DecompileArtifact {
             source: msg,
@@ -1187,10 +1233,7 @@ mod warframe_fixtures {
     use super::{DecompileOptions, try_decompile_warframe_bytecode_with_options};
 
     fn word(opcode: u8, a: u8, b: u8, c: u8) -> [u8; 4] {
-        (u32::from(opcode)
-            | (u32::from(a) << 8)
-            | (u32::from(b) << 16)
-            | (u32::from(c) << 24))
+        (u32::from(opcode) | (u32::from(a) << 8) | (u32::from(b) << 16) | (u32::from(c) << 24))
             .to_le_bytes()
     }
 
@@ -1219,6 +1262,23 @@ mod warframe_fixtures {
         )
         .unwrap();
         assert!(source.contains("__wf_atom_2fdd25fc"));
+        let named = super::try_decompile_warframe_bytecode_with_symbols(
+            &bytecode,
+            None,
+            DecompileOptions::default(),
+            &std::collections::BTreeMap::from([(0x2fdd25fc, "module".into())]),
+        )
+        .unwrap();
+        assert!(named.contains("return module"), "{named}");
+        assert!(!named.contains("__wf_atom_"));
+        let unrelated = super::try_decompile_warframe_bytecode_with_symbols(
+            &bytecode,
+            None,
+            DecompileOptions::default(),
+            &std::collections::BTreeMap::from([(0x12345678, "print".into())]),
+        )
+        .unwrap();
+        assert_eq!(unrelated, source);
     }
 }
 

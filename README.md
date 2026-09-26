@@ -15,7 +15,13 @@ standard error:
 wf-luau-decompiler normalized.wflu
 wf-luau-decompiler - --diagnostics json < normalized.wflu
 wf-luau-decompiler --describe
+wf-luau-decompiler normalized.wflu --symbol 2fdd25fc=module
 ```
+
+Repeat `--symbol HEX=NAME` for verified atom names. Names are applied to atom
+constants before lifting; unresolved atoms retain their hexadecimal identities.
+Symbol labels are presentation metadata, not proof that native bindings match
+between game versions. `--describe` advertises this as `atom-symbols`.
 
 Resource extraction and build-specific opcode mapping remain outside this
 project. The upstream Tovek behavior and interfaces remain available below.

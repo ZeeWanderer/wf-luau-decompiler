@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::{self, Read};
 use std::path::PathBuf;
@@ -32,6 +33,10 @@ struct Cli {
     /// Optional source name used in reconstructed output.
     #[arg(long)]
     script_name: Option<String>,
+
+    /// Name an atom for source presentation (repeatable, hexadecimal HASH=NAME).
+    #[arg(long = "symbol", value_parser = parse_symbol)]
+    symbols: Vec<(u32, String)>,
 
     /// Emit a versioned JSON result record to standard error.
     #[arg(long, value_name = "FORMAT", value_parser = ["json"])]
@@ -71,6 +76,7 @@ struct Description {
     version: &'static str,
     dialects: [&'static str; 2],
     diagnostics: [&'static str; 1],
+    features: [&'static str; 1],
 }
 
 fn main() {
@@ -83,6 +89,7 @@ fn main() {
             version: env!("CARGO_PKG_VERSION"),
             dialects: ["warframe", "luau"],
             diagnostics: ["json"],
+            features: ["atom-symbols"],
         };
         println!(
             "{}",
@@ -105,11 +112,36 @@ fn main() {
         no_synth_helpers: cli.no_synth_helpers,
         assume_no_nan: cli.assume_no_nan,
     };
+    let mut symbols = BTreeMap::new();
+    for (hash, name) in &cli.symbols {
+        if symbols
+            .insert(*hash, name.clone())
+            .is_some_and(|old| old != *name)
+        {
+            exit_error(
+                &cli,
+                dialect,
+                bytecode.len(),
+                started,
+                "conflicting atom symbols",
+            );
+        }
+    }
+    if matches!(cli.dialect, Dialect::Luau) && !symbols.is_empty() {
+        exit_error(
+            &cli,
+            dialect,
+            bytecode.len(),
+            started,
+            "atom symbols require the Warframe dialect",
+        );
+    }
     let result = match cli.dialect {
-        Dialect::Warframe => luau_lifter::try_decompile_warframe_bytecode_with_options(
+        Dialect::Warframe => luau_lifter::try_decompile_warframe_bytecode_with_symbols(
             &bytecode,
             cli.script_name.as_deref(),
             options,
+            &symbols,
         ),
         Dialect::Luau => luau_lifter::try_decompile_bytecode_with_options(
             &bytecode,
@@ -126,6 +158,24 @@ fn main() {
         }
         Err(error) => exit_error(&cli, dialect, bytecode.len(), started, &error),
     }
+}
+
+fn parse_symbol(value: &str) -> Result<(u32, String), String> {
+    let (hash, name) = value
+        .split_once('=')
+        .ok_or("expected hexadecimal HASH=NAME")?;
+    let hash = u32::from_str_radix(hash.strip_prefix("0x").unwrap_or(hash), 16)
+        .map_err(|_| "invalid hexadecimal atom hash")?;
+    let mut chars = name.bytes();
+    if hash <= 1
+        || !chars
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic() || c == b'_')
+        || !chars.all(|c| c.is_ascii_alphanumeric() || c == b'_')
+    {
+        return Err("expected a non-boolean atom hash and identifier name".into());
+    }
+    Ok((hash, name.into()))
 }
 
 fn read_input(path: &PathBuf) -> Result<Vec<u8>, String> {
@@ -174,5 +224,37 @@ fn emit_diagnostic(
         Err(serialization_error) => {
             eprintln!("error: could not serialize diagnostics: {serialization_error}")
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn atom_symbols_accept_hex_identifiers_but_not_boolean_or_code() {
+        assert_eq!(
+            parse_symbol("0x2fdd25fc=module").unwrap(),
+            (0x2fdd25fc, "module".into())
+        );
+        for value in [
+            "0=false",
+            "1=true",
+            "zz=name",
+            "abcd=",
+            "abcd=a.b",
+            "abcd=print()",
+        ] {
+            assert!(parse_symbol(value).is_err(), "{value}");
+        }
+        let cli = Cli::try_parse_from([
+            "wf-luau-decompiler",
+            "--symbol",
+            "abcd=first",
+            "--symbol",
+            "dcba=second",
+        ])
+        .unwrap();
+        assert_eq!(cli.symbols.len(), 2);
     }
 }

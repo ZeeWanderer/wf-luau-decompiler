@@ -5,21 +5,18 @@ use ast::{
     flatten_guards::flatten_guards,
     local_declarations::LocalDeclarer,
     name_locals::name_locals,
-    replace_locals::replace_locals,
+    link_upvalues::link_upvalues,
     simplify_gotos::{hoist_locals_for_gotos, simplify_gotos},
-    Traverse,
 };
 use by_address::ByAddress;
 use cfg::ssa::{
     self,
-    structuring::{structure_conditionals, structure_jumps, structure_method_calls},
+    structuring::{structure_conditionals, structure_jumps},
 };
-use indexmap::IndexMap;
+use ast::FxIndexMap as IndexMap;
 use lifter::Lifter;
 use parking_lot::Mutex;
-use petgraph::algo::dominators::simple_fast;
-use rayon::iter::ParallelIterator;
-use rayon::prelude::IntoParallelIterator;
+use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 use std::{
     fs::File,
@@ -63,16 +60,40 @@ fn main() -> anyhow::Result<()> {
     input.read_exact(&mut buffer)?;
 
     let start = Instant::now();
-    let chunk = Chunk::parse(&buffer).unwrap().1;
+    let chunk = match Chunk::parse(&buffer) {
+        Ok((_, chunk)) => chunk,
+        Err(error) => anyhow::bail!(
+            "not a supported Lua 5.1 chunk: {:?}",
+            error.map(|error| (buffer.len() - error.input.len(), error.code))
+        ),
+    };
+    let res = decompile(&chunk.function, true)?;
+    let duration = start.elapsed();
+
+    // TODO: use BufWriter?
+    let mut out = File::create(path.with_extension("dec.51.lua").file_name().unwrap())?;
+    writeln!(out, "-- decompiled by Sentinel (took {:?})", duration)?;
+    writeln!(out, "{}", res)?;
+
+    Ok(())
+}
+
+fn decompile(prototype: &lua51_deserializer::Function<'_>, parallel: bool) -> anyhow::Result<String> {
+    ast::reset_local_ids();
     let mut lifted = Vec::new();
-    let (function, upvalues) = Lifter::lift(&chunk.function, &mut lifted);
+    let (function, upvalues) = Lifter::lift(prototype, &mut lifted);
     lifted.push((Arc::<Mutex<_>>::default(), function, upvalues));
     lifted.reverse();
 
-    let (main, ..) = lifted.first().unwrap().clone();
-    let mut upvalues = lifted
-        .into_iter()
-        .map(|(ast_function, mut function, upvalues_in)| {
+    let main = Arc::clone(&lifted.first().unwrap().0);
+    let id_base = ast::current_local_id();
+    let function_count = lifted.len() as u64;
+    const ID_STRIDE: u64 = 1 << 40;
+    type Lifted = (Arc<Mutex<ast::Function>>, cfg::function::Function, Vec<ast::RcLocal>);
+    let process = |(index, (ast_function, mut function, upvalues_in)): (usize, Lifted)| {
+            // Same deterministic disjoint ranges as the Luau pipeline. Rayon
+            // workers can execute functions in any order without sharing IDs.
+            ast::set_local_id_base(id_base + index as u64 * ID_STRIDE);
             let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) =
                 cfg::ssa::construct(&mut function, &upvalues_in);
             let upvalue_to_group = upvalue_in_groups
@@ -98,26 +119,28 @@ fn main() -> anyhow::Result<()> {
             // etc.
             // the macro could also maybe generate an optimal ordering?
             let mut changed = true;
+            let mut dominator_cache = None;
             while changed {
                 changed = false;
 
-                let dominators = simple_fast(function.graph(), function.entry().unwrap());
-                changed |= structure_jumps(&mut function, &dominators);
+                let dominators = dominator_cache.get_or_insert_with(||
+                    cfg::dominators::Dominators::new(function.graph(), function.entry().unwrap()));
+                let topology_changed = structure_jumps(&mut function, dominators);
+                changed |= topology_changed;
 
                 ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
 
-                if structure_conditionals(&mut function)
-                // || {
-                //     let post_dominators = post_dominators(function.graph_mut());
-                //     structure_for_loops(&mut function, &dominators, &post_dominators)
-                // }
-                    || structure_method_calls(&mut function)
-                {
+                let conditionals_changed = structure_conditionals(&mut function, &|local| upvalue_to_group.contains_key(local));
+                if topology_changed || conditionals_changed { dominator_cache = None; }
+                // SELF stays `t.m(t, ...)`: Luau's `t:m(...)` looks the method
+                // up after the arguments run, and through a userdata's
+                // `__namecall`, neither of which Lua 5.1 does.
+                if conditionals_changed {
                     changed = true;
                 }
                 let mut local_map = FxHashMap::default();
                 // TODO: loop until returns false?
-                if ssa::construct::remove_unnecessary_params(&mut function, &mut local_map, None) {
+                if ssa::construct::remove_unnecessary_params(&mut function, &mut local_map, None, None) {
                     changed = true;
                 }
                 ssa::construct::apply_local_map(&mut function, local_map);
@@ -130,9 +153,17 @@ fn main() -> anyhow::Result<()> {
             )
             .destruct();
 
-            let params = std::mem::take(&mut function.parameters);
+            let params = function.parameters.clone();
             let is_variadic = function.is_variadic;
-            let mut lifted = restructure::lift(function);
+            let ignored = upvalues_in.iter().chain(params.iter()).cloned().collect();
+            let mut lifted =
+                match restructure::lift_source_like_attempt_with_ignored_locals(function, &ignored)
+                {
+                    restructure::StructureAttempt::Structured(block) => block,
+                    rejection => anyhow::bail!(
+                        "no proven source representation for Lua 5.1 function: {rejection:?}"
+                    ),
+                };
             simplify_gotos(&mut lifted);
             flatten_guards(&mut lifted);
             let block = Arc::new(lifted.into());
@@ -149,71 +180,74 @@ fn main() -> anyhow::Result<()> {
                 ast_function.parameters = params;
                 ast_function.is_variadic = is_variadic;
             }
-            (ByAddress(ast_function), upvalues_in)
-        })
-        .collect::<FxHashMap<_, _>>();
+            Ok((ByAddress(ast_function), upvalues_in))
+        };
+    // Collect in input order before resolving errors, so the first failed
+    // function is deterministic as well as every successful function's IDs.
+    let results = if parallel && lifted.len() > 1 {
+        lifted.into_par_iter().enumerate().map(process).collect::<Vec<_>>()
+    } else {
+        lifted.into_iter().enumerate().map(process).collect::<Vec<_>>()
+    };
+    ast::set_local_id_base(id_base + function_count * ID_STRIDE);
+    let mut upvalues = results.into_iter().collect::<anyhow::Result<FxHashMap<_, _>>>()?;
 
     let main = ByAddress(main);
     upvalues.remove(&main);
     let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
     link_upvalues(&mut body, &mut upvalues);
     name_locals(&mut body, true);
-    let res = body.to_string();
-    let duration = start.elapsed();
-
-    // TODO: use BufWriter?
-    let mut out = File::create(path.with_extension("dec.51.lua").file_name().unwrap())?;
-    writeln!(out, "-- decompiled by Sentinel (took {:?})", duration)?;
-    writeln!(out, "{}", res)?;
-
-    Ok(())
+    Ok(body.to_string())
 }
 
-fn link_upvalues(
-    body: &mut ast::Block,
-    upvalues: &mut FxHashMap<ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>>,
-) {
-    for stat in &mut body.0 {
-        stat.traverse_rvalues(&mut |rvalue| {
-            if let ast::RValue::Closure(closure) = rvalue {
-                let old_upvalues = upvalues.remove(&closure.function).unwrap();
-                let mut function = closure.function.lock();
-                // TODO: inefficient, try constructing a map of all up -> new up first
-                // and then call replace_locals on main body
-                let mut local_map =
-                    FxHashMap::with_capacity_and_hasher(old_upvalues.len(), Default::default());
-                for (old, new) in
-                    old_upvalues
-                        .iter()
-                        .zip(closure.upvalues.iter().map(|u| match u {
-                            ast::Upvalue::Copy(l) | ast::Upvalue::Ref(l) => l,
-                        }))
-                {
-                    // println!("{} -> {}", old, new);
-                    local_map.insert(old.clone(), new.clone());
+#[cfg(test)]
+mod scheduling_tests {
+    use super::*;
+
+    fn prototype(words: Vec<u32>, children: Vec<Vec<u8>>, upvalues: u8, stack: u8) -> Vec<u8> {
+        let mut bytes = vec![0; 12];
+        bytes.extend([upvalues, 0, 0, stack]);
+        bytes.extend((words.len() as u32).to_le_bytes());
+        bytes.extend(words.into_iter().flat_map(u32::to_le_bytes));
+        bytes.extend(1u32.to_le_bytes());
+        bytes.push(3);
+        bytes.extend(7f64.to_le_bytes());
+        bytes.extend((children.len() as u32).to_le_bytes());
+        for child in children { bytes.extend(child); }
+        bytes.extend([0; 12]); // line positions, debug locals and upvalue names
+        bytes
+    }
+
+    fn captured_child(depth: usize) -> Vec<u8> {
+        if depth == 0 {
+            prototype(vec![4, 30 | (2 << 23)], vec![], 1, 1)
+        } else {
+            // CLOSURE r0 child0; capture parent's UPVAL0; RETURN r0.
+            prototype(vec![36, 4, 30 | (2 << 23)], vec![captured_child(depth - 1)], 1, 1)
+        }
+    }
+
+    #[test]
+    fn closure_capture_source_is_identical_in_serial_and_one_or_four_threads() {
+        for depth in [0, 2, 6] {
+            let mut words = vec![1]; // LOADK r0 7
+            let mut children = Vec::new();
+            for index in 0..5 {
+                words.extend([36 | ((index + 1) << 6) | (index << 14), 0]); // capture r0
+                children.push(captured_child(depth));
+            }
+            words.push(30 | (1 << 6) | (6 << 23)); // return the five closures
+            let bytes = prototype(words, children, 0, 6);
+            let (rest, prototype) = lua51_deserializer::Function::parse(&bytes).unwrap();
+            assert!(rest.is_empty());
+            let serial = decompile(&prototype, false).unwrap();
+            assert!(serial.contains("function"));
+            for threads in [1, 4] {
+                let pool = rayon::ThreadPoolBuilder::new().num_threads(threads).build().unwrap();
+                for _ in 0..3 {
+                    assert_eq!(pool.install(|| decompile(&prototype, true)).unwrap(), serial);
                 }
-                link_upvalues(&mut function.body, upvalues);
-                replace_locals(&mut function.body, &local_map);
             }
-        });
-        match stat {
-            ast::Statement::If(r#if) => {
-                link_upvalues(&mut r#if.then_block.lock(), upvalues);
-                link_upvalues(&mut r#if.else_block.lock(), upvalues);
-            }
-            ast::Statement::While(r#while) => {
-                link_upvalues(&mut r#while.block.lock(), upvalues);
-            }
-            ast::Statement::Repeat(repeat) => {
-                link_upvalues(&mut repeat.block.lock(), upvalues);
-            }
-            ast::Statement::NumericFor(numeric_for) => {
-                link_upvalues(&mut numeric_for.block.lock(), upvalues);
-            }
-            ast::Statement::GenericFor(generic_for) => {
-                link_upvalues(&mut generic_for.block.lock(), upvalues);
-            }
-            _ => {}
         }
     }
 }

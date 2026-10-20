@@ -21,8 +21,9 @@ impl fmt::Display for UnaryOperation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Unary {
+    pub node_origin: crate::node_origins::Origin,
     pub value: Box<RValue>,
     pub operation: UnaryOperation,
 }
@@ -38,6 +39,14 @@ impl SideEffects for Unary {
 }
 
 impl Traverse for Unary {
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        visit(&self.value)
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        visit(&mut self.value)
+    }
+
     fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
         vec![&mut self.value]
     }
@@ -67,7 +76,9 @@ impl Reduce for Unary {
             }
         };
 
-        match (self.value.reduce(), self.operation) {
+        let mut value_box = self.value;
+        let value = std::mem::replace(value_box.as_mut(), Literal::Nil.into()).reduce();
+        match (value, self.operation) {
             (RValue::Literal(Literal::Boolean(value)), UnaryOperation::Not) => {
                 RValue::Literal(Literal::Boolean(!value))
             }
@@ -75,6 +86,7 @@ impl Reduce for Unary {
                 RValue::Unary(Unary {
                     box value,
                     operation: UnaryOperation::Not,
+                    ..
                 }),
                 UnaryOperation::Not,
             ) => ensure_boolean(value.reduce_condition()),
@@ -97,9 +109,11 @@ impl Reduce for Unary {
                     left,
                     right,
                     operation: BinaryOperation::Equal,
+                    ..
                 }),
                 UnaryOperation::Not,
             ) => Binary {
+                node_origin: Default::default(),
                 left,
                 right,
                 operation: BinaryOperation::NotEqual,
@@ -110,9 +124,11 @@ impl Reduce for Unary {
                     left,
                     right,
                     operation: BinaryOperation::NotEqual,
+                    ..
                 }),
                 UnaryOperation::Not,
             ) => Binary {
+                node_origin: Default::default(),
                 left,
                 right,
                 operation: BinaryOperation::Equal,
@@ -123,22 +139,27 @@ impl Reduce for Unary {
                     left,
                     right,
                     operation,
+                    ..
                 }),
                 UnaryOperation::Not,
             ) if (operation == BinaryOperation::And || operation == BinaryOperation::Or)
             // TODO: unnecessary clones
                 && (does_reduce(&Unary {
+                    node_origin: Default::default(),
                     value: left.clone(),
                     operation: UnaryOperation::Not,
                 }.into()) || does_reduce(&Unary {
+                    node_origin: Default::default(),
                     value: right.clone(),
                     operation: UnaryOperation::Not,
                 }.into())) =>
             {
                 ensure_boolean(
                     Binary {
+                        node_origin: Default::default(),
                         left: Box::new(
                             Unary {
+                                node_origin: Default::default(),
                                 value: left,
                                 operation: UnaryOperation::Not,
                             }
@@ -146,6 +167,7 @@ impl Reduce for Unary {
                         ),
                         right: Box::new(
                             Unary {
+                                node_origin: Default::default(),
                                 value: right,
                                 operation: UnaryOperation::Not,
                             }
@@ -160,15 +182,19 @@ impl Reduce for Unary {
                     .reduce_condition(),
                 )
             }
-            (value, operation) => Self {
-                value: Box::new(value),
-                operation,
+            (value, operation) => {
+                *value_box = value;
+                Self { node_origin: Default::default(), value: value_box, operation }.into()
             }
-            .into(),
         }
     }
 
     fn reduce_condition(self) -> RValue {
+        // Only `not` consumes a condition. __unm consumes the original value
+        // and may return any type or raise; retain value-context reduction.
+        if self.operation == UnaryOperation::Negate {
+            return self.reduce();
+        }
         // `#X` evaluates X as a VALUE (not a condition) and, when it succeeds,
         // yields a number — always truthy. But it can run a `__len` metamethod,
         // raise on a non-lengthable X (`#5`, `#nil`), and X itself may have side
@@ -177,7 +203,8 @@ impl Reduce for Unary {
         // that applies; otherwise keep `#X` as the condition. A computed nil/NaN
         // table key can raise even though `has_side_effects()` is false.
         if self.operation == UnaryOperation::Length {
-            let value = self.value.reduce();
+            let mut value_box = self.value;
+            let value = std::mem::replace(value_box.as_mut(), Literal::Nil.into()).reduce();
             return if crate::is_total_pure(&value)
                 && matches!(
                     value,
@@ -185,18 +212,21 @@ impl Reduce for Unary {
                 ) {
                 RValue::Literal(Literal::Boolean(true))
             } else {
+                *value_box = value;
                 Unary {
-                    value: Box::new(value),
+                    node_origin: Default::default(),
+                    value: value_box,
                     operation: UnaryOperation::Length,
-                }
-                .into()
+                }.into()
             };
         }
 
         // TODO: unnecessary clone
         let does_reduce = |r: &RValue| &r.clone().reduce_condition() != r;
 
-        match (self.value.reduce_condition(), self.operation) {
+        let mut value_box = self.value;
+        let value = std::mem::replace(value_box.as_mut(), Literal::Nil.into()).reduce_condition();
+        match (value, self.operation) {
             (RValue::Literal(Literal::Boolean(value)), UnaryOperation::Not) => {
                 RValue::Literal(Literal::Boolean(!value))
             }
@@ -204,6 +234,7 @@ impl Reduce for Unary {
                 RValue::Unary(Unary {
                     box value,
                     operation: UnaryOperation::Not,
+                    ..
                 }),
                 UnaryOperation::Not,
             ) => value.reduce_condition(),
@@ -219,9 +250,11 @@ impl Reduce for Unary {
                     left,
                     right,
                     operation: BinaryOperation::Equal,
+                    ..
                 }),
                 UnaryOperation::Not,
             ) => Binary {
+                node_origin: Default::default(),
                 left,
                 right,
                 operation: BinaryOperation::NotEqual,
@@ -232,9 +265,11 @@ impl Reduce for Unary {
                     left,
                     right,
                     operation: BinaryOperation::NotEqual,
+                    ..
                 }),
                 UnaryOperation::Not,
             ) => Binary {
+                node_origin: Default::default(),
                 left,
                 right,
                 operation: BinaryOperation::Equal,
@@ -245,21 +280,26 @@ impl Reduce for Unary {
                     left,
                     right,
                     operation,
+                    ..
                 }),
                 UnaryOperation::Not,
             ) if (operation == BinaryOperation::And || operation == BinaryOperation::Or)
             // TODO: unnecessary clones
                 && (does_reduce(&Unary {
+                    node_origin: Default::default(),
                     value: left.clone(),
                     operation: UnaryOperation::Not,
                 }.into()) || does_reduce(&Unary {
+                    node_origin: Default::default(),
                     value: right.clone(),
                     operation: UnaryOperation::Not,
                 }.into())) =>
             {
                 Binary {
+                    node_origin: Default::default(),
                     left: Box::new(
                         Unary {
+                            node_origin: Default::default(),
                             value: left,
                             operation: UnaryOperation::Not,
                         }
@@ -267,6 +307,7 @@ impl Reduce for Unary {
                     ),
                     right: Box::new(
                         Unary {
+                            node_origin: Default::default(),
                             value: right,
                             operation: UnaryOperation::Not,
                         }
@@ -280,11 +321,10 @@ impl Reduce for Unary {
                 }
                 .reduce_condition()
             }
-            (value, operation) => Self {
-                value: Box::new(value),
-                operation,
+            (value, operation) => {
+                *value_box = value;
+                Self { node_origin: Default::default(), value: value_box, operation }.into()
             }
-            .into(),
         }
     }
 }
@@ -292,6 +332,7 @@ impl Reduce for Unary {
 impl Unary {
     pub fn new(value: RValue, operation: UnaryOperation) -> Self {
         Self {
+            node_origin: Default::default(),
             value: Box::new(value),
             operation,
         }
@@ -310,21 +351,25 @@ impl Unary {
                         operation: UnaryOperation::Negate,
                         ..
                     })
-                ) || matches!(
-                    *self.value,
-                    RValue::Literal(Literal::Number(value))
-                        if value.is_sign_negative() && !value.is_nan()
-                )))
+                ) || matches!(&*self.value, RValue::Literal(literal) if literal.prints_negated())))
     }
 }
 
 impl LocalRw for Unary {
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.value.visit_local_reads(visit)
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.value.values_read()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.value.visit_local_reads_mut(visit)
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.value.values_read_mut()
+        crate::local::collect_reads_mut(self)
     }
 }
 
@@ -380,10 +425,12 @@ mod tests {
     #[test]
     fn length_of_table_with_dynamic_key_keeps_possible_error() {
         let key = RValue::Local(RcLocal::default());
-        let table = RValue::Table(Table(vec![(
+        let table = RValue::Table(Table::new(vec![(
             Some(key),
             RValue::Literal(Literal::Number(1.0)),
         )]));
         assert!(is_length(&len_condition(table)));
     }
 }
+
+crate::node_origins::semantic_debug!(Unary; value,operation);

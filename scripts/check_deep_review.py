@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""Kiểm tra hồi quy bằng bytecode gốc và source decompile được biên dịch lại."""
+import argparse
+import json
+import pathlib
+import re
+import struct
+import subprocess
+import sys
+
+ROOT = pathlib.Path(__file__).resolve().parent.parent
+CASES = {
+    "math_shadow": ('local math={huge=5,pi=7}; print(math.huge,1/0,math.pi,3.141592653589793)', ''),
+    "math_parameter": ('local function f(math) return 1/0,math end; print(f(42))', ''),
+    "math_global": ('math={huge=5,pi=7}; print(1/0,3.141592653589793)', ''),
+    "vector_shadow": ('local Vector3={new=function() return "fake" end}; print(Vector3.new(),vector.create(1/0,0,0))', ''),
+    "vector_global": ('print(vector.create(1,2,3))', ''),
+    "vector_local": ('local v=vector.create(1,2,3); local vector={create=function() return "fake" end}; print(vector.create(),v)', ''),
+    "format_table": ('print(("%*"):format({}) ~= nil)', ''),
+    "format_method": ('local n=5; print(("x%*y"):format(n):sub(1,1))', ''),
+    "format_index": ('local n=5; print(("x%*y"):format(n)["sub"]("abc",1,1))', ''),
+    "conditional_value": ('return function(a,b,x) local z=x; if a then z=b; if z then return 99 end end; return z end',
+        'for _,a in {false,true} do for _,b in {false,true} do print(a,b,f(a,b,11)) end end'),
+    "numeric_break": ('return function(n,s) for i=1,n,s do break end; return "after" end',
+        'for _,n in {-2,0,1,3,1/0,0/0} do for _,s in {1,-1,0} do print(f(n,s)) end end; local ok=pcall(f,{},1); print(ok)'),
+    "snapshot_return_call": ('return function() local a=1; local function mutate() a=2; return 3 end; local old=a; return mutate(),old end', 'print(f())'),
+    "snapshot_return_operator": ('return function() local a=1; local t=setmetatable({},{__add=function() a=2; return 3 end}); local old=a; return old,t+t,old end', 'print(f())'),
+    "snapshot_return_index": ('return function() local a=1; local t=setmetatable({},{__index=function() a=2; return 3 end}); local old=a; return t.x,old end', 'print(f())'),
+    "snapshot_across_operator": ('return function() local a=1; local t=setmetatable({},{__add=function() a=2; return 3 end}); local old=a; local z=t+t; return old,z,z end', 'print(f())'),
+    "unary_condition_and": ('return function(a) if -(a and 3) then return 7 else return 8 end end', 'for _,a in {true,false,0,2} do local ok,v=pcall(f,a); print(ok,if ok then v else "ERROR") end'),
+    "unary_condition_or": ('return function(a) if -(a or 3) then return 7 else return 8 end end', 'for _,a in {true,false,0,2} do local ok,v=pcall(f,a); print(ok,if ok then v else "ERROR") end'),
+    "api_vector3": ('Vector3={new=function(x,y,z) print("new",x,y,z); return 7 end,zero=99}; print(Vector3.new(0,0,0))', ''),
+    "api_vector2": ('Vector2={new=function(x,y) print("new",x,y); return 7 end,one=99}; print(Vector2.new(1,1))', ''),
+    "api_cframe": ('CFrame={new=function() print("new"); return 7 end,identity=99}; print(CFrame.new())', ''),
+    "interpolation_open_call": ('local function nothing() end; return function() print(("%*"):format(nothing())) end', 'print(pcall(f))'),
+    "interpolation_open_vararg": ('return function(...) print(("%*"):format(...)) end', 'print(pcall(f)); print(pcall(f,1,2))'),
+    "interpolation_rejected_late_specifier": (
+        'return function(value, count) return ("[%*]:%04d"):format(value, count) end',
+        'print(f("value",7)); print(f(false,-2)); local value=setmetatable({},'
+        '{__tostring=function() print("tostring"); return "object" end}); print(f(value,12))'),
+    "interpolation_rejected_late_static_byte": (
+        r'return function(value) return ("[%*]\007"):format(value) end',
+        'for _,value in {"x","界"} do local s=f(value); print(#s,string.byte(s,1,#s)) end'),
+    "interpolation_rejected_too_few_arguments": (
+        'return function(value) return ("%*:%*"):format(value) end',
+        'print(pcall(f,"value")); print(pcall(f,false)); print(pcall(f,nil))'),
+    "interpolation_rejected_too_many_arguments": (
+        'return function(value, extra) return ("[%*]"):format(value, extra) end',
+        'local extra=setmetatable({},{__tostring=function() print("unexpected-extra-tostring"); '
+        'return "extra" end}); print(f("value",extra)); print(f(false,extra)); print(f(nil,extra))'),
+    "interpolation_rejected_nested_scalar_calls": (
+        r'return function(value) return ("%*\007"):format((("%*\007"):format((("%*\007"):format(value))))) end',
+        'for _,value in {"leaf","界"} do local s=f(value); print(#s,string.byte(s,1,#s)) end'),
+    "interpolation_valid_escaped_unicode": (
+        r'return function(value) return ("界`{\\\n\t\r\f}%%:%*"):format(value) end',
+        'for _,value in {"leaf","đ",false} do local s=f(value); print(#s,string.byte(s,1,#s)) end'),
+    "conditional_captured_cell": ('return function(n,flag) local a=n; local read=function() return a end; if flag then a=false; if a then return "bad" end end; return a,read() end', 'for _,n in {1,0,false} do for _,flag in {false,true} do print(n,flag,f(n,flag)) end end'),
+    # Phi copies at the head of the empty loop's step block touch `b`, a cell
+    # `__iter` code may see: moved to the edge from the preparation they
+    # would follow it, which no source spells (typed fuzzer, -g2 names).
+    "step_copies_after_generic_preparation": (
+        'local function record(...) for index = 1, select("#", ...) do end return ... end '
+        'return function(input, flip, ...) local a, b = input, if flip then 1 else -1 '
+        'local function iterate(limit) local index = 0 return function() index += 1 end end '
+        'for w in iterate(0) do end '
+        'for i = 1, 3 do a, b = b, a for j = 1, 2, 0.5 do if (if flip then 0.5 else i) >= record(1e300) then end end end '
+        'if (not flip or flip) and record(not flip) then local function get() return b end cell = -1 end '
+        'return a, b, cell end',
+        'print(f(-3, true)); cell = nil; print(f(2, false))'),
+    # `b`'s first version enters as a phi and `a, b = b, a` writes it again:
+    # a copy taken before the write is no value of the cell's storage
+    # (typed fuzzer, -g2 names; the choice took the cell's register).
+    "cell_version_entering_as_phi": (
+        'return function(input, flip) local a, b = input, if flip then 1 else -1 '
+        'local function bump() return b end local guard = 0 '
+        'while guard < 1 do guard += 1 a, b = b, a print(`<{input}|{(not flip) and a or guard}>`, a) end '
+        'return a, b, bump() end',
+        'print(f(-3, true)); print(f(-3, false)); print(f(false, false))'),
+    "dominator_parallel_loop": ('return function(n,flip) local a,b,c=n,n+1,n+2; for j=1,2 do a,c=b,b+c; if j==2 then a,c=c,a+b; continue end; if flip then a,b=c,a; break end; a=a+1 end; c=c+3; return a,b,c end', 'for _,n in {-2,0,1,2,3,5,9} do for _,flag in {false,true} do print(n,flag,f(n,flag)) end end'),
+    # `debug.info(2, ...)` names the caller, which may be in another
+    # script: code reading it never moves into a helper, whose frame the
+    # caller would become.
+    "debug_info_caller_source": (
+        'local function matches(expected) return debug.info(2, "s") == expected and type(expected) == "string" end '
+        'return {subject = function(expected, fallback) return not (debug.info(2, "s") == expected '
+        'and type(expected) == "string") and fallback or "same" end, '
+        'direct = function(expected) return matches(expected) end}',
+        'local here = debug.info(1, "s"); print(f.subject(here, "different"), f.direct(here))'),
+    "integer_literals": ('return {42i,9007199254740993i,-0x8000000000000000i,9223372036854775807i,-42i,0i,{n=9007199254740993i}}', 'for i=1,6 do local v=f[i]; print(type(v),tostring(v),v==42) end; print(type(f[7].n),tostring(f[7].n))'),
+}
+
+
+def run(command):
+    result = subprocess.run([str(arg) for arg in command], capture_output=True, timeout=60)
+    return {"exit_code": result.returncode,
+            "stdout": result.stdout.decode("utf-8", errors="replace"),
+            "stderr": result.stderr.decode("utf-8", errors="replace")}
+
+
+def normalize(output):
+    output = re.sub(r'(subject|driver):\d+', 'FILE:N', output)
+    return re.sub(r'[^\s:]+\.luau:\d+(?::\d+)?', 'FILE:N', output.replace('\r\n', '\n')).strip()
+
+
+def compile_source(args, source, destination, optimization, debug, integer=False):
+    flags = '--fflags=false,LuauIntegerType2=true' if integer else '--fflags=false'
+    command = [str(args.compiler), '--binary', flags, f'-O{optimization}', f'-g{debug}',
+               '--vector-lib=vector', '--vector-ctor=create', str(source)]
+    result = subprocess.run(command, capture_output=True, timeout=60)
+    destination.write_bytes(result.stdout)
+    if result.returncode:
+        raise RuntimeError(result.stderr.decode(errors='replace'))
+
+
+class Refused(Exception):
+    """The decompiler refused the case with the reason it names."""
+
+
+def check(args, name, source, driver, optimization, debug, bytecode=None, integer=False,
+          output_optimization=None, refusal=None):
+    """`refusal`: a decompile failure naming this reason passes too."""
+    output_optimization = optimization if output_optimization is None else output_optimization
+    suffix = '' if output_optimization == optimization else f'.outO{output_optimization}'
+    directory = args.work / f'{name}.O{optimization}.g{debug}{suffix}'
+    directory.mkdir(parents=True, exist_ok=True)
+    original = directory / 'input.luau'
+    original.write_text(source, encoding='utf-8')
+    driver_source = directory / 'driver.luau'
+    driver_source.write_text(driver, encoding='utf-8')
+    data, output_data, driver_data = [directory / filename for filename in ('input.bc', 'output.bc', 'driver.bc')]
+    evidence = {"ca": name, "toi_uu": optimization, "debug": debug}
+    try:
+        compile_source(args, driver_source, driver_data, 1, 1, integer)
+        if bytecode is None:
+            compile_source(args, original, data, optimization, debug, integer)
+        else:
+            data.write_bytes(bytecode)
+        evidence['goc'] = run([args.vm, data, driver_data])
+        assert evidence['goc']['exit_code'] == 0, evidence['goc']
+        evidence['decompile'] = run([args.lifter, data])
+        if refusal and evidence['decompile']['exit_code'] != 0:
+            assert refusal in evidence['decompile']['stderr'] + evidence['decompile']['stdout'], evidence['decompile']
+            evidence['ket_qua'] = 'PASS'
+            evidence['tu_choi'] = refusal
+            raise Refused
+        assert evidence['decompile']['exit_code'] == 0, evidence['decompile']
+        output_source = directory / 'output.luau'
+        output_source.write_text(evidence['decompile']['stdout'], encoding='utf-8')
+        compile_source(args, output_source, output_data, output_optimization, debug, integer)
+        evidence['sau_sua'] = run([args.vm, output_data, driver_data])
+        assert evidence['sau_sua']['exit_code'] == 0, evidence['sau_sua']
+        assert normalize(evidence['goc']['stdout']) == normalize(evidence['sau_sua']['stdout']), evidence
+        evidence['ket_qua'] = 'PASS'
+    except Refused:
+        pass
+    except (AssertionError, RuntimeError, subprocess.TimeoutExpired) as error:
+        evidence['ket_qua'] = 'FAIL'
+        evidence['loi'] = str(error)
+    (directory / 'result.json').write_text(json.dumps(evidence, ensure_ascii=False, indent=2), encoding='utf-8')
+    print(name, optimization, debug, evidence['ket_qua'], flush=True)
+    return evidence
+
+
+def main():
+    sys.stdout.reconfigure(encoding='utf-8')
+    parser = argparse.ArgumentParser(description=__doc__)
+    for option in ('compiler', 'vm', 'lifter', 'work'):
+        parser.add_argument('--' + option, type=pathlib.Path, required=True)
+    args = parser.parse_args()
+    args.work.mkdir(parents=True, exist_ok=True)
+    results = []
+    for name, (source, driver) in CASES.items():
+        for debug in (0, 2):
+            for optimization in (0, 1, 2):
+                results.append(check(args, name, source, driver, optimization, debug,
+                                     integer=name == 'integer_literals'))
+    for path in sorted((ROOT / '_harness/_bugs').glob('C*.luau')):
+        if '.dec.' in path.name:
+            continue
+        for optimization in (0, 1, 2):
+            results.append(check(args, path.stem, path.read_text(encoding='utf-8-sig'), '', optimization, 1))
+    for name, source, driver in [
+        ('vector_environment', 'return function() return vector.create(1,2,3) end',
+         'getfenv(f).vector={create=function() return "fake" end}; print(type(f()),f())'),
+        ('vector_nested_environment', 'local createVector=7; return function(n) return function() return vector.create(1,2,3),createVector+n end end',
+         'local g=f(2); getfenv(g).vector={create=function() return "fake" end}; print(type(g()),g())'),
+    ]:
+        for output_optimization in (0, 1, 2):
+            results.append(check(args, name, source, driver, 2, 2,
+                                 output_optimization=output_optimization))
+    # A closure with no upvalue left for the constructor, in a script that
+    # replaces `vector` through `_G.getfenv`: the folded constant has no
+    # spelling that ignores the environment.
+    captured = [f'l{i}' for i in range(200)]
+    vector_getfenv_member = (
+        f'return function(...) local {", ".join(captured)} = ... '
+        'return function() _G.getfenv().vector = {create = function() return "fake" end} '
+        f'return vector.create(1, 2, 3), {" + ".join(captured)} end end')
+    for output_optimization in (0, 1, 2):
+        results.append(check(args, 'vector_getfenv_member', vector_getfenv_member,
+                             'local t = {} for i = 1, 200 do t[i] = i end local g = f(table.unpack(t)) '
+                             'local v, n = g() print(type(v), v, n)', 2, 0,
+                             output_optimization=output_optimization,
+                             refusal='headroom for the vector constructor'))
+    def abc(op, a=0, b=0, c=0):
+        return op | (a << 8) | (b << 16) | (c << 24)
+    def chunk(words):
+        return bytes([6,3,0,0,1,3,0,0,0,0,0,len(words)]) + b''.join(struct.pack('<I', word) for word in words) + bytes(7)
+    for name, words, driver in [
+        ('LOADB_skip', [abc(3,b=1,c=1), abc(4,b=5), abc(22,b=2)], 'print(f)'),
+        ('SETLIST_sparse', [abc(53),0,abc(4,a=1,b=42),abc(55,b=1,c=2),5,abc(22,b=2)], 'print(f[1],f[5])'),
+    ]:
+        results.append(check(args, name, '-- Bytecode tu tao: xem script sinh instruction.', driver, 1, 1, chunk(words)))
+    # Both VM loader template tags initialize absent values to number zero.
+    for tag in (5, 8):
+        words = [abc(54, b=1), abc(22, b=2)]
+        data = (bytes([9, 3, 1, 5]) + b'field' + bytes([0, 1, 1, 0, 0, 0, 0, 0, 2])
+                + b''.join(struct.pack('<I', word) for word in words)
+                + bytes([2, 3, 1, tag, 1, 0])
+                + (struct.pack('<i', -1) if tag == 8 else b'') + bytes(6))
+        results.append(check(args, f'table_template_{tag}', '-- VM template with zero field',
+                             'print(f.field,type(f.field))', 1, 1, data))
+    # NAMECALL with a method name no identifier spells (the VM takes any
+    # string): it reads the object and looks the method up after the
+    # arguments, an open last one included, which `object[name](object, ...)`
+    # would not; arguments that reassign a captured object change the call.
+    namecall = ('local o = setmetatable({}, {__index = function(_, k) print("lookup", k) '
+                'return function(self, ...) print("call", ...) return "r1", "r2" end end}) '
+                'local function args() print("arg") return 1, 2 end '
+                'return function() o:bad_nam(args()); print(o:bad_nam(0, args())); o:bad_nam("x") end')
+    namecall_receiver = ('local meta = {__index = function(_, k) return function(self, ...) print("call", self.name, ...) end end} '
+                         'return function() local current = setmetatable({name = "old"}, meta) '
+                         'local function args() current = setmetatable({name = "new"}, meta) return 1, 2 end '
+                         'current:bad_nam(args()); print(current.name) end')
+    # NAMECALL keeps the receiver before the lookup, which an `__index` may
+    # follow by changing the captured object.
+    namecall_lookup_changes_receiver = (
+        'local meta = {} '
+        'return function() local o = setmetatable({name = "old"}, meta) '
+        'local swap = setmetatable({name = "new"}, meta) '
+        'meta.__index = function() o = swap return function(self, ...) print("call", self.name, ...) end end '
+        'local function args() return 1, 2 end o:bad_nam(args()) end')
+    # A global no identifier spells is read from the environment by key,
+    # through the global `getfenv`, which a parameter must not shadow (its
+    # name survives at -g2), and never as a `function` statement's name.
+    global_name = 'return function() return weird_name, 1 end'
+    global_name_shadowed = 'return function(getfenv) return weird_name, getfenv end'
+    global_function_name = 'function weird_name() return 42 end return function() return weird_name() end'
+    # `getfenv(1)["name"]` would call the `getfenv` of the environment the
+    # script installs itself.
+    global_name_environment = (
+        'return function() setfenv(1, {weird_name = 42, '
+        'getfenv = function() return {weird_name = 99} end}) return weird_name end')
+    # A userdata's `__namecall` answers NAMECALL, never an indexed call.
+    namecall_userdata = (
+        'local o = newproxy(true) getmetatable(o).__namecall = function(self, ...) print("namecall", ...) end '
+        'getmetatable(o).__index = function() return function(self, ...) print("index", ...) end end '
+        'return function() o:bad_nam(1, 2) end')
+    # Only `0 / 0` and `-(0 / 0)` spell a NaN; `buffer` shows the payload.
+    nan_payload = 'return function() return 1.25 end'
+    nan_driver = ('local b = buffer.create(8) buffer.writef64(b, 0, f()) '
+                  'print(string.format("%08x%08x", buffer.readu32(b, 4), buffer.readu32(b, 0)))')
+    no_method_spelling = 'a method name no identifier spells'
+    for name, source, driver, spelled, patched, debug, refusal in [
+        ('namecall_name', namecall, 'f()', b'bad_nam', b'bad nam', 1, no_method_spelling),
+        ('namecall_captured_receiver', namecall_receiver, 'f()', b'bad_nam', b'bad nam', 1, no_method_spelling),
+        ('namecall_lookup_changes_receiver', namecall_lookup_changes_receiver, 'f()', b'bad_nam', b'bad nam', 1,
+         no_method_spelling),
+        ('namecall_userdata', namecall_userdata, 'f()', b'bad_nam', b'bad nam', 1, no_method_spelling),
+        ('global_name', global_name, 'getfenv(f)["bad name!!"] = 73; print(f())', b'weird_name', b'bad name!!', 1,
+         None),
+        ('global_name_shadowed', global_name_shadowed, 'getfenv(f)["bad name!!"] = 73; print(f(9))',
+         b'weird_name', b'bad name!!', 2, None),
+        ('global_function_name', global_function_name, 'print(f())', b'weird_name', b'bad name!!', 1, None),
+        ('global_name_environment', global_name_environment, 'print(f())', b'weird_name', b'bad name!!', 1,
+         'a global name no identifier spells'),
+        ('nan_payload', nan_payload, nan_driver, struct.pack('<d', 1.25),
+         struct.pack('<Q', 0x7ff8000000001234), 1, 'a NaN constant whose payload'),
+        # From -O1 `type(x)` runs the builtin by id (FASTCALL); only the
+        # fallback names it, so another name has no source spelling.
+        ('fastcall_renamed_builtin', 'return function(x) return type(x) end', 'print(pcall(f, 1))',
+         b'type', b'typ ', 1, 'a builtin call names another function'),
+        # From -O1 `pairs(t)` prepares a loop that iterates the table itself
+        # with the standard environment, whatever the generator is called.
+        ('forgprep_renamed_pairs', 'return function(t) local n = 0 for _, v in pairs(t) do n += v end return n end',
+         'print(pcall(f, {1, 2}))', b'pairs', b'pai s', 1, 'a loop prepared for'),
+    ]:
+        for optimization in (0, 1, 2):
+            directory = args.work / f'{name}.raw.O{optimization}'
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / 'input.luau').write_text(source, encoding='utf-8')
+            compile_source(args, directory / 'input.luau', directory / 'input.bc', optimization, debug)
+            data = (directory / 'input.bc').read_bytes()
+            assert spelled in data, (name, optimization)
+            data = data.replace(spelled, patched)
+            results.append(check(args, name, f'-- {patched!r}: bytecode patched from the source',
+                                 driver, optimization, debug, data, refusal=refusal))
+    (args.work / 'results.json').write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding='utf-8')
+    failed = sum(result['ket_qua'] != 'PASS' for result in results)
+    print(f'Tổng: {len(results)}; pass: {len(results)-failed}; fail: {failed}')
+    return bool(failed)
+
+
+if __name__ == '__main__':
+    raise SystemExit(main())

@@ -1,0 +1,934 @@
+//! Keep a closure the bytecode makes anew on every run of its literal
+//! (NEWCLOSURE) from becoming one shared object once the output compiles again.
+//!
+//! Luau shares one closure object per literal (DUPCLOSURE) when every local
+//! the literal captures is never written and is declared in the chunk's
+//! top-level code outside loops, or is bound to a literal it shares in turn;
+//! a local holding a constant folds into the literal's body and is not
+//! captured at all (`shouldShareClosure`, `compileExprFunction`). Where the
+//! bytecode made a new object, the printed literal can still meet that rule.
+//! An `-O2` copy of a helper returning `function() ... tag ... end`, called
+//! with a constant, captures the constant through a temporary register and
+//! prints as
+//!
+//! ```lua
+//! local tag = "y"
+//! return function() return tag end
+//! ```
+//!
+//! Compiled again, `tag` folds away, the literal captures nothing, and every
+//! run returns one object where the bytecode returned a new one (`==` and
+//! table keys tell them apart). One local such a literal captures is then
+//! declared first and assigned after (`local tag` / `tag = "y"`): written, it
+//! is captured by reference, and Luau never shares a literal capturing a
+//! written local. Its value and every read stay as they were.
+//!
+//! Every other literal capturing that local is captured by reference too: one
+//! the bytecode shares (DUPCLOSURE) would become new on every run, also one
+//! in a function that reaches the local through its own upvalue. Such a
+//! local is never split. Where the fresh literal captures nothing else, it
+//! captures a private copy instead, declared and assigned right before the
+//! statement making it (`local p` / `p = tag`), its reads renamed: the copy
+//! holds the value the literal captured, as the local is never written.
+//!
+//! Only a literal that can run more than once matters (in a function, or in a
+//! loop or a loop condition of the chunk). The caller runs this only for a chunk whose bytecode
+//! shares some closure: at `-O0` every literal is new, and a recompiled one
+//! capturing nothing is shared whatever the spelling.
+
+use itertools::Either;
+use parking_lot::Mutex;
+use rustc_hash::{FxHashMap, FxHashSet};
+use triomphe::Arc;
+
+use crate::{Assign, Block, Function, LValue, Local, LocalRw, RValue, RcLocal, Statement, Traverse, Upvalue};
+
+type FnPtr = *const Mutex<Function>;
+
+/// What a `local` declaration binds, as Luau's constant folding and closure
+/// sharing read it.
+#[derive(Clone)]
+enum Init {
+    /// A value Luau folds when the local is never written: a literal, `nil`
+    /// for a declaration without one, an operator over such values.
+    Constant,
+    /// Another local: a constant when that one is.
+    Alias(RcLocal),
+    /// A function literal: shared when that literal is.
+    Closure(FnPtr),
+    Other,
+}
+
+struct Declaration {
+    /// In the chunk's own code, outside any loop.
+    top_level: bool,
+    init: Init,
+}
+
+#[derive(Default)]
+struct Facts {
+    declarations: FxHashMap<RcLocal, Declaration>,
+    /// Locals written after their declaration: what makes Luau capture a
+    /// local by reference once the output compiles again.
+    written: FxHashSet<RcLocal>,
+    /// The captures of each function literal bound by a declaration.
+    bound_captures: FxHashMap<FnPtr, Vec<Upvalue>>,
+    /// Literals of NEWCLOSURE prototypes that can run more than once.
+    fresh: Vec<(Arc<Mutex<Function>>, Vec<Upvalue>)>,
+    /// The locals literals the bytecode shares (DUPCLOSURE) capture, by
+    /// value or passed on through an upvalue of the enclosing function.
+    shared_captures: FxHashSet<RcLocal>,
+    /// How many literals make each function.
+    literals: FxHashMap<FnPtr, usize>,
+    visited: FxHashSet<FnPtr>,
+}
+
+/// Keep every fresh literal the output would share fresh (module
+/// documentation): split the declaration of one local it captures, else give
+/// it a private copy of one.
+pub fn keep_fresh_closures(block: &mut Block) {
+    let mut facts = Facts::default();
+    census(block, 0, 0, &mut facts);
+    if facts.fresh.is_empty() {
+        return;
+    }
+    // Rare: only now are the writes of the recorded locals worth a walk.
+    facts.visited.clear();
+    writes(block, &mut facts);
+    let copies = |upvalues: &[Upvalue]| -> Vec<RcLocal> {
+        upvalues
+            .iter()
+            .filter_map(|upvalue| match upvalue {
+                Upvalue::Copy(local) => Some(local.clone()),
+                Upvalue::Ref(_) => None,
+            })
+            .collect()
+    };
+    // A local the literal's body reads first: capturing it is what keeps the
+    // literal new. Then a constant (folded away, it hides the capture), else
+    // a top-level local.
+    let preference = |body: &Block, local: &RcLocal| {
+        (!crate::folded_captures::body_reads(body, local), !facts.is_constant(local, 0))
+    };
+    let mut split = FxHashSet::default();
+    let mut unsplit = Vec::new();
+    // Literals relying on a capture their body never reads (Luau folded
+    // every read of the constant, `crate::folded_captures`): each gets a
+    // read of it.
+    let mut unread = Vec::new();
+    for (function, upvalues) in &facts.fresh {
+        if !facts.shares(upvalues, Arc::as_ptr(function), &mut FxHashSet::default()) {
+            continue;
+        }
+        // A local bound to a literal keeps its `local function`; a local a
+        // shared literal captures keeps that literal shared.
+        let captured = copies(upvalues);
+        let body = &function.lock().body;
+        let splittable = captured
+            .iter()
+            .filter(|local| {
+                !matches!(facts.declarations.get(*local), Some(Declaration { init: Init::Closure(_), .. }))
+                    && !facts.shared_captures.contains(*local)
+            })
+            .min_by_key(|local| preference(body, local));
+        match splittable {
+            Some(local) => {
+                crate::telemetry::count("fresh_closure_kept", 1);
+                if !crate::folded_captures::body_reads(body, local) {
+                    unread.push((function.clone(), local.clone()));
+                }
+                split.insert(local.clone());
+            }
+            None => unsplit.push((function, captured)),
+        }
+    }
+    let mut aliased = Vec::new();
+    for (function, captured) in unsplit {
+        let body = &function.lock().body;
+        // Another literal's split made this one capture a written local.
+        if let Some(local) = captured.iter().filter(|local| split.contains(*local)).min_by_key(|local| preference(body, local)) {
+            crate::telemetry::count("fresh_closure_kept", 1);
+            if !crate::folded_captures::body_reads(body, local) {
+                unread.push((function.clone(), local.clone()));
+            }
+            continue;
+        }
+        let pointer = Arc::as_ptr(function);
+        // Never the literal's own binder (`local function f` capturing `f`),
+        // not yet declared before the statement making it.
+        let own_binder = |local: &&RcLocal| {
+            matches!(facts.declarations.get(*local), Some(Declaration { init: Init::Closure(bound), .. }) if *bound == pointer)
+        };
+        match captured.iter().filter(|local| !own_binder(local)).min_by_key(|local| preference(body, local)) {
+            Some(local)
+                if facts.literals.get(&pointer) == Some(&1) && only_literals_of_their_functions(body, &facts.literals) =>
+            {
+                aliased.push((function.clone(), local.clone(), crate::folded_captures::body_reads(body, local)));
+            }
+            _ => crate::telemetry::count("fresh_closure_unkept", 1),
+        }
+    }
+    if !split.is_empty() {
+        split_declarations(block, &split, &mut FxHashSet::default());
+    }
+    if !aliased.is_empty() {
+        alias(block, aliased, &mut unread);
+    }
+    for (function, local) in unread {
+        read_capture(&mut function.lock().body, local);
+    }
+}
+
+/// Gives each literal of `aliased` a private copy of the local it captures
+/// ([`alias_captures`]); a literal whose body never read that local is added
+/// to `unread` with its copy.
+fn alias(
+    block: &mut Block,
+    aliased: Vec<(Arc<Mutex<Function>>, RcLocal, bool)>,
+    unread: &mut Vec<(Arc<Mutex<Function>>, RcLocal)>,
+) {
+    // Each copy is named after its local, counted on past every name the
+    // chunk spells (`tag2`): it shadows nothing a later read means.
+    let Ok(Some(inventory)) = crate::lower_conditionals::prepare_local_rewrite(block, |_| true) else {
+        crate::telemetry::count("fresh_closure_unkept", aliased.len() as u64);
+        return;
+    };
+    let mut reserved = inventory.reserved;
+    let aliased: FxHashMap<FnPtr, (RcLocal, RcLocal)> = aliased
+        .into_iter()
+        .map(|(function, local, read)| {
+            let name = local.0.lock().0.clone().unwrap_or_default();
+            let stem = name.trim_end_matches(|c: char| c.is_ascii_digit());
+            let stem = if stem.is_empty() || stem.len() > 32 { "v" } else { stem };
+            let name = (2..).map(|counter| format!("{stem}{counter}")).find(|name| !reserved.contains(name)).unwrap();
+            reserved.insert(name.clone());
+            let copy = RcLocal::new(Local::new(Some(name)));
+            if !read {
+                unread.push((function.clone(), copy.clone()));
+            }
+            (Arc::as_ptr(&function), (local, copy))
+        })
+        .collect();
+    crate::telemetry::count("fresh_closure_aliased", aliased.len() as u64);
+    alias_captures(block, &aliased, &mut FxHashSet::default());
+}
+
+/// `local _ = local` first in a literal's body: Luau captures only a local
+/// the literal names, and the literal stays new only through that capture.
+/// Named `_`, or `_2` and on past every name the body spells, locals and
+/// globals alike, so it hides nothing the body reads or writes (`_ = v`
+/// discards into a global `_`).
+fn read_capture(body: &mut Block, local: RcLocal) {
+    let mut spelled = FxHashSet::default();
+    spelled_names(body, &mut spelled);
+    let name = std::iter::once("_".to_string())
+        .chain((2..).map(|counter| format!("_{counter}")))
+        .find(|name| !spelled.contains(name))
+        .unwrap();
+    crate::telemetry::count("fresh_closure_capture_read", 1);
+    let mut read = Assign::new(vec![RcLocal::new(Local::new(Some(name))).into()], vec![RValue::Local(local)]);
+    read.prefix = true;
+    body.0.insert(0, read.into());
+}
+
+/// Every name `block` spells, locals and globals, nested blocks and function
+/// literals included.
+fn spelled_names(block: &Block, names: &mut FxHashSet<String>) {
+    fn global_names(value: &RValue, names: &mut FxHashSet<String>) {
+        if let RValue::Global(global) = value {
+            names.insert(String::from_utf8_lossy(&global.0).into_owned());
+        }
+        // A literal's body is walked on its own below.
+        if !matches!(value, RValue::Closure(_)) {
+            value.visit_rvalues(&mut |child| {
+                global_names(child, names);
+                true
+            });
+        }
+    }
+    for statement in &block.0 {
+        let mut record = |local: &RcLocal| {
+            if let Some(name) = &local.0.lock().0 {
+                names.insert(name.clone());
+            }
+            true
+        };
+        statement.visit_local_reads(&mut record);
+        statement.visit_local_writes(&mut record);
+        statement.visit_rvalues(&mut |value| {
+            global_names(value, names);
+            true
+        });
+        statement.visit_lvalues(&mut |target| {
+            match target {
+                LValue::Global(global) => {
+                    names.insert(String::from_utf8_lossy(&global.0).into_owned());
+                }
+                LValue::Index(index) => {
+                    global_names(&index.left, names);
+                    global_names(&index.right, names);
+                }
+                LValue::Local(_) => {}
+            }
+            true
+        });
+        let mut nested = Vec::new();
+        crate::inline_temps::collect_closures_in_statement(statement, &mut |closure| nested.push(closure.function.0.clone()));
+        for function in nested {
+            let function = function.lock();
+            for parameter in &function.parameters {
+                if let Some(name) = &parameter.0.lock().0 {
+                    names.insert(name.clone());
+                }
+            }
+            spelled_names(&function.body, names);
+        }
+        let mut child = 0;
+        while let Some(nested) = child_block(statement, child) {
+            spelled_names(&nested.lock(), names);
+            child += 1;
+        }
+    }
+}
+
+/// One walk of the tree. Only locals that can keep a literal shared are
+/// recorded (declared at the top level, or with a constant, another local or
+/// a literal that may be shared as value); a literal capturing anything else
+/// is never shared, so most literals are dismissed on the spot. Writes are
+/// read afterwards, and only when some literal remains.
+fn census(block: &Block, function_depth: usize, loop_depth: usize, facts: &mut Facts) {
+    let top_level = function_depth == 0 && loop_depth == 0;
+    for statement in &block.0 {
+        if let Statement::Assign(assign) = statement
+            && assign.prefix
+        {
+            declare(assign, top_level, facts);
+        }
+        let inner_loop = loop_depth + usize::from(matches!(
+            statement,
+            Statement::While(_) | Statement::Repeat(_) | Statement::NumericFor(_) | Statement::GenericFor(_)
+        ));
+        let blocks = |facts: &mut Facts| {
+            let mut child = 0;
+            while let Some(block) = child_block(statement, child) {
+                census(&block.lock(), function_depth, inner_loop, facts);
+                child += 1;
+            }
+        };
+        // `until` reads the locals of the body before it.
+        let condition_last = matches!(statement, Statement::Repeat(_));
+        if condition_last {
+            blocks(facts);
+        }
+        // A loop's condition runs on every trip, a `for` loop's values once.
+        let repeats = !top_level || matches!(statement, Statement::While(_) | Statement::Repeat(_));
+        let mut nested = Vec::new();
+        crate::inline_temps::collect_closures_in_statement(statement, &mut |closure| {
+            *facts.literals.entry(Arc::as_ptr(&closure.function.0)).or_default() += 1;
+            if !closure.upvalues.is_empty() {
+                let function = closure.function.lock();
+                if function.closure_constant.is_some() {
+                    // A capture marked by reference is the local passed on
+                    // through the enclosing function's upvalue (`CAPTURE
+                    // UPVAL`): Luau shares the literal only while that local
+                    // stays unwritten too.
+                    facts.shared_captures.extend(closure.upvalues.iter().map(|upvalue| {
+                        let (Upvalue::Copy(local) | Upvalue::Ref(local)) = upvalue;
+                        local.clone()
+                    }));
+                } else if repeats && function.bytecode_proto_id.is_some() && facts.may_share(&closure.upvalues, None) {
+                    facts.fresh.push((closure.function.0.clone(), closure.upvalues.clone()));
+                }
+            }
+            nested.push(closure.function.0.clone());
+        });
+        for function in nested {
+            if facts.visited.insert(Arc::as_ptr(&function)) {
+                census(&function.lock().body, function_depth + 1, 0, facts);
+            }
+        }
+        if !condition_last {
+            blocks(facts);
+        }
+    }
+}
+
+/// The recorded locals written after their declaration anywhere in the
+/// tree, function bodies included. A capture the tree marks by reference
+/// is no write: a literal passing on an upvalue of its function
+/// (`CAPTURE UPVAL`) is marked so, however that function captured it; the
+/// output's writes alone decide how Luau captures a local.
+fn writes(block: &Block, facts: &mut Facts) {
+    for statement in &block.0 {
+        // A `local` statement writes only the locals it declares; a loop's
+        // variables are recorded nowhere.
+        if !matches!(statement, Statement::Assign(assign) if assign.prefix) {
+            statement.visit_local_writes(&mut |local| {
+                if facts.declarations.contains_key(local) {
+                    facts.written.insert(local.clone());
+                }
+                true
+            });
+        }
+        let mut nested = Vec::new();
+        crate::inline_temps::collect_closures_in_statement(statement, &mut |closure| nested.push(closure.function.0.clone()));
+        for function in nested {
+            if facts.visited.insert(Arc::as_ptr(&function)) {
+                writes(&function.lock().body, facts);
+            }
+        }
+        let mut child = 0;
+        while let Some(block) = child_block(statement, child) {
+            writes(&block.lock(), facts);
+            child += 1;
+        }
+    }
+}
+
+/// Records the locals of `local ... = ...` that may keep a literal shared.
+fn declare(assign: &Assign, top_level: bool, facts: &mut Facts) {
+    // A call or `...` last fills the remaining locals (a `Select` is a call
+    // whose results the statement adjusts).
+    let multiple_tail =
+        matches!(assign.right.last(), Some(RValue::Call(_) | RValue::MethodCall(_) | RValue::VarArg(_) | RValue::Select(_)));
+    for (index, left) in assign.left.iter().enumerate() {
+        let LValue::Local(local) = left else { continue };
+        let init = match assign.right.get(index) {
+            Some(RValue::Local(other)) if facts.declarations.contains_key(other) => Init::Alias(other.clone()),
+            Some(RValue::Closure(closure)) if facts.may_share(&closure.upvalues, Some(local)) => {
+                let function = Arc::as_ptr(&closure.function.0);
+                facts.bound_captures.insert(function, closure.upvalues.clone());
+                Init::Closure(function)
+            }
+            Some(value) if folds(value) => Init::Constant,
+            Some(_) => Init::Other,
+            None if multiple_tail => Init::Other,
+            None => Init::Constant,
+        };
+        if top_level || !matches!(init, Init::Other) {
+            facts.declarations.insert(local.clone(), Declaration { top_level, init });
+        }
+    }
+}
+
+/// A literal, or an operator over literals: what Luau's constant folding may
+/// fold. Reading more as constant than Luau does only splits a declaration
+/// that needed none.
+fn folds(value: &RValue) -> bool {
+    match value {
+        RValue::Literal(_) => true,
+        RValue::Unary(unary) => folds(&unary.value),
+        RValue::Binary(binary) => folds(&binary.left) && folds(&binary.right),
+        _ => false,
+    }
+}
+
+impl Facts {
+    /// Whether every local `upvalues` captures is recorded (or is `itself`, a
+    /// literal bound to the local it captures): only then may the literal be
+    /// shared, the writes after it aside. A capture marked by reference is a
+    /// written local, which the writes rule out, or a local passed on through
+    /// the enclosing function's upvalue (`CAPTURE UPVAL`), which Luau shares
+    /// a literal over like any other.
+    fn may_share(&self, upvalues: &[Upvalue], itself: Option<&RcLocal>) -> bool {
+        upvalues.iter().all(|upvalue| {
+            let (Upvalue::Copy(local) | Upvalue::Ref(local)) = upvalue;
+            Some(local) == itself || self.declarations.contains_key(local)
+        })
+    }
+
+    /// Whether Luau folds `local` into a constant: declared with one and
+    /// never written.
+    fn is_constant(&self, local: &RcLocal, depth: usize) -> bool {
+        if depth > 32 || self.written.contains(local) {
+            return false;
+        }
+        match self.declarations.get(local).map(|declaration| &declaration.init) {
+            Some(Init::Constant) => true,
+            Some(Init::Alias(other)) => self.is_constant(other, depth + 1),
+            _ => false,
+        }
+    }
+
+    /// Luau's `shouldShareClosure` for a literal of `function` capturing
+    /// `upvalues`, as the output declares and writes them.
+    fn shares(&self, upvalues: &[Upvalue], function: FnPtr, visiting: &mut FxHashSet<FnPtr>) -> bool {
+        upvalues.iter().all(|upvalue| {
+            let (Upvalue::Copy(local) | Upvalue::Ref(local)) = upvalue;
+            if self.written.contains(local) {
+                return false;
+            }
+            if self.is_constant(local, 0) {
+                return true;
+            }
+            match self.declarations.get(local) {
+                Some(Declaration { top_level: true, .. }) => true,
+                Some(Declaration { init: Init::Closure(bound), .. }) => {
+                    *bound == function
+                        || visiting.insert(*bound)
+                            && self.bound_captures.get(bound).is_some_and(|captures| self.shares(captures, *bound, visiting))
+                }
+                _ => false,
+            }
+        })
+    }
+}
+
+fn child_block(statement: &Statement, child: u8) -> Option<&Arc<Mutex<Block>>> {
+    match (statement, child) {
+        (Statement::If(node), 0) => Some(&node.then_block),
+        (Statement::If(node), 1) => Some(&node.else_block),
+        (Statement::While(node), 0) => Some(&node.block),
+        (Statement::Repeat(node), 0) => Some(&node.block),
+        (Statement::NumericFor(node), 0) => Some(&node.block),
+        (Statement::GenericFor(node), 0) => Some(&node.block),
+        _ => None,
+    }
+}
+
+/// `local a, b = values` declaring a local of `split` becomes `local a, b`
+/// then `a, b = values` (`a, b = nil` without values).
+fn split_declarations(block: &mut Block, split: &FxHashSet<RcLocal>, visited: &mut FxHashSet<FnPtr>) {
+    let mut index = 0;
+    while index < block.0.len() {
+        let mut nested = Vec::new();
+        crate::inline_temps::collect_closures_in_statement(&block.0[index], &mut |closure| nested.push(closure.function.0.clone()));
+        for function in nested {
+            if visited.insert(Arc::as_ptr(&function)) {
+                split_declarations(&mut function.lock().body, split, visited);
+            }
+        }
+        let mut child = 0;
+        while let Some(nested) = child_block(&block.0[index], child) {
+            split_declarations(&mut nested.lock(), split, visited);
+            child += 1;
+        }
+        let declares_split = matches!(&block.0[index], Statement::Assign(assign) if assign.prefix
+            && assign.left.iter().any(|left| matches!(left, LValue::Local(local) if split.contains(local))));
+        if declares_split {
+            let Statement::Assign(declaration) = &mut block.0[index] else { unreachable!() };
+            let mut right = std::mem::take(&mut declaration.right);
+            if right.is_empty() {
+                right = vec![RValue::Literal(crate::Literal::Nil); declaration.left.len()];
+            }
+            let mut assignment = Assign::new(declaration.left.clone(), right);
+            assignment.node_origin = declaration.node_origin.clone();
+            block.0.insert(index + 1, assignment.into());
+            index += 1;
+        }
+        index += 1;
+    }
+}
+
+/// Whether every function literal in `body`, at any depth, is the only
+/// literal of its function: renaming a capture there renames it nowhere
+/// else.
+fn only_literals_of_their_functions(body: &Block, literals: &FxHashMap<FnPtr, usize>) -> bool {
+    body.0.iter().all(|statement| {
+        let mut nested = Vec::new();
+        crate::inline_temps::collect_closures_in_statement(statement, &mut |closure| nested.push(closure.function.0.clone()));
+        let mut blocks = Vec::new();
+        let mut child = 0;
+        while let Some(block) = child_block(statement, child) {
+            blocks.push(block.clone());
+            child += 1;
+        }
+        nested.iter().all(|function| {
+            literals.get(&Arc::as_ptr(function)) == Some(&1) && only_literals_of_their_functions(&function.lock().body, literals)
+        }) && blocks.iter().all(|block| only_literals_of_their_functions(&block.lock(), literals))
+    })
+}
+
+/// Gives each literal of `aliased` (its function, mapped to the local it
+/// captures by value and the copy) the copy of that local: `local copy` and
+/// `copy = local` right before the statement making it, the literal
+/// capturing `copy` and its body reading `copy`.
+fn alias_captures(block: &mut Block, aliased: &FxHashMap<FnPtr, (RcLocal, RcLocal)>, visited: &mut FxHashSet<FnPtr>) {
+    let mut index = 0;
+    while index < block.0.len() {
+        let mut nested = Vec::new();
+        let mut made = Vec::new();
+        crate::inline_temps::collect_closures_in_statement(&block.0[index], &mut |closure| {
+            let function = Arc::as_ptr(&closure.function.0);
+            if let Some(alias) = aliased.get(&function) {
+                made.push((function, alias.clone()));
+            }
+            nested.push(closure.function.0.clone());
+        });
+        for function in nested {
+            if visited.insert(Arc::as_ptr(&function)) {
+                alias_captures(&mut function.lock().body, aliased, visited);
+            }
+        }
+        let mut child = 0;
+        while let Some(nested) = child_block(&block.0[index], child) {
+            alias_captures(&mut nested.lock(), aliased, visited);
+            child += 1;
+        }
+        for (function, (local, copy)) in made {
+            block.0[index].post_traverse_values(&mut |value| -> Option<()> {
+                if let Either::Right(RValue::Closure(closure)) = value
+                    && Arc::as_ptr(&closure.function.0) == function
+                {
+                    for upvalue in &mut closure.upvalues {
+                        if let Upvalue::Copy(captured) = upvalue
+                            && *captured == local
+                        {
+                            *captured = copy.clone();
+                        }
+                    }
+                    rename_reads(&mut closure.function.lock().body, &local, &copy);
+                }
+                None
+            });
+            let mut declaration = Assign::new(vec![copy.clone().into()], Vec::new());
+            declaration.prefix = true;
+            let assignment = Assign::new(vec![copy.into()], vec![RValue::Local(local.clone())]);
+            // A literal in `until` sees the locals of the loop body, which
+            // the copy of one must follow: right after its declaration (a
+            // `continue` skips only the rest of the body).
+            if let Statement::Repeat(repeat) = &block.0[index] {
+                let mut body = repeat.block.lock();
+                let declared_at = body.0.iter().position(|statement| {
+                    matches!(statement, Statement::Assign(assign) if assign.prefix
+                        && assign.left.iter().any(|left| matches!(left, LValue::Local(declared) if *declared == local)))
+                });
+                if let Some(at) = declared_at {
+                    body.0.splice(at + 1..at + 1, [declaration.into(), assignment.into()]);
+                    continue;
+                }
+            }
+            block.0.splice(index..index, [declaration.into(), assignment.into()]);
+            index += 2;
+        }
+        index += 1;
+    }
+}
+
+/// Every read of `from` in `block`, nested blocks and function literals
+/// included (a literal's capture is a read), reads `to` instead.
+fn rename_reads(block: &mut Block, from: &RcLocal, to: &RcLocal) {
+    for statement in &mut block.0 {
+        statement.visit_local_reads_mut(&mut |local| {
+            if local == from {
+                *local = to.clone();
+            }
+            true
+        });
+        statement.post_traverse_values(&mut |value| -> Option<()> {
+            if let Either::Right(RValue::Closure(closure)) = value {
+                rename_reads(&mut closure.function.lock().body, from, to);
+            }
+            None
+        });
+        let mut child = 0;
+        while let Some(nested) = child_block(statement, child) {
+            rename_reads(&mut nested.lock(), from, to);
+            child += 1;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{Closure, Literal, Return};
+
+    fn closure(proto: usize, constant: Option<usize>, upvalues: Vec<Upvalue>) -> RValue {
+        let function = Arc::new(Mutex::new(Function {
+            bytecode_proto_id: Some(proto),
+            closure_constant: constant,
+            ..Default::default()
+        }));
+        Closure { node_origin: Default::default(), function: by_address::ByAddress(function), upvalues }.into()
+    }
+
+    fn declare(local: &RcLocal, value: RValue) -> Statement {
+        let mut assign = Assign::new(vec![local.clone().into()], vec![value]);
+        assign.prefix = true;
+        assign.into()
+    }
+
+    /// `function() local tag = "y"; return function() return tag end end`.
+    fn factory(constant: Option<usize>) -> (Block, RcLocal) {
+        let tag = RcLocal::default();
+        let inner = closure(1, constant, vec![Upvalue::Copy(tag.clone())]);
+        let body = Block(vec![declare(&tag, Literal::String(b"y".to_vec()).into()), Return::new(vec![inner]).into()]);
+        let outer = closure(0, Some(0), vec![]);
+        if let RValue::Closure(closure) = &outer {
+            closure.function.lock().body = body;
+        }
+        (Block(vec![declare(&RcLocal::default(), outer)]), tag)
+    }
+
+    fn inner_body(block: &Block) -> Block {
+        let Statement::Assign(assign) = &block.0[0] else { panic!() };
+        let RValue::Closure(closure) = &assign.right[0] else { panic!() };
+        closure.function.lock().body.clone()
+    }
+
+    #[test]
+    fn the_capture_read_hides_no_global() {
+        // `return _` reads a global `_`; `_ = 1` in a nested literal writes
+        // one. The read the literal gets must take neither name.
+        let flag = RcLocal::default();
+        let underscore = || crate::Global(b"_".to_vec());
+        let underscore2 = Assign::new(vec![LValue::Global(crate::Global(b"_2".to_vec()))], vec![Literal::Number(1.0).into()]);
+        let nested = closure(2, Some(1), vec![]);
+        if let RValue::Closure(closure) = &nested {
+            closure.function.lock().body = Block(vec![underscore2.into()]);
+        }
+        let mut body = Block(vec![
+            Statement::Call(crate::Call::new(nested, vec![])),
+            Return::new(vec![RValue::Global(underscore())]).into(),
+        ]);
+        read_capture(&mut body, flag.clone());
+        let Statement::Assign(read) = &body.0[0] else { panic!() };
+        let LValue::Local(local) = &read.left[0] else { panic!() };
+        assert_eq!(local.0.lock().0.as_deref(), Some("_3"));
+        assert_eq!(read.right, vec![RValue::Local(flag)]);
+    }
+
+    #[test]
+    fn a_fresh_literal_capturing_a_constant_gets_a_written_local() {
+        let (mut block, tag) = factory(None);
+        keep_fresh_closures(&mut block);
+        let body = inner_body(&block);
+        assert_eq!(body.0.len(), 3);
+        let Statement::Assign(declaration) = &body.0[0] else { panic!() };
+        assert!(declaration.prefix && declaration.right.is_empty());
+        let Statement::Assign(assignment) = &body.0[1] else { panic!() };
+        assert!(!assignment.prefix);
+        assert_eq!(assignment.left, vec![LValue::Local(tag)]);
+        assert_eq!(assignment.right, vec![RValue::Literal(Literal::String(b"y".to_vec()))]);
+    }
+
+    #[test]
+    fn a_shared_literal_or_a_written_capture_stays() {
+        let (mut block, _) = factory(Some(3));
+        keep_fresh_closures(&mut block);
+        assert_eq!(inner_body(&block).0.len(), 2);
+
+        // Captured by reference: Luau never shares it.
+        let tag = RcLocal::default();
+        let inner = closure(1, None, vec![Upvalue::Ref(tag.clone())]);
+        let outer = closure(0, Some(0), vec![]);
+        if let RValue::Closure(closure) = &outer {
+            closure.function.lock().body =
+                Block(vec![declare(&tag, Literal::Number(1.0).into()), Return::new(vec![inner]).into()]);
+        }
+        let mut block = Block(vec![declare(&RcLocal::default(), outer)]);
+        keep_fresh_closures(&mut block);
+        assert_eq!(inner_body(&block).0.len(), 2);
+    }
+
+    #[test]
+    fn a_literal_run_once_in_the_chunk_stays() {
+        let tag = RcLocal::default();
+        let mut block = Block(vec![
+            declare(&tag, Literal::Boolean(true).into()),
+            Return::new(vec![closure(1, None, vec![Upvalue::Copy(tag)])]).into(),
+        ]);
+        keep_fresh_closures(&mut block);
+        assert_eq!(block.0.len(), 2);
+    }
+
+    /// `local tag = "y"; local f = function() return function() return tag
+    /// end, <DUPCLOSURE>function() return tag end end`.
+    #[test]
+    fn a_local_a_shared_literal_captures_is_copied_not_split() {
+        let tag = RcLocal::new(Local::new(Some("tag".into())));
+        let fresh = closure(1, None, vec![Upvalue::Copy(tag.clone())]);
+        let shared = closure(2, Some(5), vec![Upvalue::Copy(tag.clone())]);
+        for literal in [&fresh, &shared] {
+            if let RValue::Closure(closure) = literal {
+                closure.function.lock().body = Block(vec![Return::new(vec![tag.clone().into()]).into()]);
+            }
+        }
+        let outer = closure(0, Some(0), vec![]);
+        if let RValue::Closure(closure) = &outer {
+            closure.function.lock().body = Block(vec![Return::new(vec![fresh, shared]).into()]);
+        }
+        let mut block = Block(vec![declare(&tag, Literal::String(b"y".to_vec()).into()), declare(&RcLocal::default(), outer)]);
+        keep_fresh_closures(&mut block);
+        // The declaration stays: `shared` keeps capturing an unwritten local.
+        let Statement::Assign(declaration) = &block.0[0] else { panic!() };
+        assert!(declaration.prefix && declaration.right.len() == 1);
+        let Statement::Assign(assign) = &block.0[1] else { panic!() };
+        let RValue::Closure(outer) = &assign.right[0] else { panic!() };
+        let body = outer.function.lock().body.clone();
+        assert_eq!(body.0.len(), 3, "`local tag2`, `tag2 = tag`, the return");
+        let Statement::Assign(copy) = &body.0[1] else { panic!() };
+        let LValue::Local(copy_local) = &copy.left[0] else { panic!() };
+        assert!(!copy.prefix && copy.right == vec![RValue::Local(tag.clone())]);
+        assert_eq!(copy_local.to_string(), "tag2");
+        let Statement::Return(ret) = &body.0[2] else { panic!() };
+        let (RValue::Closure(fresh), RValue::Closure(shared)) = (&ret.values[0], &ret.values[1]) else { panic!() };
+        assert_eq!(fresh.upvalues, vec![Upvalue::Copy(copy_local.clone())]);
+        assert_eq!(shared.upvalues, vec![Upvalue::Copy(tag.clone())]);
+        let Statement::Return(inner) = &fresh.function.lock().body.0[0] else { panic!() };
+        assert_eq!(inner.values, vec![RValue::Local(copy_local.clone())]);
+    }
+
+    /// `local tag = "y"; local f = function() return function() return tag
+    /// end end; local g = function() return <DUPCLOSURE>function() return
+    /// tag end end`: `g` is made anew, and its shared literal reaches `tag`
+    /// through `g`'s upvalue (`CAPTURE UPVAL`, marked by reference).
+    /// Splitting `tag` would make that literal new on every call of `g`: the
+    /// fresh literal gets a private copy instead.
+    #[test]
+    fn a_local_a_shared_literal_reaches_through_an_upvalue_is_not_split() {
+        let tag = RcLocal::new(Local::new(Some("tag".into())));
+        let returns_tag = Block(vec![Return::new(vec![tag.clone().into()]).into()]);
+        let fresh = closure(1, None, vec![Upvalue::Copy(tag.clone())]);
+        let shared = closure(2, Some(5), vec![Upvalue::Ref(tag.clone())]);
+        for literal in [&fresh, &shared] {
+            if let RValue::Closure(closure) = literal {
+                closure.function.lock().body = returns_tag.clone();
+            }
+        }
+        let outer = closure(0, Some(0), vec![]);
+        if let RValue::Closure(closure) = &outer {
+            closure.function.lock().body = Block(vec![Return::new(vec![fresh]).into()]);
+        }
+        let maker = closure(3, None, vec![Upvalue::Copy(tag.clone())]);
+        if let RValue::Closure(closure) = &maker {
+            closure.function.lock().body = Block(vec![Return::new(vec![shared]).into()]);
+        }
+        let mut block = Block(vec![
+            declare(&tag, Literal::String(b"y".to_vec()).into()),
+            declare(&RcLocal::default(), outer),
+            declare(&RcLocal::default(), maker),
+        ]);
+        keep_fresh_closures(&mut block);
+        assert_eq!(block.0.len(), 3, "`tag` keeps its declaration");
+        let Statement::Assign(assign) = &block.0[1] else { panic!() };
+        let RValue::Closure(outer) = &assign.right[0] else { panic!() };
+        assert_eq!(outer.function.lock().body.0.len(), 3, "`local tag2`, `tag2 = tag`, the return");
+    }
+
+    /// `local tag = "y"; local f = function() return function() return
+    /// function() return tag end end end`: the innermost literal passes `tag`
+    /// on as an upvalue of the middle one, which the tree marks as a capture by
+    /// reference. That is no write: the middle literal, fresh, would print
+    /// shared, so `tag` is split.
+    #[test]
+    fn passing_an_upvalue_on_is_no_write() {
+        let tag = RcLocal::new(Local::new(Some("tag".into())));
+        let inner = closure(2, None, vec![Upvalue::Ref(tag.clone())]);
+        if let RValue::Closure(closure) = &inner {
+            closure.function.lock().body = Block(vec![Return::new(vec![tag.clone().into()]).into()]);
+        }
+        let middle = closure(1, None, vec![Upvalue::Copy(tag.clone())]);
+        if let RValue::Closure(closure) = &middle {
+            closure.function.lock().body = Block(vec![Return::new(vec![inner]).into()]);
+        }
+        let outer = closure(0, Some(0), vec![]);
+        if let RValue::Closure(closure) = &outer {
+            closure.function.lock().body = Block(vec![Return::new(vec![middle]).into()]);
+        }
+        let mut block = Block(vec![declare(&tag, Literal::String(b"y".to_vec()).into()), declare(&RcLocal::default(), outer)]);
+        keep_fresh_closures(&mut block);
+        assert_eq!(block.0.len(), 3, "`local tag`, `tag = \"y\"`, `local f = ...`");
+    }
+
+    /// `function() local DEBUG = false; return function() return 1 end end`,
+    /// the literal capturing `DEBUG` whose every read Luau folded: split, the
+    /// literal still captures nothing once printed, so it reads `DEBUG` first.
+    #[test]
+    fn a_literal_relying_on_an_unread_capture_reads_it() {
+        let flag = RcLocal::new(Local::new(Some("DEBUG".into())));
+        let inner = closure(1, None, vec![Upvalue::Copy(flag.clone())]);
+        if let RValue::Closure(closure) = &inner {
+            closure.function.lock().body = Block(vec![Return::new(vec![Literal::Number(1.0).into()]).into()]);
+        }
+        let outer = closure(0, Some(0), vec![]);
+        if let RValue::Closure(closure) = &outer {
+            closure.function.lock().body =
+                Block(vec![declare(&flag, Literal::Boolean(false).into()), Return::new(vec![inner]).into()]);
+        }
+        let mut block = Block(vec![declare(&RcLocal::default(), outer)]);
+        keep_fresh_closures(&mut block);
+        let body = inner_body(&block);
+        assert_eq!(body.0.len(), 3, "`local DEBUG`, `DEBUG = false`, the return");
+        let Statement::Return(ret) = &body.0[2] else { panic!() };
+        let RValue::Closure(inner) = &ret.values[0] else { panic!() };
+        let inner = inner.function.lock().body.clone();
+        let Statement::Assign(read) = &inner.0[0] else { panic!() };
+        assert!(read.prefix && read.right == vec![RValue::Local(flag)]);
+        assert_eq!(read.left[0].as_local().unwrap().to_string(), "_");
+    }
+
+    /// `local top = {}; local f = function() local tag = "y"; return
+    /// function() return tag, top end end`: the literal passes `top` on
+    /// through `f`'s upvalue (marked by reference). Luau shares a literal
+    /// over a top-level local as over any other, so the literal would print
+    /// shared and `tag` is split.
+    #[test]
+    fn a_passed_on_top_level_capture_may_share() {
+        let top = RcLocal::new(Local::new(Some("top".into())));
+        let (mut block, tag) = factory(None);
+        let Statement::Assign(assign) = &block.0[0] else { panic!() };
+        let RValue::Closure(outer) = &assign.right[0] else { panic!() };
+        {
+            let body = &mut outer.function.lock().body;
+            let Statement::Return(ret) = &mut body.0[1] else { panic!() };
+            let RValue::Closure(inner) = &mut ret.values[0] else { panic!() };
+            inner.upvalues.push(Upvalue::Ref(top.clone()));
+        }
+        block.0.insert(0, declare(&top, crate::Table::default().into()));
+        keep_fresh_closures(&mut block);
+        let Statement::Assign(assign) = &block.0[1] else { panic!() };
+        let RValue::Closure(outer) = &assign.right[0] else { panic!() };
+        let body = outer.function.lock().body.clone();
+        assert_eq!(body.0.len(), 3, "`local tag`, `tag = \"y\"`, the return");
+        let Statement::Assign(assignment) = &body.0[1] else { panic!() };
+        assert_eq!(assignment.left, vec![LValue::Local(tag)]);
+    }
+
+    /// `repeat local function h() end until f(function() return h end)`: the
+    /// literal in `until` runs on every trip and reads the body's `h`, a
+    /// local function, which keeps it shareable; its private copy follows
+    /// `h` inside the body.
+    #[test]
+    fn a_fresh_literal_in_until_copies_a_body_local_inside_the_body() {
+        let h = RcLocal::new(Local::new(Some("h".into())));
+        let literal = closure(1, None, vec![Upvalue::Copy(h.clone())]);
+        if let RValue::Closure(closure) = &literal {
+            closure.function.lock().body = Block(vec![Return::new(vec![h.clone().into()]).into()]);
+        }
+        let condition = crate::Call::new(RValue::Global(crate::Global::from("f")), vec![literal]);
+        let body = Block(vec![declare(&h, closure(2, Some(0), vec![]))]);
+        let mut block = Block(vec![crate::Repeat::new(condition.into(), body).into()]);
+        keep_fresh_closures(&mut block);
+        assert_eq!(block.0.len(), 1, "nothing before the loop");
+        let Statement::Repeat(repeat) = &block.0[0] else { panic!() };
+        let body = repeat.block.lock();
+        assert_eq!(body.0.len(), 3, "`local function h`, `local h2`, `h2 = h`");
+        let Statement::Assign(copy) = &body.0[2] else { panic!() };
+        assert_eq!(copy.right, vec![RValue::Local(h.clone())]);
+        let LValue::Local(copy_local) = &copy.left[0] else { panic!() };
+        let RValue::Call(call) = &repeat.condition else { panic!() };
+        let RValue::Closure(literal) = &call.arguments[0] else { panic!() };
+        assert_eq!(literal.upvalues, vec![Upvalue::Copy(copy_local.clone())]);
+    }
+
+    /// `function() local function f() return f end; return f end`: the
+    /// literal captures only its own binder, declared by the statement making
+    /// it, which no copy before that statement can read.
+    #[test]
+    fn a_literal_capturing_only_its_own_binder_gets_no_copy() {
+        let f = RcLocal::new(Local::new(Some("f".into())));
+        let literal = closure(1, None, vec![Upvalue::Copy(f.clone())]);
+        if let RValue::Closure(closure) = &literal {
+            closure.function.lock().body = Block(vec![Return::new(vec![f.clone().into()]).into()]);
+        }
+        let outer = closure(0, Some(0), vec![]);
+        if let RValue::Closure(closure) = &outer {
+            closure.function.lock().body = Block(vec![declare(&f, literal), Return::new(vec![f.clone().into()]).into()]);
+        }
+        let mut block = Block(vec![declare(&RcLocal::default(), outer)]);
+        keep_fresh_closures(&mut block);
+        assert_eq!(inner_body(&block).0.len(), 2);
+    }
+}

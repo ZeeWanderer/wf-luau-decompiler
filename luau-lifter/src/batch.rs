@@ -13,16 +13,17 @@ use crate::decompile_core::{
     AnalysisManifestEntry, AnalysisUnavailable, ExportManifestInventory, GeneratedSourceRecord,
     Outcome, acquire_output_generation_lock, atomic_write_contained,
     build_work_from_export_manifest, build_work_with_extension, invalidate_analysis_manifest,
-    precreate_dirs, prepare_analysis_root, process_one, process_one_with_analysis, sha256_hex,
+    precreate_dirs, prepare_analysis_root, sha256_hex,
     size_pool, validate_analysis_root_for_write,
 };
-use luau_lifter::DecompileOptions;
+use luau_lifter::{DecompileDiagnostic, DecompileOptions};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-/// Run the folder decompiler. Returns a process exit code (0 = no failures).
+/// Uncached entry used by existing folder regression tests.
+#[cfg(test)]
 pub fn run(
     src: &Path,
     out: &Path,
@@ -34,18 +35,35 @@ pub fn run(
     output_extension: &str,
     export_manifest: Option<&Path>,
 ) -> i32 {
+    run_with_cache(src, out, key, threads, verbose, options, emit_upvalue_analysis,
+                   output_extension, export_manifest, None, 512)
+}
+
+pub fn run_with_cache(
+    src: &Path,
+    out: &Path,
+    key: u8,
+    threads: usize,
+    verbose: bool,
+    options: DecompileOptions,
+    emit_upvalue_analysis: bool,
+    output_extension: &str,
+    export_manifest: Option<&Path>,
+    cache_dir: Option<&Path>,
+    cache_max_mib: u64,
+) -> i32 {
     let start = Instant::now();
 
-    let (_src_root, out_root, work, inventory) = match export_manifest {
+    let (_src_root, out_root, work, inventory, discovery_failures) = match export_manifest {
         Some(manifest) => {
             match build_work_from_export_manifest(src, out, output_extension, manifest) {
-                Ok((src_root, out_root, work, inventory)) => (src_root, out_root, work, inventory),
+                Ok((src_root, out_root, work, inventory)) => (src_root, out_root, work, inventory, Vec::new()),
                 Err(code) => return code,
             }
         }
         None => match build_work_with_extension(src, out, output_extension) {
-            Ok((src_root, out_root, work)) => {
-                let total_scripts = work.len();
+            Ok((src_root, out_root, work, failures)) => {
+                let total_scripts = work.len() + failures.len();
                 (
                     src_root,
                     out_root,
@@ -54,6 +72,7 @@ pub fn run(
                         total_scripts,
                         ..ExportManifestInventory::default()
                     },
+                    failures,
                 )
             }
             Err(code) => return code,
@@ -72,6 +91,30 @@ pub fn run(
         }
     };
     let locked_out_root = generation_lock.output_root();
+    // Every check that can refuse the run (the cache, the output directories)
+    // comes before the previous generation's manifest is invalidated: a
+    // refused run leaves it intact.
+    let cache = match cache_dir {
+        Some(_) if crate::decompile_cache::diagnostic_environment() => {
+            eprintln!("cache bypassed: diagnostic environment requires fresh execution");
+            None
+        }
+        Some(path) => {
+            let Some(max_bytes) = cache_max_mib.checked_mul(1024 * 1024).filter(|&n| n > 0) else {
+                eprintln!("error: invalid cache byte limit");
+                return 2;
+            };
+            match crate::decompile_cache::Cache::open(path, max_bytes, &_src_root, &out_root) {
+                Ok(cache) => Some(cache),
+                Err(error) => { eprintln!("error: cache: {error}"); return 2; }
+            }
+        }
+        None => None,
+    };
+
+    if let Err(code) = precreate_dirs(&work) {
+        return code;
+    }
     if emit_upvalue_analysis || !work.is_empty() {
         if let Err(error) = invalidate_analysis_manifest(locked_out_root) {
             eprintln!("error: invalidate previous analysis manifest: {error}");
@@ -89,33 +132,89 @@ pub fn run(
     } else {
         locked_out_root.join(".tovek-analysis")
     };
-    if let Err(code) = precreate_dirs(&work) {
-        return code;
-    }
 
     size_pool(threads);
 
     // Decompile in parallel. map_init gives each worker a reusable base64 scratch
     // buffer so we don't reallocate it per file.
-    let outcomes: Vec<(
+    type Row = (
         Outcome,
         Option<AnalysisManifestEntry>,
         Option<AnalysisUnavailable>,
         Option<GeneratedSourceRecord>,
-    )> = work
-        .par_iter()
-        .map_init(Vec::<u8>::new, |b64, w| {
-            if emit_upvalue_analysis {
-                process_one_with_analysis(w, key, b64, verbose, options, &analysis_root)
-            } else {
-                (process_one(w, key, b64, verbose, options), None, None, None)
-            }
-        })
-        .collect();
+        Option<(u64, String)>,
+    );
+    let process_text = |w: &crate::decompile_core::Work, text: std::io::Result<Vec<u8>>, b64: &mut Vec<u8>,
+                        memo: Option<&crate::decompile_core::DuplicateMemo>| {
+            let text = match text {
+                Ok(text) => text,
+                Err(error) => return (Outcome::Fail(format!("read: {error}")), None, None, None, None),
+            };
+            let digest = emit_upvalue_analysis.then(|| (text.len() as u64, sha256_hex(&text)));
+            let (outcome, entry, unavailable, source) = crate::decompile_core::process_one_preloaded(
+                w, &text, key, b64, verbose, options,
+                emit_upvalue_analysis.then_some(analysis_root.as_path()), cache.as_ref(), memo,
+            );
+            (outcome, entry, unavailable, source, digest)
+        };
+    let process = |w: &crate::decompile_core::Work, b64: &mut Vec<u8>| {
+        process_text(w, std::fs::read(&w.input), b64, None)
+    };
+    // A cache that already holds artifacts mostly answers by file: keep that
+    // I/O parallel per file, without a grouping pass reading and hashing
+    // every input first (measured ~3% slower on a warm corpus).
+    let grouped = !luau_lifter::requires_fresh_decompilation() && cache.as_ref().is_none_or(|cache| cache.is_empty());
+    let outcomes: Vec<Row> = if grouped {
+        // Schedule each distinct payload/naming context independently, with
+        // no cache or a cold one. Grouping by module hint alone serializes an
+        // entire dump of unrelated ModuleScript.lua files. The per-group memo
+        // verifies exact decoded bytes before reusing an artifact, including
+        // when an input changes between the grouping and processing reads.
+        // Options, decode key, analysis mode and executable are fixed for this
+        // invocation; kind and module hint supply the remaining context.
+        // No lock is held during computation, which can itself enter Rayon.
+        // Grouping reads every input once, but keeps its bytes only within
+        // `PRELOAD_BUDGET`: the rest is read again where its group runs, so
+        // memory does not grow with the folder.
+        let preloaded = std::sync::atomic::AtomicUsize::new(0);
+        let (texts, payloads): (Vec<_>, Vec<_>) = work.par_iter().map_init(Vec::new, |scratch, item| {
+            let text = std::fs::read(&item.input);
+            let payload = text.as_ref().ok().map(|text| payload_key(text, scratch));
+            let keep = text.as_ref().map_or(true, |bytes| {
+                let before = preloaded.fetch_add(bytes.len(), std::sync::atomic::Ordering::Relaxed);
+                before + bytes.len() <= PRELOAD_BUDGET
+            });
+            (std::sync::Mutex::new(keep.then_some(text)), payload)
+        }).unzip();
+        let groups = duplicate_groups(&work, &payloads);
+        let grouped = groups.par_iter().map_init(Vec::<u8>::new, |b64, group| {
+            let memo = crate::decompile_core::DuplicateMemo::default();
+            // Stats count each input: a shared artifact would carry none.
+            let memo = (group.len() > 1 && !luau_lifter::stats::enabled()).then_some(&memo);
+            group.iter().map(|&index| {
+                let text = texts[index].lock().unwrap().take()
+                    .unwrap_or_else(|| std::fs::read(&work[index].input));
+                (index, process_text(&work[index], text, b64, memo))
+            }).collect::<Vec<_>>()
+        }).collect::<Vec<_>>();
+        let mut ordered = (0..work.len()).map(|_| None).collect::<Vec<_>>();
+        for (index, outcome) in grouped.into_iter().flatten() { ordered[index] = Some(outcome); }
+        ordered.into_iter().map(Option::unwrap).collect()
+    } else {
+        work.par_iter().map_init(Vec::<u8>::new, |b64, item| process(item, b64)).collect()
+    };
+
+    // Hash the bytes actually consumed by each worker, without a second read
+    // or a race between hashing an input and later decompiling a changed file.
+    let corpus_sha256 = hash_corpus_inputs(&work, outcomes.iter().map(|row| row.4.as_ref()));
+
+    if let Some(cache) = &cache {
+        eprintln!("TOVEK_CACHE {}", cache.report());
+    }
 
     // Tally on the main thread (collect() preserves input order, so the FAIL
     // list is deterministic).
-    let (mut ok, mut skipped, mut fail) = (0usize, 0usize, inventory.failed_scripts);
+    let (mut ok, mut skipped, mut fail) = (0usize, 0usize, inventory.failed_scripts + discovery_failures.len());
     let mut entries = Vec::new();
     let mut diagnostics: Vec<FolderDiagnostic> = inventory
         .diagnostics
@@ -130,16 +229,28 @@ pub fn run(
             },
             code: diagnostic.code,
             message: diagnostic.message.clone(),
+            evidence: None,
         })
         .collect();
+    for failure in discovery_failures {
+        eprintln!("FAIL {}\n      {}", failure.rel, failure.message);
+        diagnostics.push(FolderDiagnostic {
+            export_id: None,
+            script_path: failure.rel,
+            status: "failed",
+            code: failure.code,
+            message: failure.message,
+            evidence: None,
+        });
+    }
     let mut unavailable = 0usize;
     let mut generated_sources = Vec::new();
-    for (w, (o, entry, analysis_unavailable, source_record)) in work.iter().zip(&outcomes) {
+    for (w, (o, entry, analysis_unavailable, source_record, _)) in work.iter().zip(outcomes) {
         if let Some(source_record) = source_record {
-            generated_sources.push(source_record.clone());
+            generated_sources.push(source_record);
         }
         if let Some(entry) = entry {
-            entries.push(entry.clone());
+            entries.push(entry);
         }
         if let Some(analysis_unavailable) = analysis_unavailable {
             unavailable += 1;
@@ -151,7 +262,8 @@ pub fn run(
                 script_path: w.rel.clone(),
                 status: "analysis_unavailable",
                 code: analysis_unavailable.code,
-                message: analysis_unavailable.message.clone(),
+                message: analysis_unavailable.message,
+                evidence: None,
             });
         }
         match o {
@@ -167,10 +279,12 @@ pub fn run(
                     status: "skipped",
                     code: "empty_bytecode_payload",
                     message: "Raw bytecode entry had no decoded payload".to_string(),
+                    evidence: None,
                 });
             }
             Outcome::Fail(reason) => {
                 fail += 1;
+                let (code, evidence) = classify_failure(&reason);
                 diagnostics.push(FolderDiagnostic {
                     export_id: w
                         .volt_export
@@ -178,8 +292,9 @@ pub fn run(
                         .map(|metadata| metadata.export_id.clone()),
                     script_path: w.rel.clone(),
                     status: "failed",
-                    code: "processing_failed",
+                    code,
                     message: reason.clone(),
+                    evidence,
                 });
                 eprintln!("FAIL {}\n      {reason}", w.rel);
             }
@@ -187,7 +302,7 @@ pub fn run(
     }
 
     if emit_upvalue_analysis {
-        if let Err(error) = write_analysis_manifest(
+        if let Err(error) = write_analysis_manifest_with_audit(
             &analysis_root,
             output_extension,
             options,
@@ -195,6 +310,9 @@ pub fn run(
             unavailable,
             skipped,
             fail,
+            key,
+            rayon::current_num_threads(),
+            corpus_sha256,
             generated_sources,
             entries,
             diagnostics,
@@ -239,6 +357,93 @@ struct FolderDiagnostic {
     status: &'static str,
     code: &'static str,
     message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    evidence: Option<Vec<DecompileDiagnostic>>,
+}
+
+/// Input bytes kept from the grouping read for the decompile pass.
+const PRELOAD_BUDGET: usize = 64 << 20;
+
+/// A scheduling fingerprint, never an equality proof. Hash the compact wrapper
+/// in one write so comments, whitespace and line boundaries do not split equal
+/// computations. STANDARD accepts only canonical base64, so equal decoded bytes
+/// have equal compact encodings. Every member still validates/decodes separately
+/// before exact-byte memo lookup; invalid wrappers never reuse an artifact.
+fn payload_key(text: &[u8], compact: &mut Vec<u8>) -> (u64, usize) {
+    use std::hash::Hasher;
+    // Most exporters write one already compact line. Borrow it rather than
+    // allocating/copying the complete payload merely to hash its bytes.
+    let line = text.strip_suffix(b"\r\n")
+        .or_else(|| text.strip_suffix(b"\n")).unwrap_or(text);
+    let payload = if !line.starts_with(b"--")
+        && !line.iter().any(|&byte| matches!(byte, b' ' | b'\t' | b'\r' | b'\n'))
+    {
+        line
+    } else {
+        crate::decompile_core::compact_wrapper_payload(text, compact);
+        compact.as_slice()
+    };
+    let mut hasher = rustc_hash::FxHasher::default();
+    hasher.write(payload);
+    (hasher.finish(), payload.len())
+}
+
+/// Work indices grouped by identical payload key and module hint, in input
+/// order. Unreadable inputs stay alone and fail in their own slot.
+fn duplicate_groups(work: &[crate::decompile_core::Work], payloads: &[Option<(u64, usize)>]) -> Vec<Vec<usize>> {
+    let mut contexts = rustc_hash::FxHashMap::default();
+    let mut groups: Vec<Vec<usize>> = Vec::with_capacity(work.len());
+    for (index, (item, payload)) in work.iter().zip(payloads).enumerate() {
+        let Some(payload) = payload else {
+            groups.push(vec![index]);
+            continue;
+        };
+        let context = (*payload, item.kind == crate::decompile_core::WorkKind::RawBytecode,
+            ast::name_locals::script_module_hint(&item.rel));
+        let group = *contexts.entry(context).or_insert_with(|| {
+            groups.push(Vec::new());
+            groups.len() - 1
+        });
+        groups[group].push(index);
+    }
+    groups
+}
+
+/// Convert the legacy string error into a stable top-level code and preserve
+/// any structured per-function diagnostics appended by the lifter.  The
+/// parser deliberately falls back to a coarse code for older/errors outside
+/// the structuring pipeline, so mixed-version corpus manifests remain useful.
+fn classify_failure(reason: &str) -> (&'static str, Option<Vec<DecompileDiagnostic>>) {
+    const MARKER: &str = " | diagnostics=";
+    if let Some((_, payload)) = reason.split_once(MARKER) {
+        if let Ok(diagnostics) = serde_json::from_str::<Vec<DecompileDiagnostic>>(payload) {
+            let code = diagnostics
+                .first()
+                .map(|diagnostic| match diagnostic.code.as_str() {
+                    "residual_control_flow" => "residual_control_flow",
+                    "panic" => "panic",
+                    code if code.starts_with("source_like_unsafe_") => "source_like_rejection",
+                    "source_like_unsupported" => "source_like_rejection",
+                    _ => "processing_failed",
+                })
+                .unwrap_or("processing_failed");
+            return (code, Some(diagnostics));
+        }
+    }
+    let code = if reason.starts_with("deserialize:") {
+        "deserialize"
+    } else if reason.starts_with("base64:") {
+        "base64"
+    } else if reason.contains("residual goto/label") {
+        "residual_control_flow"
+    } else if reason.contains("unsupported certified fallback") {
+        "certified_fallback_unavailable"
+    } else if reason.starts_with("formatting failed") {
+        "formatting"
+    } else {
+        "processing_failed"
+    };
+    (code, None)
 }
 
 #[derive(Serialize)]
@@ -271,6 +476,50 @@ struct FolderAnalysisManifest {
     volt_export_declared_counts: Option<crate::decompile_core::VoltExportCounts>,
     scripts: Vec<AnalysisManifestEntry>,
     diagnostics: Vec<FolderDiagnostic>,
+    #[serde(flatten)]
+    corpus_audit: CorpusAuditMetadata,
+}
+
+#[derive(Serialize)]
+struct CorpusAuditMetadata {
+    audit_schema: &'static str,
+    repo_head: String,
+    corpus_sha256: String,
+    corpus_hash_algorithm: &'static str,
+    input_count: usize,
+    command: Vec<String>,
+    encode_key: u8,
+    threads: usize,
+    control_flow_policy: &'static str,
+    tool_path: String,
+    tool_version: &'static str,
+    tool_sha256: String,
+    results_sha256: String,
+    parser_status: &'static str,
+    parser_failures: Vec<String>,
+}
+
+fn hash_corpus_inputs<'a>(
+    work: &[crate::decompile_core::Work],
+    records: impl Iterator<Item = Option<&'a (u64, String)>>,
+) -> String {
+    use sha2::{Digest, Sha256};
+
+    let mut digest = Sha256::new();
+    digest.update(b"Tovek corpus: ordered SHA256 content digests v2\0");
+    for (item, record) in work.iter().zip(records) {
+        let path = item.rel.as_bytes();
+        digest.update((path.len() as u64).to_le_bytes());
+        digest.update(path);
+        if let Some((size, hash)) = record {
+            digest.update([1]);
+            digest.update(size.to_le_bytes());
+            digest.update(hash.as_bytes());
+        } else {
+            digest.update([0]);
+        }
+    }
+    format!("sha256:{:x}", digest.finalize())
 }
 
 #[derive(Serialize)]
@@ -288,6 +537,9 @@ struct SourceWriteProvenance<'a> {
     volt_export_manifest_sha256: Option<&'a str>,
 }
 
+// Test and compatibility helper retained for callers that only need the
+// original analysis-manifest shape. Production folder runs use the audited
+// variant below with corpus/tool hashes and command metadata.
 #[allow(clippy::too_many_arguments)]
 fn write_analysis_manifest(
     analysis_root: &Path,
@@ -297,6 +549,39 @@ fn write_analysis_manifest(
     analysis_unavailable_scripts: usize,
     skipped_scripts: usize,
     failed_scripts: usize,
+    generated_sources: Vec<GeneratedSourceRecord>,
+    scripts: Vec<AnalysisManifestEntry>,
+    diagnostics: Vec<FolderDiagnostic>,
+) -> Result<(), String> {
+    write_analysis_manifest_with_audit(
+        analysis_root,
+        output_extension,
+        options,
+        inventory,
+        analysis_unavailable_scripts,
+        skipped_scripts,
+        failed_scripts,
+        1,
+        rayon::current_num_threads(),
+        "unknown".to_string(),
+        generated_sources,
+        scripts,
+        diagnostics,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_analysis_manifest_with_audit(
+    analysis_root: &Path,
+    output_extension: &str,
+    options: DecompileOptions,
+    inventory: &ExportManifestInventory,
+    analysis_unavailable_scripts: usize,
+    skipped_scripts: usize,
+    failed_scripts: usize,
+    encode_key: u8,
+    threads: usize,
+    corpus_sha256: String,
     mut generated_sources: Vec<GeneratedSourceRecord>,
     mut scripts: Vec<AnalysisManifestEntry>,
     diagnostics: Vec<FolderDiagnostic>,
@@ -321,6 +606,30 @@ fn write_analysis_manifest(
         .iter()
         .filter(|script| script.status == luau_lifter::upvalue_analysis::AnalysisStatus::Partial)
         .count();
+    let results_material = serde_json::to_vec(&(&generated_sources, &scripts, &diagnostics))
+        .map_err(|error| error.to_string())?;
+    let tool_path = std::env::current_exe()
+        .ok()
+        .and_then(|path| std::fs::canonicalize(path).ok())
+        .unwrap_or_else(|| PathBuf::from("unknown"));
+    let tool_sha256 = std::fs::read(&tool_path)
+        .map(|bytes| sha256_hex(&bytes))
+        .unwrap_or_else(|_| "unknown".to_string());
+    let repo_head = std::process::Command::new("git")
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
+        .filter(|head| !head.is_empty())
+        .unwrap_or_else(|| "unknown".to_string());
+    let control_flow_policy = if options.control_flow_policy
+        == luau_lifter::ControlFlowOutputPolicy::StrictNoSyntheticControl
+    {
+        "StrictNoSyntheticControl"
+    } else {
+        "AllowCertifiedDispatcher"
+    };
     let total_scripts = inventory.total_scripts;
     let export_status = inventory.manifest_status.as_deref();
     let status = if total_scripts == 0
@@ -369,9 +678,42 @@ fn write_analysis_manifest(
         volt_export_declared_counts: inventory.declared_counts.clone(),
         scripts,
         diagnostics,
+        corpus_audit: CorpusAuditMetadata {
+            audit_schema: "tovek-corpus-audit/v1",
+            repo_head,
+            corpus_sha256,
+            corpus_hash_algorithm: "ordered-content-sha256-v2",
+            input_count: total_scripts,
+            command: std::env::args().collect(),
+            encode_key,
+            threads,
+            control_flow_policy,
+            tool_path: tool_path.to_string_lossy().replace('\\', "/"),
+            tool_version: env!("CARGO_PKG_VERSION"),
+            tool_sha256,
+            results_sha256: format!("sha256:{}", sha256_hex(&results_material)),
+            // The batch binary does not bundle the external official Luau
+            // compiler. Keep an explicit status so an empty failure list is
+            // never mistaken for a parser audit having run.
+            parser_status: "not_run",
+            parser_failures: Vec::new(),
+        },
     };
-    let generation_material =
-        serde_json::to_vec(&(&manifest, &generated_sources)).map_err(|error| error.to_string())?;
+    // Keep the publication identity stable across worker counts and invocation
+    // metadata.  The audit envelope intentionally records command/thread/tool
+    // provenance, but those fields must not perturb source sidecars or the
+    // generation id used to bind them.  Results and output-affecting options
+    // are the canonical identity inputs instead.
+    let generation_material = serde_json::to_vec(&(
+        &results_material,
+        output_extension,
+        options.bits(),
+        &inventory.manifest_sha256,
+        &inventory.manifest_schema,
+        &inventory.manifest_schema_version,
+        &inventory.manifest_status,
+    ))
+    .map_err(|error| error.to_string())?;
     manifest.generation_id = format!("sha256:{}", sha256_hex(&generation_material));
     let provenance = SourceWriteProvenance {
         schema_name: "tovek-source-write-provenance",
@@ -415,6 +757,36 @@ fn write_analysis_manifest(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn payload_fingerprint_preserves_wrapper_normalization() {
+        let mut scratch = Vec::new();
+        let canonical = payload_key(b"YWJj", &mut scratch);
+        for wrapper in [b"YWJj\n".as_slice(), b"YWJj\r\n", b"YW\nJj", b"-- header\nYWJj\n", b"-- header\r\nYWJj\r\n", b" Y\tW\rJj \n"] {
+            assert_eq!(payload_key(wrapper, &mut scratch), canonical);
+        }
+        assert_ne!(payload_key(b" -- header\nYWJj", &mut scratch), canonical);
+        assert_eq!(payload_key(b"-- only a comment\r\n", &mut scratch), payload_key(b"", &mut scratch));
+        // Vertical/form-feed whitespace is intentionally not stripped by the
+        // wrapper protocol, and must still reach the decoder as invalid input.
+        assert_ne!(payload_key(b"YW\x0bJj", &mut scratch), canonical);
+        assert_ne!(payload_key(b"YW\x0cJj", &mut scratch), canonical);
+    }
+
+    #[test]
+    fn duplicate_schedule_separates_distinct_payloads_and_naming_contexts() {
+        use crate::decompile_core::{Work, WorkKind};
+        let names = ["A/Widget/init.lua", "B/Widget.lua", "C/Widget.lua", "D/Gadget.lua", "E/Widget.lua", "F/Widget.lua"];
+        let mut work = names.iter().map(|name| Work {
+            input: PathBuf::from(name), output: PathBuf::new(), output_root: PathBuf::new(),
+            rel: name.to_string(), source_rel: String::new(),
+            kind: WorkKind::RawBytecode, volt_export: None,
+        }).collect::<Vec<_>>();
+        work[4].kind = WorkKind::SourceFallback;
+        let texts: [&[u8]; 6] = [b"YWJj", b"ZGVm", b"-- comment\nY W\tJ\rj\n", b"YWJj", b"YWJj", b"bad!"];
+        let mut scratch = Vec::new();
+        let payloads = texts.iter().map(|text| Some(payload_key(text, &mut scratch))).collect::<Vec<_>>();
+        assert_eq!(duplicate_groups(&work, &payloads), vec![vec![0, 2], vec![1], vec![3], vec![4], vec![5]]);
+    }
     use super::*;
     use base64::prelude::*;
     use serde_json::{Value, json};
@@ -441,6 +813,44 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.0);
         }
+    }
+
+    #[test]
+    fn cached_duplicate_schedule_preserves_sources_and_path_specific_analysis() {
+        let temp = TestDir::new("cache-representatives");
+        let src = temp.0.join("dump");
+        let cache = temp.0.join("cache");
+        let first = BASE64_STANDARD.encode(include_bytes!("../tests/fixtures/upvalue_analysis_nested_g0.luaubc"));
+        let second = BASE64_STANDARD.encode(include_bytes!("../tests/fixtures/upvalue_analysis_nested.luaubc"));
+        for (directory, text) in [("A", first.clone()), ("B", second), ("C", format!("-- another wrapper\n{first}\n"))] {
+            std::fs::create_dir_all(src.join(directory)).unwrap();
+            std::fs::write(src.join(directory).join("ModuleScript.lua"), text).unwrap();
+        }
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let mut baseline = None;
+        for (label, cached) in [("uncached", false), ("cold", true), ("warm", true)] {
+            let out = temp.0.join(label);
+            assert_eq!(pool.install(|| run_with_cache(
+                &src, &out, 1, 0, false, DecompileOptions::default(), true, "luau", None,
+                cached.then_some(cache.as_path()), 512,
+            )), 0);
+            let manifest: Value = serde_json::from_slice(&std::fs::read(out.join(".tovek-analysis/manifest.json")).unwrap()).unwrap();
+            assert_eq!(manifest["scripts"].as_array().unwrap().len(), 3);
+            let mut artifacts = Vec::new();
+            for item in manifest["scripts"].as_array().unwrap() {
+                let source = item["source_path"].as_str().unwrap();
+                let sidecar = item["sidecar_path"].as_str().unwrap();
+                let sidecar_bytes = std::fs::read(out.join(sidecar)).unwrap();
+                let parsed: Value = serde_json::from_slice(&sidecar_bytes).unwrap();
+                assert_eq!(parsed["source_path"], source);
+                assert_eq!(parsed["script_path"], item["script_path"]);
+                artifacts.push((source.to_string(), std::fs::read(out.join(source)).unwrap(), sidecar_bytes));
+            }
+            if let Some(expected) = &baseline { assert_eq!(&artifacts, expected); }
+            else { baseline = Some(artifacts); }
+        }
+        assert_eq!(std::fs::read_dir(cache).unwrap().filter_map(Result::ok)
+            .filter(|entry| entry.path().extension().is_some_and(|extension| extension == "json")).count(), 2);
     }
 
     fn entry(
@@ -717,7 +1127,7 @@ mod tests {
         );
         assert_eq!(
             std::fs::read(out.join("Workspace/Error.lua")).unwrap(),
-            b"compile error: expected expression\n"
+            b"-- Roblox could not compile this script:\n-- compile error: expected expression\n"
         );
         let parsed: Value = serde_json::from_slice(
             &std::fs::read(out.join(".tovek-analysis/manifest.json")).unwrap(),
@@ -1060,6 +1470,40 @@ mod tests {
                 .unwrap()
                 .starts_with("sha256:")
         );
+        assert_eq!(parsed["audit_schema"], "tovek-corpus-audit/v1");
+        assert_eq!(parsed["input_count"], 0);
+        assert_eq!(parsed["encode_key"], 1);
+        assert!(
+            parsed["corpus_sha256"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert!(
+            parsed["results_sha256"]
+                .as_str()
+                .unwrap()
+                .starts_with("sha256:")
+        );
+        assert_eq!(parsed["parser_status"], "not_run");
+        assert!(parsed["parser_failures"].as_array().unwrap().is_empty());
+    }
+
+    /// A run its output directories refuse (`out/sub` is a file) leaves the
+    /// previous generation's manifest in place.
+    #[test]
+    fn refused_output_directories_keep_the_previous_manifest() {
+        let temp = TestDir::new("refused-directories");
+        let src = temp.0.join("src");
+        let out = temp.0.join("out");
+        std::fs::create_dir_all(src.join("sub")).unwrap();
+        std::fs::write(src.join("sub/x.lua"), b"").unwrap();
+        std::fs::create_dir_all(out.join(".tovek-analysis")).unwrap();
+        std::fs::write(out.join(".tovek-analysis/manifest.json"), b"previous").unwrap();
+        std::fs::write(out.join("sub"), b"not a directory").unwrap();
+
+        assert_eq!(run(&src, &out, 1, 1, false, DecompileOptions::default(), true, "lua", None), 2);
+        assert_eq!(std::fs::read(out.join(".tovek-analysis/manifest.json")).unwrap(), b"previous");
     }
 
     #[test]
@@ -1350,5 +1794,25 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn classify_failure_preserves_per_function_structuring_evidence() {
+        let failure = luau_lifter::DecompileFailure {
+            message: "control-flow structuring failed: residual goto/label would be invalid Luau"
+                .to_string(),
+            diagnostics: vec![DecompileDiagnostic {
+                stage: "final_invariant".to_string(),
+                code: "residual_control_flow".to_string(),
+                function: "p3".to_string(),
+                message: "source-like proof rejected: shared tail".to_string(),
+            }],
+        };
+        let rendered = failure.to_string();
+        let (code, evidence) = classify_failure(&rendered);
+        assert_eq!(code, "residual_control_flow");
+        let evidence = evidence.expect("typed diagnostics should survive legacy rendering");
+        assert_eq!(evidence[0].function, "p3");
+        assert_eq!(evidence[0].code, "residual_control_flow");
     }
 }

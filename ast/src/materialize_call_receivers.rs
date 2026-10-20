@@ -4,10 +4,13 @@
 //! property is being mutated and is rarely how Roblox source is written. More
 //! importantly, this shape can already exist before the late UI inliner runs,
 //! so merely refusing to create new instances is insufficient.
+//!
+//! `getmetatable(x).__index = ...` is the exception: it configures the
+//! metatable of the already-named `x`, and that is how Lua source writes it.
 
 use rustc_hash::FxHashSet;
 
-use crate::{Assign, Block, LValue, Literal, Local, RValue, RcLocal, Select, Statement, Traverse};
+use crate::{Assign, Block, LValue, Literal, RValue, RcLocal, Select, Statement, Traverse};
 
 const MAX_ACTIVE_LOCALS: usize = 200;
 
@@ -22,14 +25,18 @@ struct FunctionContext {
 }
 
 impl FunctionContext {
+    /// Only a receiver rewrite mints a local, and rewriting never creates a
+    /// receiver call in the same function. The name snapshot precedes nested
+    /// closure rewrites, so it is taken eagerly, but only when it can be used.
     fn new(block: &mut Block, parameter_count: usize) -> Self {
         let mut reserved = FxHashSet::default();
-        crate::rehoist_constants::collect_reserved_identifiers(block, &mut reserved);
-        let declared = count_declared_locals(block);
-        Self {
-            local_headroom: MAX_ACTIVE_LOCALS.saturating_sub(parameter_count + declared),
-            reserved,
+        let mut local_headroom = 0;
+        if block.any_statement(&mut |statement| receiver_call(statement).is_some()) {
+            crate::rehoist_constants::collect_reserved_identifiers(block, &mut reserved);
+            let declared = count_declared_locals(block);
+            local_headroom = MAX_ACTIVE_LOCALS.saturating_sub(parameter_count + declared);
         }
+        Self { local_headroom, reserved }
     }
 
     fn fresh_receiver(&mut self, hint: Option<String>) -> Option<RcLocal> {
@@ -38,8 +45,7 @@ impl FunctionContext {
         }
         self.local_headroom -= 1;
         let base = hint.as_deref().unwrap_or("instance");
-        let name = crate::rehoist_constants::unique_name(base, &mut self.reserved);
-        Some(RcLocal::new(Local::new(Some(name))))
+        Some(crate::rehoist_constants::unique_local(base, &mut self.reserved))
     }
 }
 
@@ -141,12 +147,17 @@ fn call_root(mut value: &RValue) -> Option<&RValue> {
     loop {
         match value {
             RValue::Index(index) => value = &index.left,
-            RValue::Call(_)
-            | RValue::MethodCall(_)
-            | RValue::Select(Select::Call(_) | Select::MethodCall(_)) => return Some(value),
+            RValue::Call(call) | RValue::Select(Select::Call(call)) => {
+                return (!is_metatable_access(call)).then_some(value);
+            }
+            RValue::MethodCall(_) | RValue::Select(Select::MethodCall(_)) => return Some(value),
             _ => return None,
         }
     }
+}
+
+fn is_metatable_access(call: &crate::Call) -> bool {
+    matches!(call.value.as_ref(), RValue::Global(global) if global.0.as_slice() == b"getmetatable")
 }
 
 fn take_receiver_call(statement: &mut Statement, local: &RcLocal) -> Option<RValue> {
@@ -170,7 +181,13 @@ fn take_receiver_call(statement: &mut Statement, local: &RcLocal) -> Option<RVal
     }
 }
 
+/// The name `name_locals` would give the call's result
+/// (`script:WaitForChild("PlayEmote")` -> `playEmote`), else the callee's name
+/// without its verb (`createLabel(...)` -> `label`), else the callee's name.
 fn call_result_hint(value: &RValue) -> Option<String> {
+    if let Some(hint) = crate::name_locals::rvalue_hint(value) {
+        return sanitize_hint(&hint);
+    }
     let raw = match value {
         RValue::Call(call) => callee_name(&call.value),
         RValue::MethodCall(call) => Some(call.method.clone()),
@@ -178,7 +195,9 @@ fn call_result_hint(value: &RValue) -> Option<String> {
         RValue::Select(Select::MethodCall(call)) => Some(call.method.clone()),
         _ => None,
     }?;
-    sanitize_hint(&raw)
+    let raw = crate::name_spelling::strip_private(&raw);
+    let noun = crate::name_locals::strip_verb_prefix(raw);
+    sanitize_hint(noun.unwrap_or(raw))
 }
 
 fn callee_name(value: &RValue) -> Option<String> {
@@ -201,19 +220,18 @@ fn sanitize_hint(raw: &str) -> Option<String> {
         "and", "break", "do", "else", "elseif", "end", "false", "for", "function", "goto", "if",
         "in", "local", "nil", "not", "or", "repeat", "return", "then", "true", "until", "while",
     ];
-    let mut name = raw
+    let mut chars = raw
         .chars()
         .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
-        .collect::<String>();
-    if name.is_empty() {
+        .collect::<Vec<_>>();
+    if chars.is_empty() {
         return None;
     }
-    if name.as_bytes()[0].is_ascii_digit() {
-        name.insert(0, '_');
+    crate::name_spelling::lower_camel_in_place(&mut chars);
+    if chars[0].is_ascii_digit() {
+        chars.insert(0, '_');
     }
-    if let Some(first) = name.get_mut(0..1) {
-        first.make_ascii_lowercase();
-    }
+    let name: String = chars.into_iter().collect();
     if name == "_" || name == "self" || KEYWORDS.contains(&name.as_str()) {
         None
     } else {
@@ -267,6 +285,51 @@ mod tests {
         let once = block.to_string();
         materialize_call_assignment_receivers(&mut block);
         assert_eq!(block.to_string(), once);
+    }
+
+    #[test]
+    fn keeps_metatable_configuration_inline() {
+        let object = local("object");
+        let receiver = Call::new(RValue::Global(Global::from("getmetatable")), vec![local_value(&object)]);
+        let mut block = Block(vec![Assign::new(
+            vec![LValue::Index(Index::new(RValue::Select(crate::Select::Call(receiver)), string("__index")))],
+            vec![local_value(&object)],
+        )
+        .into()]);
+        let before = block.to_string();
+
+        materialize_call_assignment_receivers(&mut block);
+
+        assert_eq!(block.to_string(), before);
+        assert_eq!(before, "getmetatable(object).__index = object");
+    }
+
+    #[test]
+    fn names_receiver_after_the_produced_value() {
+        let create_label = local("createLabel");
+        let peek = local("peek");
+        let data = local("data");
+        let label = Call::new(local_value(&create_label), vec![string("Title")]);
+        let state = Call::new(local_value(&peek), vec![RValue::Index(Index::new(local_value(&data), string("PlayerData")))]);
+        let mut block = Block(vec![
+            Assign::new(
+                vec![LValue::Index(Index::new(RValue::Call(label), string("TextSize")))],
+                vec![RValue::Literal(Literal::Number(12.0))],
+            )
+            .into(),
+            Assign::new(
+                vec![LValue::Index(Index::new(RValue::Call(state), string("Coins")))],
+                vec![RValue::Literal(Literal::Number(0.0))],
+            )
+            .into(),
+        ]);
+
+        materialize_call_assignment_receivers(&mut block);
+
+        assert_eq!(
+            block.to_string(),
+            "local label = createLabel(\"Title\")\nlabel.TextSize = 12\nlocal playerData = peek(data.PlayerData)\nplayerData.Coins = 0"
+        );
     }
 
     #[test]

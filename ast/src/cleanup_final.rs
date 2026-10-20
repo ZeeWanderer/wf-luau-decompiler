@@ -2,22 +2,21 @@
 //!
 //! The individual rewrites are deliberately narrow: straight-line boolean
 //! propagation never crosses captured cells or loop back-edges; dead stores are
-//! removed only when their evaluation is disposable; API canonicalization is a
-//! literal lookup table; and module-table recovery accepts only static fields.
+//! removed only when their evaluation is disposable; and module-table recovery
+//! accepts only static fields.
 
 use std::collections::VecDeque;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
-    Assign, Block, Break, Global, Index, LValue, Literal, Local, LocalRw, RValue, RcLocal, Reduce,
-    Select, Statement, Table, Traverse,
+    Assign, Block, Break, Index, LValue, Literal, LocalRw, RValue, RcLocal, Reduce,
+    Statement, Table, Traverse,
 };
 
 const MAX_ACTIVE_LOCALS: usize = 200;
 
 pub fn cleanup_final(block: &mut Block, script_name: Option<&str>) {
-    canonicalize_api_in_block(block);
     let root_upvalues = FxHashSet::default();
     simplify_constants_in_tree(block, &root_upvalues);
     rewrite_tail_loop_returns_in_tree(block);
@@ -28,15 +27,19 @@ pub fn cleanup_final(block: &mut Block, script_name: Option<&str>) {
 // ---------------------------------------------------------------------------
 // 5.2: straight-line boolean propagation and dead branches
 
-type ConstantState = FxHashMap<RcLocal, bool>;
+type ConstantState = FxHashMap<RcLocal, Literal>;
 
 fn simplify_constants_in_tree(block: &mut Block, function_upvalues: &FxHashSet<RcLocal>) {
     for (function, upvalues) in closure_functions(block) {
         simplify_constants_in_tree(&mut function.lock().body, &upvalues);
     }
-    if function_has_goto(block) {
+    // Children must run first: a shared structured block can gain a boolean
+    // assignment while a child function is simplified.
+    if constant_opportunities(block) != Some(true) {
+        crate::telemetry::count("cleanup_constant_functions_skipped", 1);
         return;
     }
+    crate::telemetry::count("cleanup_constant_functions_processed", 1);
     let mut captured = crate::inline_temps::collect_usage(block)
         .into_iter()
         .filter(|(_, usage)| usage.captured)
@@ -105,6 +108,10 @@ fn simplify_constant_block(
 
             let mut then_state = state.clone();
             let mut else_state = state.clone();
+            if let Statement::If(node) = &block.0[index] {
+                refine_guard(&node.condition, true, captured, &mut then_state, 0);
+                refine_guard(&node.condition, false, captured, &mut else_state, 0);
+            }
             {
                 let Statement::If(node) = &mut block.0[index] else {
                     unreachable!()
@@ -170,29 +177,38 @@ fn simplify_constant_block(
 }
 
 fn replace_constants(value: &mut RValue, state: &ConstantState) -> bool {
+    if state.is_empty() {
+        return false;
+    }
+    #[cfg(test)]
+    CONSTANT_VALUE_VISITS.with(|visits| visits.set(visits.get() + 1));
     if let RValue::Local(local) = value
-        && let Some(&constant) = state.get(local)
+        && let Some(constant) = state.get(local)
     {
-        *value = RValue::Literal(Literal::Boolean(constant));
+        *value = RValue::Literal(constant.clone());
         return true;
     }
     if matches!(value, RValue::Closure(_)) {
         return false;
     }
-    value
-        .rvalues_mut()
-        .into_iter()
-        .fold(false, |changed, child| {
-            replace_constants(child, state) | changed
-        })
+    let mut changed = false;
+    value.visit_rvalues_mut(&mut |child| {
+        changed |= replace_constants(child, state);
+        true
+    });
+    changed
 }
 
 fn rewrite_direct_statement_values(statement: &mut Statement, state: &ConstantState) -> bool {
-    crate::deinline::stmt_rvalues_mut(statement)
-        .into_iter()
-        .fold(false, |changed, value| {
-            replace_constants(value, state) | changed
-        })
+    if state.is_empty() {
+        return false;
+    }
+    let mut changed = false;
+    crate::deinline::visit_stmt_rvalues_mut(statement, &mut |value| {
+        changed |= replace_constants(value, state);
+        true
+    });
+    changed
 }
 
 fn update_state_after_statement(
@@ -200,9 +216,10 @@ fn update_state_after_statement(
     captured: &FxHashSet<RcLocal>,
     state: &mut ConstantState,
 ) {
-    for local in statement.values_written() {
+    statement.visit_local_writes(&mut |local| {
         state.remove(local);
-    }
+        true
+    });
     let Statement::Assign(assign) = statement else {
         return;
     };
@@ -216,14 +233,48 @@ fn update_state_after_statement(
         return;
     };
     if !captured.contains(local) {
-        state.insert(local.clone(), value);
+        state.insert(local.clone(), Literal::Boolean(value));
+    }
+}
+
+fn refine_guard(condition: &RValue, taken: bool, captured: &FxHashSet<RcLocal>, state: &mut ConstantState, depth: usize) {
+    if depth >= 32 || state.len() >= MAX_ACTIVE_LOCALS { return; }
+    match condition {
+        RValue::Unary(unary) if unary.operation == crate::UnaryOperation::Not =>
+            refine_guard(&unary.value, !taken, captured, state, depth + 1),
+        RValue::Binary(binary) => {
+            use crate::BinaryOperation as Op;
+            if (binary.operation == Op::And && taken) || (binary.operation == Op::Or && !taken) {
+                refine_guard(&binary.left, taken, captured, state, depth + 1);
+                refine_guard(&binary.right, taken, captured, state, depth + 1);
+            } else if (binary.operation == Op::Equal && taken) || (binary.operation == Op::NotEqual && !taken) {
+                let pair = match (&*binary.left, &*binary.right) {
+                    (RValue::Local(local), RValue::Literal(literal))
+                    | (RValue::Literal(literal), RValue::Local(local)) => Some((local, literal)),
+                    _ => None,
+                };
+                if let Some((local, literal)) = pair {
+                    // Equality with a primitive literal excludes __eq. Numeric
+                    // zero is deliberately absent: +0 == -0 loses the sign bit.
+                    let exact = match literal {
+                        Literal::Nil | Literal::Boolean(_) => true,
+                        Literal::String(bytes) => bytes.len() <= 1024,
+                        Literal::Number(n) => n.is_finite() && *n != 0.0
+                            && n.abs().to_bits() != std::f64::consts::PI.to_bits(),
+                        _ => false,
+                    };
+                    if exact && !captured.contains(local) { state.insert(local.clone(), literal.clone()); }
+                }
+            }
+        }
+        _ => {} // Truthiness, type hints and calls named type/typeof prove no exact value.
     }
 }
 
 fn intersect_states(left: &ConstantState, right: &ConstantState) -> ConstantState {
     left.iter()
         .filter(|(local, value)| right.get(*local) == Some(*value))
-        .map(|(local, value)| (local.clone(), *value))
+        .map(|(local, value)| (local.clone(), value.clone()))
         .collect()
 }
 
@@ -245,11 +296,11 @@ fn is_loop_statement(statement: &Statement) -> bool {
 }
 
 fn statement_written_locals_deep(statement: &Statement) -> FxHashSet<RcLocal> {
-    let mut written = statement
-        .values_written()
-        .into_iter()
-        .cloned()
-        .collect::<FxHashSet<_>>();
+    let mut written = FxHashSet::default();
+    statement.visit_local_writes(&mut |local| {
+        written.insert(local.clone());
+        true
+    });
     match statement {
         Statement::While(node) => collect_block_writes(&node.block.lock(), &mut written),
         Statement::Repeat(node) => collect_block_writes(&node.block.lock(), &mut written),
@@ -268,7 +319,10 @@ fn statement_written_locals_deep(statement: &Statement) -> FxHashSet<RcLocal> {
 
 fn collect_block_writes(block: &Block, written: &mut FxHashSet<RcLocal>) {
     for statement in &block.0 {
-        written.extend(statement.values_written().into_iter().cloned());
+        statement.visit_local_writes(&mut |local| {
+            written.insert(local.clone());
+            true
+        });
         match statement {
             Statement::If(node) => {
                 collect_block_writes(&node.then_block.lock(), written);
@@ -289,21 +343,35 @@ fn collect_block_writes(block: &Block, written: &mut FxHashSet<RcLocal>) {
     }
 }
 
-fn function_has_goto(block: &Block) -> bool {
-    block.0.iter().any(|statement| {
-        matches!(statement, Statement::Goto(_) | Statement::Label(_))
-            || match statement {
-                Statement::If(node) => {
-                    function_has_goto(&node.then_block.lock())
-                        || function_has_goto(&node.else_block.lock())
-                }
-                Statement::While(node) => function_has_goto(&node.block.lock()),
-                Statement::Repeat(node) => function_has_goto(&node.block.lock()),
-                Statement::NumericFor(node) => function_has_goto(&node.block.lock()),
-                Statement::GenericFor(node) => function_has_goto(&node.block.lock()),
-                _ => false,
+// None preserves the old goto/label bailout. Some(false) proves that an
+// initially empty state stays empty and no If condition is independently
+// reduced. This adds flags to the existing structured-block scan, without
+// walking expressions or entering closure bodies.
+fn constant_opportunities(block: &Block) -> Option<bool> {
+    let mut opportunity = false;
+    for statement in &block.0 {
+        match statement {
+            Statement::Goto(_) | Statement::Label(_) => return None,
+            Statement::Assign(assign) => {
+                opportunity |= !assign.parallel
+                    && matches!(assign.left.as_slice(), [LValue::Local(_)])
+                    && matches!(assign.right.as_slice(), [RValue::Literal(Literal::Boolean(_))]);
             }
-    })
+            Statement::If(node) => {
+                // Keep scanning both arms even when an opportunity is known:
+                // a goto anywhere disables propagation for this function.
+                constant_opportunities(&node.then_block.lock())?;
+                constant_opportunities(&node.else_block.lock())?;
+                opportunity = true;
+            }
+            Statement::While(node) => opportunity |= constant_opportunities(&node.block.lock())?,
+            Statement::Repeat(node) => opportunity |= constant_opportunities(&node.block.lock())?,
+            Statement::NumericFor(node) => opportunity |= constant_opportunities(&node.block.lock())?,
+            Statement::GenericFor(node) => opportunity |= constant_opportunities(&node.block.lock())?,
+            _ => {}
+        }
+    }
+    Some(opportunity)
 }
 
 // ---------------------------------------------------------------------------
@@ -327,15 +395,18 @@ fn collect_current_function_usage_in_block(
     usage: &mut FxHashMap<RcLocal, crate::inline_temps::Usage>,
 ) {
     for statement in &block.0 {
-        for local in statement.values_read() {
+        statement.visit_local_reads(&mut |local| {
             usage.entry(local.clone()).or_default().reads += 1;
-        }
-        for local in statement.values_written() {
+            true
+        });
+        statement.visit_local_writes(&mut |local| {
             usage.entry(local.clone()).or_default().writes += 1;
-        }
-        for value in crate::deinline::stmt_rvalues(statement) {
+            true
+        });
+        crate::deinline::visit_stmt_rvalues(statement, &mut |value| {
             record_direct_closure_captures(value, usage);
-        }
+            true
+        });
         match statement {
             Statement::If(node) => {
                 collect_current_function_usage_in_block(&node.then_block.lock(), usage);
@@ -374,9 +445,10 @@ fn record_direct_closure_captures(
         // the closure's explicit upvalue list above.
         return;
     }
-    for child in value.rvalues() {
+    value.visit_rvalues(&mut |child| {
         record_direct_closure_captures(child, usage);
-    }
+        true
+    });
 }
 
 #[derive(Debug)]
@@ -529,11 +601,16 @@ fn dead_store_candidate(
     if !assign.right.is_empty() && !assign.right.first().is_some_and(disposable_unused_value) {
         return None;
     }
+    let mut reads = Vec::new();
+    statement.visit_local_reads(&mut |local| {
+        reads.push(local.clone());
+        true
+    });
     Some(DeadStoreCandidate {
         statement_id,
         destination: local.clone(),
         prefix: assign.prefix,
-        reads: statement.values_read().into_iter().cloned().collect(),
+        reads,
     })
 }
 
@@ -601,95 +678,18 @@ fn disposable_unused_value(value: &RValue) -> bool {
     // Keep recovered helper definitions and named tables even when all of their
     // optimized call sites disappeared; they are valuable source structure and
     // are not the scalar/lookup junk this cleanup targets.
-    !contains_structural_definition(value) && crate::side_effects::is_total_pure(value)
+    // Use the bounded effect summary of the emitted expression. In particular,
+    // comparisons with primitive literals cannot dispatch __eq, but math.pi,
+    // non-finite constants and vector literals can emit environment lookups.
+    // Reading a captured value is disposable here: this deletes an unused
+    // evaluation in place, never moves it across a callback.
+    let summary = crate::effects::summarize(value, &|_| true);
+    !summary.exhausted && summary.effects.is_total_pure() && !contains_structural_definition(value)
 }
 
 fn contains_structural_definition(value: &RValue) -> bool {
     matches!(value, RValue::Closure(_) | RValue::Table(_))
-        || value
-            .rvalues()
-            .into_iter()
-            .any(contains_structural_definition)
-}
-
-// ---------------------------------------------------------------------------
-// 5.7: canonical Roblox literal APIs
-
-fn canonicalize_api_in_block(block: &mut Block) {
-    for statement in &mut block.0 {
-        for value in crate::deinline::stmt_rvalues_mut(statement) {
-            canonicalize_api_value(value);
-        }
-        match statement {
-            Statement::If(node) => {
-                canonicalize_api_in_block(&mut node.then_block.lock());
-                canonicalize_api_in_block(&mut node.else_block.lock());
-            }
-            Statement::While(node) => canonicalize_api_in_block(&mut node.block.lock()),
-            Statement::Repeat(node) => canonicalize_api_in_block(&mut node.block.lock()),
-            Statement::NumericFor(node) => canonicalize_api_in_block(&mut node.block.lock()),
-            Statement::GenericFor(node) => canonicalize_api_in_block(&mut node.block.lock()),
-            _ => {}
-        }
-    }
-}
-
-fn canonicalize_api_value(value: &mut RValue) {
-    if let RValue::Closure(closure) = value {
-        canonicalize_api_in_block(&mut closure.function.lock().body);
-        return;
-    }
-    for child in value.rvalues_mut() {
-        canonicalize_api_value(child);
-    }
-    if let Some(property) = canonical_api_property(value) {
-        *value = property;
-    }
-}
-
-fn canonical_api_property(value: &RValue) -> Option<RValue> {
-    let call = match value {
-        RValue::Call(call) => call,
-        RValue::Select(Select::Call(call)) => call,
-        _ => return None,
-    };
-    let RValue::Index(callee) = call.value.as_ref() else {
-        return None;
-    };
-    let RValue::Global(class) = callee.left.as_ref() else {
-        return None;
-    };
-    if !matches!(callee.right.as_ref(), RValue::Literal(Literal::String(key)) if key == b"new") {
-        return None;
-    }
-
-    let property = if class.0 == b"Vector3" && all_exact_numbers(&call.arguments, 3, 0.0) {
-        "zero"
-    } else if class.0 == b"Vector3" && all_exact_numbers(&call.arguments, 3, 1.0) {
-        "one"
-    } else if class.0 == b"Vector2" && all_exact_numbers(&call.arguments, 2, 0.0) {
-        "zero"
-    } else if class.0 == b"Vector2" && all_exact_numbers(&call.arguments, 2, 1.0) {
-        "one"
-    } else if class.0 == b"CFrame" && call.arguments.is_empty() {
-        "identity"
-    } else {
-        return None;
-    };
-    Some(
-        Index::new(
-            RValue::Global(Global(class.0.clone())),
-            RValue::Literal(Literal::String(property.as_bytes().to_vec())),
-        )
-        .into(),
-    )
-}
-
-fn all_exact_numbers(values: &[RValue], count: usize, expected: f64) -> bool {
-    values.len() == count
-        && values.iter().all(
-            |value| matches!(value, RValue::Literal(Literal::Number(number)) if number.to_bits() == expected.to_bits()),
-        )
+        || !value.visit_rvalues(&mut |child| !contains_structural_definition(child))
 }
 
 // ---------------------------------------------------------------------------
@@ -782,10 +782,7 @@ fn recover_named_module_return(block: &mut Block, script_name: Option<&str>) {
     let base = script_name
         .and_then(crate::name_locals::script_module_hint)
         .unwrap_or_else(|| "Module".to_string());
-    let module = RcLocal::new(Local::new(Some(crate::rehoist_constants::unique_name(
-        &base,
-        &mut reserved,
-    ))));
+    let module = crate::rehoist_constants::unique_local(&base, &mut reserved);
     let mut statements = Vec::with_capacity(table.0.len() + 2);
     let mut declaration = Assign::new(
         vec![LValue::Local(module.clone())],
@@ -837,8 +834,11 @@ fn count_declared_locals(block: &Block) -> usize {
             direct
                 + match statement {
                     Statement::If(node) => {
-                        count_declared_locals(&node.then_block.lock())
-                            + count_declared_locals(&node.else_block.lock())
+                        // Both arms can share a Block after an AST clone.
+                        // Release the first lock before acquiring the second.
+                        let then_count = count_declared_locals(&node.then_block.lock());
+                        let else_count = count_declared_locals(&node.else_block.lock());
+                        then_count + else_count
                     }
                     Statement::While(node) => count_declared_locals(&node.block.lock()),
                     Statement::Repeat(node) => count_declared_locals(&node.block.lock()),
@@ -861,9 +861,10 @@ fn closure_functions(block: &Block) -> Vec<ClosureFunction> {
 
 fn collect_closure_functions(block: &Block, functions: &mut Vec<ClosureFunction>) {
     for statement in &block.0 {
-        for value in crate::deinline::stmt_rvalues(statement) {
+        crate::deinline::visit_stmt_rvalues(statement, &mut |value| {
             collect_closures_in_value(value, functions);
-        }
+            true
+        });
         match statement {
             Statement::If(node) => {
                 collect_closure_functions(&node.then_block.lock(), functions);
@@ -890,9 +891,20 @@ fn collect_closures_in_value(value: &RValue, functions: &mut Vec<ClosureFunction
         functions.push((closure.function.clone(), upvalues));
         return;
     }
-    for child in value.rvalues() {
+    value.visit_rvalues(&mut |child| {
         collect_closures_in_value(child, functions);
-    }
+        true
+    });
+}
+
+#[cfg(test)]
+mod reference;
+#[cfg(test)]
+mod differential;
+#[cfg(test)]
+thread_local! {
+    static CONSTANT_VALUE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static REFERENCE_VALUE_VISITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 #[cfg(test)]
@@ -934,6 +946,7 @@ mod tests {
 
     fn closure() -> RValue {
         RValue::Closure(Closure {
+            node_origin: Default::default(),
             function: ByAddress(Arc::new(Mutex::new(Function::default()))),
             upvalues: vec![],
         })
@@ -960,10 +973,34 @@ mod tests {
     }
 
     #[test]
+    fn runtime_guard_values_keep_signed_zero_capture_and_unknown_types() {
+        use super::{ConstantState, refine_guard, FxHashSet};
+        let x = local("x");
+        x.0.lock().1 = Some("number".into());
+        for literal in [Literal::Boolean(false), Literal::Nil, Literal::Number(7.0), Literal::Number(0.0), Literal::Number(-0.0), Literal::Number(f64::INFINITY)] {
+            let mut state = ConstantState::default();
+            let condition = crate::Binary::new(x.clone().into(), literal.clone().into(), crate::BinaryOperation::Equal).into();
+            refine_guard(&condition, true, &FxHashSet::default(), &mut state, 0);
+            let exact = matches!(literal, Literal::Boolean(_) | Literal::Nil | Literal::Number(7.0));
+            assert_eq!(state.contains_key(&x), exact);
+            let mut opposite = ConstantState::default();
+            refine_guard(&condition, false, &FxHashSet::default(), &mut opposite, 0);
+            assert!(opposite.is_empty());
+            let mut captured = ConstantState::default();
+            refine_guard(&condition, true, &[x.clone()].into_iter().collect(), &mut captured, 0);
+            assert!(captured.is_empty());
+        }
+        let mut state = ConstantState::default();
+        refine_guard(&x.clone().into(), false, &FxHashSet::default(), &mut state, 0);
+        assert!(state.is_empty(), "falsey does not distinguish false from nil");
+    }
+
+    #[test]
     fn captured_boolean_is_not_propagated_across_calls() {
         let flag = local("flag");
         let holder = local("holder");
         let captured = RValue::Closure(Closure {
+            node_origin: Default::default(),
             function: ByAddress(Arc::new(Mutex::new(Function::default()))),
             upvalues: vec![Upvalue::Ref(flag.clone())],
         });
@@ -989,6 +1026,7 @@ mod tests {
         let flag = local("flag");
         let holder = local("holder");
         let captured = RValue::Closure(Closure {
+            node_origin: Default::default(),
             function: ByAddress(Arc::new(Mutex::new(Function::default()))),
             upvalues: vec![Upvalue::Ref(flag.clone())],
         });
@@ -1024,6 +1062,7 @@ mod tests {
         let mut block = Block(vec![declare(
             &holder,
             vec![RValue::Closure(Closure {
+                node_origin: Default::default(),
                 function: ByAddress(function.clone()),
                 upvalues: vec![Upvalue::Ref(flag)],
             })],
@@ -1057,6 +1096,38 @@ mod tests {
         let output = block.to_string();
         assert!(output.contains("while flag do"), "{output}");
         assert!(!output.contains("while true do"), "{output}");
+    }
+
+    #[test]
+    fn discarded_primitive_checks_use_emitted_effects_and_keep_observers() {
+        let value = local("value");
+        let equality = |right: RValue| -> RValue {
+            Binary::new(value.clone().into(), right, BinaryOperation::Equal).into()
+        };
+        let cases = vec![
+            (equality(Literal::Nil.into()), false),
+            (equality(boolean(false)), false),
+            (equality(string("ready")), false),
+            (equality(Literal::Number(2.0).into()), false),
+            (equality(local("other").into()), true),
+            (Index::new(value.clone().into(), string("field")).into(), true),
+            (Call::new(global("observe"), vec![]).into(), true),
+            (Literal::Number(std::f64::consts::PI).into(), true),
+            (Literal::Number(f64::INFINITY).into(), true),
+            (Literal::Vector(1.0, 2.0, 3.0).into(), true),
+            (Binary::new(value.clone().into(), Literal::Number(1.0).into(), BinaryOperation::Add).into(), true),
+            (RValue::Table(Table::default()), true),
+        ];
+        for (rhs, kept) in cases {
+            let mut block = Block(vec![declare(&local("_"), vec![rhs])]);
+            let before = block.to_string();
+            cleanup_final(&mut block, None);
+            assert_eq!(!block.is_empty(), kept, "{before}");
+            if kept { assert_eq!(block.to_string(), before); }
+        }
+        // Exhausted summaries never grant permission to discard.
+        let wide = Table::new(vec![(None, boolean(true)); 8193]);
+        assert!(!super::disposable_unused_value(&wide.into()));
     }
 
     #[test]
@@ -1156,7 +1227,7 @@ mod tests {
     }
 
     #[test]
-    fn canonicalizes_vector_and_cframe_literals() {
+    fn preserves_calls_to_environment_provided_constructors() {
         let constructor = |class: &str, values: Vec<RValue>| {
             Call::new(
                 RValue::Index(Index::new(global(class), string("new"))),
@@ -1179,7 +1250,7 @@ mod tests {
 
         cleanup_final(&mut block, None);
 
-        assert_eq!(block.to_string(), "return Vector3.zero, CFrame.identity");
+        assert_eq!(block.to_string(), "return Vector3.new(0, 0, 0), CFrame.new()");
     }
 
     #[test]
@@ -1202,7 +1273,7 @@ mod tests {
 
     #[test]
     fn multi_function_return_table_recovers_named_module() {
-        let mut block = Block(vec![Return::new(vec![RValue::Table(Table(vec![
+        let mut block = Block(vec![Return::new(vec![RValue::Table(Table::new(vec![
             (Some(string("Play")), closure()),
             (Some(string("Stop")), closure()),
         ]))])

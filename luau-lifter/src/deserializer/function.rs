@@ -2,10 +2,9 @@ use nom::{
     IResult,
     number::complete::{le_u8, le_u32},
 };
-use nom_leb128::leb128_usize;
+use nom_leb128::{leb128_u64, leb128_usize};
 
 use super::{
-    Dialect,
     constant::Constant,
     list::{parse_list, parse_list_len},
 };
@@ -23,7 +22,113 @@ pub struct DebugLocal {
     pub register: u8,
 }
 
+/// The main prototype of a module with the `--!native` hot comment.
+pub(crate) const LPF_NATIVE_MODULE: u8 = 1 << 0;
+/// A function with the `@native` attribute.
+pub(crate) const LPF_NATIVE_FUNCTION: u8 = 1 << 2;
 const LPF_INLINABLE: u8 = 1 << 3;
+
+/// Bytecode type tags (`LuauBytecodeType` in Luau's `Bytecode.h`).
+pub const LBC_TYPE_NIL: u8 = 0;
+pub const LBC_TYPE_BOOLEAN: u8 = 1;
+pub const LBC_TYPE_NUMBER: u8 = 2;
+pub const LBC_TYPE_STRING: u8 = 3;
+pub const LBC_TYPE_TABLE: u8 = 4;
+pub const LBC_TYPE_FUNCTION: u8 = 5;
+pub const LBC_TYPE_THREAD: u8 = 6;
+pub const LBC_TYPE_USERDATA: u8 = 7;
+pub const LBC_TYPE_VECTOR: u8 = 8;
+pub const LBC_TYPE_BUFFER: u8 = 9;
+pub const LBC_TYPE_INTEGER: u8 = 10;
+pub const LBC_TYPE_ANY: u8 = 15;
+pub const LBC_TYPE_TAGGED_USERDATA_BASE: u8 = 64;
+pub const LBC_TYPE_TAGGED_USERDATA_END: u8 = 64 + 32;
+pub const LBC_TYPE_OPTIONAL_BIT: u8 = 1 << 7;
+
+/// A typed local register range recorded by the compiler (types version >= 2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TypedLocal {
+    pub type_tag: u8,
+    pub register: u8,
+    pub start_pc: usize,
+    pub end_pc: usize,
+}
+
+/// Compiler-recorded type information for one prototype.
+///
+/// `parameter_types` is the function signature (`LBC_TYPE_FUNCTION`, count,
+/// then one tag per parameter, `self` included); it is present only when the
+/// source annotated at least one parameter with a non-`any` type, so every
+/// entry here is source-recoverable.  Local and upvalue tags are inferred by
+/// the compiler from annotations and literal/builtin expressions.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct FunctionTypeInfo {
+    pub parameter_types: Vec<u8>,
+    pub upvalue_types: Vec<u8>,
+    pub local_types: Vec<TypedLocal>,
+}
+
+impl FunctionTypeInfo {
+    fn parse(raw: &[u8]) -> Option<Self> {
+        fn varint(input: &[u8], pos: &mut usize) -> Option<usize> {
+            let mut result = 0usize;
+            let mut shift = 0;
+            loop {
+                let byte = *input.get(*pos)?;
+                *pos += 1;
+                let part = usize::from(byte & 0x7f);
+                if shift >= usize::BITS || part > (usize::MAX >> shift) { return None; }
+                result |= part << shift;
+                shift += 7;
+                if byte & 0x80 == 0 {
+                    return Some(result);
+                }
+            }
+        }
+        if raw.is_empty() {
+            return None;
+        }
+        let mut pos = 0;
+        let function_size = varint(raw, &mut pos)?;
+        let upvalue_count = varint(raw, &mut pos)?;
+        let local_count = varint(raw, &mut pos)?;
+        let function = raw.get(pos..pos.checked_add(function_size)?)?;
+        pos += function_size;
+        let parameter_types = match function {
+            [] => Vec::new(),
+            [LBC_TYPE_FUNCTION, count, rest @ ..] if rest.len() == usize::from(*count) => {
+                rest.to_vec()
+            }
+            _ => return None,
+        };
+        let upvalue_types = raw.get(pos..pos.checked_add(upvalue_count)?)?.to_vec();
+        pos += upvalue_count;
+        // A record takes at least four bytes (tag, register, two varints):
+        // a count the blob cannot hold is corrupt, not an allocation size.
+        if local_count > (raw.len() - pos) / 4 {
+            return None;
+        }
+        let mut local_types = Vec::with_capacity(local_count);
+        for _ in 0..local_count {
+            let type_tag = *raw.get(pos)?;
+            let register = *raw.get(pos + 1)?;
+            pos += 2;
+            let start_pc = varint(raw, &mut pos)?;
+            let length = varint(raw, &mut pos)?;
+            local_types.push(TypedLocal {
+                type_tag,
+                register,
+                start_pc,
+                end_pc: start_pc.checked_add(length)?,
+            });
+        }
+        Some(Self {
+            parameter_types,
+            upvalue_types,
+            local_types,
+        })
+    }
+}
 
 #[derive(Debug)]
 pub struct Function {
@@ -31,6 +136,8 @@ pub struct Function {
     pub num_parameters: u8,
     pub num_upvalues: u8,
     pub is_vararg: bool,
+    /// `LuauProtoFlag` bits (`LPF_*`).
+    pub flags: u8,
     //pub instructions: Vec<u32>,
     pub instructions: Vec<Instruction>,
     pub constants: Vec<Constant>,
@@ -44,56 +151,25 @@ pub struct Function {
     pub debug_locals: Vec<DebugLocal>,
     /// Ordered one-based string-table indices, one entry per upvalue slot.
     pub debug_upvalue_name_indices: Vec<usize>,
+    /// Compiler-recorded type information (bytecode version >= 4, types
+    /// version 2/3), when the prototype carries any.
+    pub type_info: Option<FunctionTypeInfo>,
 }
 
 impl Function {
-    fn parse_instructions(vec: &[u32], encode_key: u8) -> Result<Vec<Instruction>, ()> {
-        let mut v: Vec<Instruction> = Vec::new();
-        let mut pc = 0;
+    fn parse_instructions(mut words: impl ExactSizeIterator<Item = u32>, encode_key: u8) -> Result<Vec<Instruction>, ()> {
+        let mut v: Vec<Instruction> = Vec::with_capacity(words.len());
 
-        while pc < vec.len() {
-            let ins = Instruction::parse(vec[pc], encode_key).map_err(|_| ())?;
+        while let Some(word) = words.next() {
+            let ins = Instruction::parse(word, encode_key).map_err(|_| ())?;
             let op = match ins {
                 Instruction::BC { op_code, .. } => op_code,
                 Instruction::AD { op_code, .. } => op_code,
                 Instruction::E { op_code, .. } => op_code,
             };
 
-            // handle ops with aux values
-            match op {
-                OpCode::LOP_GETGLOBAL
-                | OpCode::LOP_SETGLOBAL
-                | OpCode::LOP_GETIMPORT
-                | OpCode::LOP_GETTABLEKS
-                | OpCode::LOP_SETTABLEKS
-                | OpCode::LOP_NAMECALL
-                | OpCode::LOP_JUMPIFEQ
-                | OpCode::LOP_JUMPIFLE
-                | OpCode::LOP_JUMPIFLT
-                | OpCode::LOP_JUMPIFNOTEQ
-                | OpCode::LOP_JUMPIFNOTLE
-                | OpCode::LOP_JUMPIFNOTLT
-                | OpCode::LOP_NEWTABLE
-                | OpCode::LOP_SETLIST
-                | OpCode::LOP_FORGLOOP
-                | OpCode::LOP_LOADKX
-                | OpCode::LOP_FASTCALL2
-                | OpCode::LOP_FASTCALL2K
-                | OpCode::LOP_FASTCALL3
-                | OpCode::LOP_JUMPXEQKNIL
-                | OpCode::LOP_JUMPXEQKB
-                | OpCode::LOP_JUMPXEQKN
-                | OpCode::LOP_JUMPXEQKS
-                // v9/v10/v11 aux-bearing opcodes (getOpLength == 2). Omitting any of
-                // these would desync the instruction stream of every proto that uses them.
-                | OpCode::LOP_GETUDATAKS
-                | OpCode::LOP_SETUDATAKS
-                | OpCode::LOP_NAMECALLUDATA
-                | OpCode::LOP_NEWCLASSMEMBER
-                | OpCode::LOP_CALLFB
-                | OpCode::LOP_CMPPROTO => {
-                    let aux = *vec.get(pc + 1).ok_or(())?;
-                    pc += 2;
+            if op.has_aux() {
+                    let aux = words.next().ok_or(())?;
                     match ins {
                         Instruction::BC {
                             op_code, a, b, c, ..
@@ -118,44 +194,50 @@ impl Function {
                         c: 0,
                         aux: 0,
                     });
-                }
-                _ => {
-                    v.push(ins);
-                    pc += 1;
-                }
+            } else {
+                v.push(ins);
             }
+
         }
 
         Ok(v)
     }
 
-    pub(crate) fn parse(
-        input: &[u8],
-        encode_key: u8,
-        version: u8,
-        dialect: Dialect,
-    ) -> IResult<&[u8], Self> {
+    #[cfg(test)]
+    pub(crate) fn parse(input: &[u8], encode_key: u8, version: u8) -> IResult<&[u8], Self> {
+        Self::parse_with_dialect(input, encode_key, version, super::Dialect::Luau)
+    }
+
+    pub(crate) fn parse_with_dialect(input: &[u8], encode_key: u8, version: u8, dialect: super::Dialect) -> IResult<&[u8], Self> {
         let (input, max_stack_size) = le_u8(input)?;
         let (input, num_parameters) = le_u8(input)?;
         let (input, num_upvalues) = le_u8(input)?;
         let (input, is_vararg) = le_u8(input)?;
 
         let (input, flags) = le_u8(input)?;
-        let (input, _) = parse_list(input, le_u8)?;
+        let (input, type_info_len) = nom_leb128::leb128_usize(input)?;
+        let (input, raw_type_info) = nom::bytes::complete::take(type_info_len)(input)?;
+        let type_info = FunctionTypeInfo::parse(raw_type_info);
 
-        let (input, u32_instructions) = parse_list(input, le_u32)?;
-        if u32_instructions.is_empty() {
+        let (input, instruction_count) = nom_leb128::leb128_usize(input)?;
+        if instruction_count == 0 {
             return Err(nom::Err::Failure(nom::error::Error::new(
                 input,
                 nom::error::ErrorKind::Verify,
             )));
         }
-        //let (input, instructions) = parse_list(input, Function::parse_instrution)?;
+        let byte_count = instruction_count.checked_mul(4).ok_or_else(|| {
+            nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Count))
+        })?;
+        let (input, raw_instructions) = nom::bytes::complete::take(byte_count)(input)?;
+        let words = raw_instructions.chunks_exact(4).map(|bytes| {
+            u32::from_le_bytes(bytes.try_into().unwrap())
+        });
         let instructions =
-            Self::parse_instructions(&u32_instructions, encode_key).map_err(|_| {
+            Self::parse_instructions(words, encode_key).map_err(|_| {
                 nom::Err::Failure(nom::error::Error::new(input, nom::error::ErrorKind::Verify))
             })?;
-        let (input, constants) = parse_list(input, |i| Constant::parse(i, version, dialect))?;
+        let (input, constants) = parse_list(input, |i| Constant::parse_with_dialect(i, version, dialect))?;
         let (input, functions) = parse_list(input, leb128_usize)?;
         let (input, line_defined) = leb128_usize(input)?;
         let (input, function_name) = leb128_usize(input)?;
@@ -177,7 +259,7 @@ impl Function {
             0 => (input, None),
             _ => {
                 let (input, line_info_delta) =
-                    parse_list_len(input, le_u8, u32_instructions.len())?;
+                    parse_list_len(input, le_u8, instruction_count)?;
                 (input, Some(line_info_delta))
             }
         };
@@ -187,7 +269,7 @@ impl Function {
                 let (input, abs_line_info_delta) = parse_list_len(
                     input,
                     le_u32,
-                    ((u32_instructions.len() - 1) >> line_gap_log2.unwrap()) + 1,
+                    ((instruction_count - 1) >> line_gap_log2.unwrap()) + 1,
                 )?;
                 (input, Some(abs_line_info_delta))
             }
@@ -267,7 +349,9 @@ impl Function {
         // v12+ stores a cost-model varint for inlinable prototypes. It has no
         // source-level meaning, but must be consumed before the next prototype.
         let input = if version >= 12 && flags & LPF_INLINABLE != 0 {
-            let (input, _) = leb128_usize(input)?;
+            // Upstream readVarInt64: metadata width is independent of the host
+            // pointer width (in particular the wasm32 worker).
+            let (input, _) = leb128_u64(input)?;
             input
         } else {
             input
@@ -279,6 +363,7 @@ impl Function {
                 num_parameters,
                 num_upvalues,
                 is_vararg: is_vararg != 0u8,
+                flags,
                 instructions,
                 constants,
                 functions,
@@ -290,6 +375,7 @@ impl Function {
                 has_debug_info,
                 debug_locals,
                 debug_upvalue_name_indices,
+                type_info,
             },
         ))
     }
@@ -297,7 +383,52 @@ impl Function {
 
 #[cfg(test)]
 mod tests {
-    use super::{Dialect, Function};
+    use super::{Function, FunctionTypeInfo, TypedLocal};
+
+    #[test]
+    fn parses_type_info_block() {
+        // typeinfo: function sig size=5, 1 upvalue, 2 locals
+        // sig: FUNCTION, 3 params: number, string?, tagged#2
+        let raw = [
+            5u8, 1, 2, // sizes
+            super::LBC_TYPE_FUNCTION, 3, super::LBC_TYPE_NUMBER,
+            super::LBC_TYPE_STRING | super::LBC_TYPE_OPTIONAL_BIT,
+            super::LBC_TYPE_TAGGED_USERDATA_BASE + 2,
+            super::LBC_TYPE_TABLE, // upvalue
+            super::LBC_TYPE_VECTOR, 4, 10, 5, // local: vector in r4, pc 10..15
+            super::LBC_TYPE_BUFFER, 7, 0x80, 0x01, 3, // local: buffer in r7, pc 128..131
+        ];
+        let info = FunctionTypeInfo::parse(&raw).expect("typeinfo");
+        assert_eq!(
+            info.parameter_types,
+            vec![
+                super::LBC_TYPE_NUMBER,
+                super::LBC_TYPE_STRING | super::LBC_TYPE_OPTIONAL_BIT,
+                super::LBC_TYPE_TAGGED_USERDATA_BASE + 2
+            ]
+        );
+        assert_eq!(info.upvalue_types, vec![super::LBC_TYPE_TABLE]);
+        assert_eq!(
+            info.local_types,
+            vec![
+                TypedLocal { type_tag: super::LBC_TYPE_VECTOR, register: 4, start_pc: 10, end_pc: 15 },
+                TypedLocal { type_tag: super::LBC_TYPE_BUFFER, register: 7, start_pc: 128, end_pc: 131 },
+            ]
+        );
+        // Empty block and truncated block.
+        assert!(FunctionTypeInfo::parse(&[]).is_none());
+        assert!(FunctionTypeInfo::parse(&[5, 0, 0, super::LBC_TYPE_FUNCTION, 3]).is_none());
+        // A local count no blob can hold is refused before anything is
+        // allocated for it (2^55 records would abort the process).
+        let mut huge = vec![0, 0];
+        huge.extend(leb128(1 << 55));
+        huge.extend([0; 8]);
+        assert!(FunctionTypeInfo::parse(&huge).is_none());
+        let mut sizes = vec![];
+        sizes.extend(leb128(usize::MAX));
+        sizes.extend([0, 0]);
+        assert!(FunctionTypeInfo::parse(&sizes).is_none());
+    }
 
     fn leb128(mut value: usize) -> Vec<u8> {
         let mut out = Vec::new();
@@ -335,8 +466,7 @@ mod tests {
         bytes.extend(leb128(3));
         bytes.extend(leb128(4));
 
-        let (rest, function) =
-            Function::parse(&bytes, 1, 9, Dialect::Luau).expect("function must parse");
+        let (rest, function) = Function::parse(&bytes, 1, 9).expect("function must parse");
         assert!(rest.is_empty());
         assert_eq!(function.debug_locals.len(), 1);
         let local = &function.debug_locals[0];
@@ -353,18 +483,18 @@ mod tests {
         bytes.extend(leb128(0)); // type info
         bytes.extend(leb128(0)); // instruction count
 
-        assert!(Function::parse(&bytes, 1, 9, Dialect::Luau).is_err());
+        assert!(Function::parse(&bytes, 1, 9).is_err());
     }
 
     #[test]
     fn rejects_truncated_aux_instruction() {
         // GETGLOBAL has a two-word encoding, but only its opcode word is present.
-        assert!(Function::parse_instructions(&[7], 1).is_err());
+        assert!(Function::parse_instructions([7].into_iter(), 1).is_err());
     }
 
     #[test]
     fn rejects_invalid_opcode_without_panicking() {
-        assert!(Function::parse_instructions(&[96], 1).is_err());
+        assert!(Function::parse_instructions([96].into_iter(), 1).is_err());
     }
 
     #[test]
@@ -380,6 +510,6 @@ mod tests {
         bytes.push(1); // has line info
         bytes.push(u8::MAX); // invalid shift amount
 
-        assert!(Function::parse(&bytes, 1, 9, Dialect::Luau).is_err());
+        assert!(Function::parse(&bytes, 1, 9).is_err());
     }
 }

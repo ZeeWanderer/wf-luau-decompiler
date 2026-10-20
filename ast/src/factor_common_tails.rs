@@ -14,7 +14,7 @@ use crate::{
     deinline::{
         collect_declared_locals, unify_local, unify_lvalue, unify_rvalue, Bindings, MatchCtx,
     },
-    Block, LValue, RValue, Statement, Traverse,
+    Block, Call, Continue, LValue, RValue, Return, Select, Statement, Traverse,
 };
 use parking_lot::Mutex;
 use rustc_hash::FxHashSet;
@@ -23,42 +23,96 @@ use triomphe::Arc;
 /// Remove exact duplicate continuations throughout `body`, including closures.
 /// Returns whether the AST changed.
 pub fn factor_common_tails(body: &mut Block) -> bool {
-    unshare_blocks(body);
-    factor_block(&mut body.0)
+    {
+        let _span = crate::telemetry::Span::new("TAIL_UNSHARE");
+        unshare_blocks(body);
+    }
+    let _span = crate::telemetry::Span::new("TAIL_SCAN");
+    factor_block::<true>(&mut body.0, Some(Tail::Return), FactorMode::WholeChunk)
+}
+
+/// Factor only this function's structured blocks. The parallel lifter calls
+/// this before declarations; nested closure functions are owned by separate
+/// workers and must not be inspected or mutated through their bodies here.
+pub fn factor_function_tails(body: &mut Block, protected: &FxHashSet<crate::RcLocal>) -> bool {
+    {
+        let _span = crate::telemetry::Span::new("TAIL_UNSHARE_FUNCTION");
+        unshare_blocks_impl(body, false);
+    }
+    let _span = crate::telemetry::Span::new("TAIL_SCAN_FUNCTION");
+    factor_block::<true>(
+        &mut body.0,
+        Some(Tail::Return),
+        FactorMode::BeforeDeclarations(protected),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum FactorMode<'a> {
+    WholeChunk,
+    BeforeDeclarations(&'a FxHashSet<crate::RcLocal>),
+}
+
+/// The statement that is a semantic NO-OP when appended to a block in tail
+/// position: falling off the end of a function body returns nothing (`return`),
+/// falling off the end of a `while`/`for` body starts the next iteration
+/// (`continue`). A `repeat` body is excluded (`continue` there jumps to the
+/// `until` condition with extra scoping rules). Tail position propagates to both
+/// arms of an `if` that is the LAST statement of a tail block.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum Tail {
+    Return,
+    Continue,
+}
+
+impl Tail {
+    fn statement(self) -> Statement {
+        match self {
+            Tail::Return => Statement::Return(Return::default()),
+            Tail::Continue => Statement::Continue(Continue {}),
+        }
+    }
 }
 
 /// Give every statement owner a private nested-block tree before owner-local
 /// rewrites. Luau inlining can leave shallow-cloned statements sharing these
 /// Arcs; truncating one arm while it is shared would silently mutate siblings.
 pub(crate) fn unshare_blocks(body: &mut Block) {
+    unshare_blocks_impl(body, true);
+}
+
+fn unshare_blocks_impl(body: &mut Block, include_closures: bool) {
     for statement in &mut body.0 {
         match statement {
             Statement::If(node) => {
                 ensure_unique(&mut node.then_block);
                 ensure_unique(&mut node.else_block);
-                unshare_blocks(&mut node.then_block.lock());
-                unshare_blocks(&mut node.else_block.lock());
+                unshare_blocks_impl(&mut node.then_block.lock(), include_closures);
+                unshare_blocks_impl(&mut node.else_block.lock(), include_closures);
             }
             Statement::While(node) => {
                 ensure_unique(&mut node.block);
-                unshare_blocks(&mut node.block.lock());
+                unshare_blocks_impl(&mut node.block.lock(), include_closures);
             }
             Statement::Repeat(node) => {
                 ensure_unique(&mut node.block);
-                unshare_blocks(&mut node.block.lock());
+                unshare_blocks_impl(&mut node.block.lock(), include_closures);
             }
             Statement::NumericFor(node) => {
                 ensure_unique(&mut node.block);
-                unshare_blocks(&mut node.block.lock());
+                unshare_blocks_impl(&mut node.block.lock(), include_closures);
             }
             Statement::GenericFor(node) => {
                 ensure_unique(&mut node.block);
-                unshare_blocks(&mut node.block.lock());
+                unshare_blocks_impl(&mut node.block.lock(), include_closures);
             }
             _ => {}
         }
-        for value in crate::deinline::stmt_rvalues_mut(statement) {
-            unshare_rvalue(value);
+        if include_closures {
+            crate::deinline::visit_stmt_rvalues_mut(statement, &mut |value| {
+                unshare_rvalue(value);
+                true
+            });
         }
     }
 }
@@ -75,76 +129,129 @@ fn unshare_rvalue(value: &mut RValue) {
         unshare_blocks(&mut closure.function.0.lock().body);
         return;
     }
-    for child in value.rvalues_mut() {
+    value.visit_rvalues_mut(&mut |child| {
         unshare_rvalue(child);
-    }
+        true
+    });
 }
 
-fn factor_block(stmts: &mut Vec<Statement>) -> bool {
+// The false specialization is exercised by differential tests as the original
+// full-rescan algorithm. Release callers instantiate only the dirty-range path.
+fn factor_block<const DIRTY_ONLY: bool>(stmts: &mut Vec<Statement>, tail: Option<Tail>, mode: FactorMode<'_>) -> bool {
     let mut changed = false;
 
     // Work bottom-up.  Shrinking an inner continuation often exposes a larger
     // common tail in its parent on the next local fixed-point iteration.
-    for stmt in stmts.iter_mut() {
-        changed |= factor_children(stmt);
+    let n = stmts.len();
+    crate::telemetry::count("tail_initial_child_visits", n as u64);
+    for (index, stmt) in stmts.iter_mut().enumerate() {
+        changed |= factor_children::<DIRTY_ONLY>(stmt, tail.filter(|_| index + 1 == n), mode);
     }
 
     loop {
-        let Some(action) = find_action(stmts) else {
+        let Some(action) = find_action(stmts, tail, mode) else {
             break;
         };
+        let before_len = stmts.len();
+        let at = action.at();
         apply_action(stmts, action);
+        crate::telemetry::count("tail_actions", 1);
         changed = true;
 
-        // A moved tail can itself contain conditionals.  It was already visited
-        // in both source branches, so no recursive work is normally needed, but
-        // re-running children here keeps the invariant obvious and handles a
-        // newly adjacent parent continuation in one invocation.
-        for stmt in stmts.iter_mut() {
-            changed |= factor_children(stmt);
+        // Every action mutates only this if's arms and inserts a contiguous
+        // tail immediately after it (or inserts nothing for ReuseParent).
+        // Revisit that interval, including the changed if's new tail context.
+        // Other statements retain their child trees and tail contexts, already
+        // at a fixed point from the bottom-up walk. Unsharing at the entrypoint
+        // is essential: no sibling block owner may change through these arms.
+        // Closure identities/captures are unchanged; matching does not inspect
+        // shared closure bodies, whose root context is always Return.
+        // Keep scanning the ENTIRE parent: moved statements can match a new
+        // following continuation, and an earlier if can now reuse this region.
+        let n = stmts.len();
+        let dirty_end = at + 1 + (n - before_len);
+        let revisit = if DIRTY_ONLY { at..dirty_end } else { 0..n };
+        crate::telemetry::count("tail_revisited_children", revisit.len() as u64);
+        crate::telemetry::count("tail_skipped_children", (n - revisit.len()) as u64);
+        for index in revisit {
+            changed |= factor_children::<DIRTY_ONLY>(&mut stmts[index], tail.filter(|_| index + 1 == n), mode);
         }
     }
 
     changed
 }
 
-fn factor_children(stmt: &mut Statement) -> bool {
+/// `tail` is the tail context of `stmt`'s own position: `Some` only when `stmt`
+/// is the last statement of a tail block (so its `if` arms are tail blocks too).
+fn factor_children<const DIRTY_ONLY: bool>(stmt: &mut Statement, tail: Option<Tail>, mode: FactorMode<'_>) -> bool {
     let mut changed = match stmt {
         Statement::If(node) => {
-            factor_block(&mut node.then_block.lock().0)
-                | factor_block(&mut node.else_block.lock().0)
+            factor_block::<DIRTY_ONLY>(&mut node.then_block.lock().0, tail, mode)
+                | factor_block::<DIRTY_ONLY>(&mut node.else_block.lock().0, tail, mode)
         }
-        Statement::While(node) => factor_block(&mut node.block.lock().0),
-        Statement::Repeat(node) => factor_block(&mut node.block.lock().0),
-        Statement::NumericFor(node) => factor_block(&mut node.block.lock().0),
-        Statement::GenericFor(node) => factor_block(&mut node.block.lock().0),
+        Statement::While(node) => {
+            factor_block::<DIRTY_ONLY>(&mut node.block.lock().0, Some(Tail::Continue), mode)
+        }
+        Statement::Repeat(node) => factor_block::<DIRTY_ONLY>(&mut node.block.lock().0, None, mode),
+        Statement::NumericFor(node) => {
+            factor_block::<DIRTY_ONLY>(&mut node.block.lock().0, Some(Tail::Continue), mode)
+        }
+        Statement::GenericFor(node) => {
+            factor_block::<DIRTY_ONLY>(&mut node.block.lock().0, Some(Tail::Continue), mode)
+        }
         _ => false,
     };
 
     // Closure bodies can occur in any expression position, including conditions,
     // table fields and call arguments.  `Traverse` keeps this exhaustive when a
     // new expression form is added.
-    for value in crate::deinline::stmt_rvalues_mut(stmt) {
-        changed |= factor_in_rvalue(value);
+    if matches!(mode, FactorMode::WholeChunk) {
+        crate::deinline::visit_stmt_rvalues_mut(stmt, &mut |value| {
+            changed |= factor_in_rvalue::<DIRTY_ONLY>(value);
+            true
+        });
     }
     changed
 }
 
-fn factor_in_rvalue(value: &mut RValue) -> bool {
+fn factor_in_rvalue<const DIRTY_ONLY: bool>(value: &mut RValue) -> bool {
     if let RValue::Closure(closure) = value {
-        return factor_block(&mut closure.function.0.lock().body.0);
+        return factor_block::<DIRTY_ONLY>(
+            &mut closure.function.0.lock().body.0,
+            Some(Tail::Return),
+            FactorMode::WholeChunk,
+        );
     }
     let mut changed = false;
-    for child in value.rvalues_mut() {
-        changed |= factor_in_rvalue(child);
-    }
+    value.visit_rvalues_mut(&mut |child| {
+        changed |= factor_in_rvalue::<DIRTY_ONLY>(child);
+        true
+    });
     changed
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 enum Action {
     /// Both arms end in the same sequence.  Move one copy after the `if`.
     MergeArms { at: usize, count: usize },
+    /// Tail-position `if` (the last statement of a tail block) whose ENTIRE else
+    /// arm `S` is duplicated at the end of one or more LEAF paths of the then arm
+    /// (a leaf = the deepest arm block reached by descending through
+    /// last-statement `if`s). Hoist `S` after the `if`: strip it from the leaves
+    /// that end with it (they now fall through into the hoisted copy) and append
+    /// the tail terminator to every other fall-through leaf (a semantic no-op in
+    /// tail position, keeping those paths away from `S`). This is the structured
+    /// inverse of the CFG-to-tree cloning of a multi-entry shared continuation
+    /// (a `continue`-guarded fall-through in the source), which `MergeArms`
+    /// cannot see because the clones sit at different nesting depths.
+    HoistLeafTails {
+        at: usize,
+        /// Leaf paths of the then arm as then/else choices from the arm's own
+        /// last `if` downwards, with whether the leaf ends in `S` (strip) or
+        /// needs the terminator.
+        leaves: Vec<(Vec<bool>, bool)>,
+        terminator: Tail,
+    },
     /// One or both arms end in the terminal prefix immediately following the
     /// `if`.  Let those arms fall through to the parent copy instead.
     ReuseParent {
@@ -154,13 +261,57 @@ enum Action {
     },
 }
 
-fn find_action(stmts: &[Statement]) -> Option<Action> {
+fn should_factor_tail(stmts: &[Statement], mode: FactorMode<'_>) -> bool {
+    let FactorMode::BeforeDeclarations(protected) = mode else {
+        return true;
+    };
+    // An early pass is needed only for duplicated local definitions. Factoring
+    // a shared return, call, property store, or captured-cell cleanup has no
+    // declaration benefit and can prevent the existing guard normalization.
+    stmts.iter().any(|stmt| match stmt {
+        Statement::Assign(assign) => assign
+            .left
+            .iter()
+            .filter_map(LValue::as_local)
+            .any(|local| !protected.contains(local)),
+        Statement::If(node) => {
+            should_factor_tail(&node.then_block.lock().0, mode)
+                || should_factor_tail(&node.else_block.lock().0, mode)
+        }
+        Statement::While(node) => should_factor_tail(&node.block.lock().0, mode),
+        Statement::Repeat(node) => should_factor_tail(&node.block.lock().0, mode),
+        Statement::NumericFor(node) => should_factor_tail(&node.block.lock().0, mode),
+        Statement::GenericFor(node) => should_factor_tail(&node.block.lock().0, mode),
+        _ => false,
+    })
+}
+
+impl Action {
+    fn at(&self) -> usize {
+        match self {
+            Self::MergeArms { at, .. } | Self::HoistLeafTails { at, .. } | Self::ReuseParent { at, .. } => *at,
+        }
+    }
+}
+
+fn find_action(stmts: &[Statement], tail: Option<Tail>, mode: FactorMode<'_>) -> Option<Action> {
     for at in (0..stmts.len()).rev() {
         let Statement::If(node) = &stmts[at] else {
             continue;
         };
         let then_block = node.then_block.lock();
         let else_block = node.else_block.lock();
+        if let Some(terminator) = tail
+            && at + 1 == stmts.len()
+            && should_factor_tail(&else_block.0, mode)
+            && let Some(leaves) = find_leaf_hoist(&then_block.0, &else_block.0)
+        {
+            return Some(Action::HoistLeafTails {
+                at,
+                leaves,
+                terminator,
+            });
+        }
 
         // Prefer an already-present parent continuation over manufacturing a
         // second adjacent copy by first merging the arm tails.
@@ -168,7 +319,9 @@ fn find_action(stmts: &[Statement]) -> Option<Action> {
         if !parent.is_empty() {
             let then_count = terminal_parent_overlap(&then_block.0, parent);
             let else_count = terminal_parent_overlap(&else_block.0, parent);
-            if then_count > 0 || else_count > 0 {
+            if (then_count > 0 || else_count > 0)
+                && should_factor_tail(&parent[..then_count.max(else_count)], mode)
+            {
                 return Some(Action::ReuseParent {
                     at,
                     then_count,
@@ -178,7 +331,7 @@ fn find_action(stmts: &[Statement]) -> Option<Action> {
         }
 
         let common = common_suffix_len(&then_block.0, &else_block.0);
-        if common > 0 {
+        if common > 0 && should_factor_tail(&then_block.0[then_block.len() - common..], mode) {
             let then_prefix = &then_block.0[..then_block.0.len() - common];
             let else_prefix = &else_block.0[..else_block.0.len() - common];
             // A local declared before the shared tail is branch-scoped.  Moving
@@ -194,8 +347,167 @@ fn find_action(stmts: &[Statement]) -> Option<Action> {
     None
 }
 
+/// Leaf paths of `then_block` (see `Action::HoistLeafTails`) with their strip /
+/// terminate decision against `S = else_block`, when the hoist pays off: at least
+/// one leaf ends in `S`, and the statements removed outweigh the terminators
+/// added. `None` when any leaf path is empty (its fall-through cannot be given a
+/// terminator without inventing an arm) or `S` is empty.
+fn find_leaf_hoist(then_block: &[Statement], else_block: &[Statement]) -> Option<Vec<(Vec<bool>, bool)>> {
+    if then_block.is_empty() || !is_hoistable_tail(else_block) {
+        return None;
+    }
+    let mut decided: Vec<(Vec<bool>, bool)> = Vec::new();
+    let mut strips = 0usize;
+    let mut terminators = 0usize;
+    if !collect_leaves(
+        then_block,
+        else_block,
+        &mut Vec::new(),
+        &mut decided,
+        &mut strips,
+        &mut terminators,
+    ) {
+        return None;
+    }
+    if trace_on() {
+        eprintln!(
+            "FCT-LEAF else_len={} leaves={} strips={} terminators={} else_weight={}",
+            else_block.len(),
+            decided.len(),
+            strips,
+            terminators,
+            else_block.iter().map(statement_weight).sum::<usize>(),
+        );
+    }
+    if strips == 0 {
+        return None;
+    }
+    let weight: usize = else_block.iter().map(statement_weight).sum();
+    (weight * strips > terminators).then_some(decided)
+}
+
+/// Descend through last-statement `if`s collecting the leaf decisions. A block
+/// whose suffix already equals `tail` is a STRIP leaf (no further descent — the
+/// copy's own inner `if`s are not paths of their own); otherwise a block ending
+/// in an `if` descends into both arms, and any other block is a TERMINATE leaf
+/// (unless it already terminates). `false` when a leaf block is empty.
+fn collect_leaves(
+    block: &[Statement],
+    tail: &[Statement],
+    path: &mut Vec<bool>,
+    out: &mut Vec<(Vec<bool>, bool)>,
+    strips: &mut usize,
+    terminators: &mut usize,
+) -> bool {
+    let Some(last) = block.last() else {
+        return false;
+    };
+    let count = tail.len();
+    if block.len() >= count
+        && !has_local_declaration(&block[..block.len() - count])
+        && block_alpha_eq(tail, &block[block.len() - count..])
+    {
+        out.push((path.clone(), true));
+        *strips += 1;
+        return true;
+    }
+    if let Statement::If(node) = last {
+        path.push(true);
+        let ok_then = collect_leaves(&node.then_block.lock().0, tail, path, out, strips, terminators);
+        path.pop();
+        if !ok_then {
+            return false;
+        }
+        path.push(false);
+        let ok_else = collect_leaves(&node.else_block.lock().0, tail, path, out, strips, terminators);
+        path.pop();
+        return ok_else;
+    }
+    if !sequence_terminates(block) {
+        *terminators += 1;
+    }
+    out.push((path.clone(), false));
+    true
+}
+
+/// Recursive statement count — the size a hoisted copy saves.
+fn statement_weight(stmt: &Statement) -> usize {
+    1 + match stmt {
+        Statement::If(node) => {
+            node.then_block.lock().0.iter().map(statement_weight).sum::<usize>()
+                + node.else_block.lock().0.iter().map(statement_weight).sum::<usize>()
+        }
+        Statement::While(node) => node.block.lock().0.iter().map(statement_weight).sum(),
+        Statement::Repeat(node) => node.block.lock().0.iter().map(statement_weight).sum(),
+        Statement::NumericFor(node) => node.block.lock().0.iter().map(statement_weight).sum(),
+        Statement::GenericFor(node) => node.block.lock().0.iter().map(statement_weight).sum(),
+        _ => 0,
+    }
+}
+
+/// Navigate `path` (then/else choices from `block`'s last `if` downwards) to the
+/// leaf block and apply `f` to it.
+fn with_leaf(block: &mut Vec<Statement>, path: &[bool], f: &mut dyn FnMut(&mut Vec<Statement>)) {
+    match path.split_first() {
+        None => f(block),
+        Some((&choose_then, rest)) => {
+            let Some(Statement::If(node)) = block.last_mut() else {
+                unreachable!("leaf path must follow last-statement ifs")
+            };
+            let arm = if choose_then {
+                &node.then_block
+            } else {
+                &node.else_block
+            };
+            with_leaf(&mut arm.lock().0, rest, f);
+        }
+    }
+}
+
+/// `MEDAL_TRACE_FCT=1`: print every applied action (and each leaf-hoist
+/// decision) to stderr.
+fn trace_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("MEDAL_TRACE_FCT").is_some())
+}
+
 fn apply_action(stmts: &mut Vec<Statement>, action: Action) {
+    if trace_on() {
+        eprintln!(
+            "FCT {:?} at block of {} stmts:\n{}",
+            action,
+            stmts.len(),
+            crate::Block(stmts.clone())
+        );
+    }
     match action {
+        Action::HoistLeafTails {
+            at,
+            leaves,
+            terminator,
+        } => {
+            let hoisted = {
+                let Statement::If(node) = &mut stmts[at] else {
+                    unreachable!()
+                };
+                let mut hoisted: Vec<Statement> = std::mem::take(&mut node.else_block.lock().0);
+                let count = hoisted.len();
+                let mut then_block = node.then_block.lock();
+                for (path, strip) in &leaves {
+                    with_leaf(&mut then_block.0, path, &mut |leaf| {
+                        if *strip {
+                            let len = leaf.len() - count;
+                            carry_rebuilt(&mut hoisted, &leaf[len..]);
+                            leaf.truncate(len);
+                        } else if !sequence_terminates(leaf) {
+                            leaf.push(terminator.statement());
+                        }
+                    });
+                }
+                hoisted
+            };
+            stmts.extend(hoisted);
+        }
         Action::MergeArms { at, count } => {
             let moved = {
                 let Statement::If(node) = &mut stmts[at] else {
@@ -204,8 +516,9 @@ fn apply_action(stmts: &mut Vec<Statement>, action: Action) {
                 let mut then_block = node.then_block.lock();
                 let mut else_block = node.else_block.lock();
                 let split = then_block.0.len() - count;
-                let moved = then_block.0.split_off(split);
+                let mut moved = then_block.0.split_off(split);
                 let else_len = else_block.0.len() - count;
+                carry_rebuilt(&mut moved, &else_block.0[else_len..]);
                 else_block.0.truncate(else_len);
                 moved
             };
@@ -216,20 +529,87 @@ fn apply_action(stmts: &mut Vec<Statement>, action: Action) {
             then_count,
             else_count,
         } => {
-            let Statement::If(node) = &mut stmts[at] else {
+            let (head, parent) = stmts.split_at_mut(at + 1);
+            let Statement::If(node) = &mut head[at] else {
                 unreachable!()
             };
             if then_count > 0 {
                 let mut block = node.then_block.lock();
                 let len = block.0.len() - then_count;
+                carry_rebuilt(&mut parent[..then_count], &block.0[len..]);
                 block.0.truncate(len);
             }
             if else_count > 0 {
                 let mut block = node.else_block.lock();
                 let len = block.0.len() - else_count;
+                carry_rebuilt(&mut parent[..else_count], &block.0[len..]);
                 block.0.truncate(len);
             }
         }
+    }
+}
+
+/// `kept` and `dropped` are equal copies of a tail, and the merge keeps the
+/// first. Call equality ignores `rebuilt`, so the copy dropped may hold the
+/// calls a de-inliner rebuilt: each kept call takes its twin's `rebuilt`, and
+/// the merged tail keeps their site comments and counts. Equal copies have
+/// equal shapes, so the two walks meet the calls in the same order.
+fn carry_rebuilt(kept: &mut [Statement], dropped: &[Statement]) {
+    let mut producers = Vec::new();
+    calls(dropped, &mut |call| producers.push(call.rebuilt));
+    if producers.iter().all(Option::is_none) {
+        return;
+    }
+    let mut producers = producers.into_iter();
+    calls_mut(kept, &mut |call| {
+        if let Some(Some(producer)) = producers.next() {
+            call.rebuilt.get_or_insert(producer);
+        }
+    });
+}
+
+/// Every call in `stmts`, function bodies included, in tree order.
+fn calls(stmts: &[Statement], visit: &mut dyn FnMut(&Call)) {
+    for statement in stmts {
+        if let Statement::Call(call) = statement {
+            visit(call);
+        }
+        statement.traverse_rvalues_ref(&mut |value| match value {
+            RValue::Call(call) | RValue::Select(Select::Call(call)) => visit(call),
+            RValue::Closure(closure) => calls(&closure.function.lock().body.0, visit),
+            _ => {}
+        });
+        for_each_child(statement, &mut |block| calls(&block.lock().0, visit));
+    }
+}
+
+/// [`calls`], mutable.
+fn calls_mut(stmts: &mut [Statement], visit: &mut dyn FnMut(&mut Call)) {
+    for statement in stmts {
+        if let Statement::Call(call) = statement {
+            visit(call);
+        }
+        statement.traverse_rvalues(&mut |value| match value {
+            RValue::Call(call) | RValue::Select(Select::Call(call)) => visit(call),
+            RValue::Closure(closure) => calls_mut(&mut closure.function.lock().body.0, visit),
+            _ => {}
+        });
+        for_each_child(statement, &mut |block| calls_mut(&mut block.lock().0, visit));
+    }
+}
+
+/// The nested blocks of a block statement.
+fn for_each_child(statement: &Statement, visit: &mut dyn FnMut(&Arc<Mutex<Block>>)) {
+    match statement {
+        Statement::If(node) => {
+            visit(&node.then_block);
+            visit(&node.else_block);
+        }
+        Statement::While(node) => visit(&node.block),
+        Statement::Repeat(node) => visit(&node.block),
+        Statement::NumericFor(node) => visit(&node.block),
+        Statement::GenericFor(node) => visit(&node.block),
+        _ => {}
     }
 }
 
@@ -237,8 +617,23 @@ fn common_suffix_len(a: &[Statement], b: &[Statement]) -> usize {
     let limit = a.len().min(b.len());
     (1..=limit)
         .rev()
-        .find(|&count| block_alpha_eq(&a[a.len() - count..], &b[b.len() - count..]))
+        .find(|&count| {
+            let suffix = &a[a.len() - count..];
+            is_hoistable_tail(suffix) && block_alpha_eq(suffix, &b[b.len() - count..])
+        })
         .unwrap_or(0)
+}
+
+/// A tail worth (and safe to) hoist: a trailing (same-line) comment annotates the
+/// statement BEFORE it — it is not a statement of its own — so a tail that STARTS
+/// at one would carry the annotation away from its statement (the de-inliner's
+/// `-- inlined by Luau -O2` marker migrated from both reconstructed calls to the
+/// `end` of the enclosing `if`), and a trivia-only tail merges no code at all.
+fn is_hoistable_tail(suffix: &[Statement]) -> bool {
+    !matches!(suffix.first(), Some(Statement::Comment(c)) if c.trailing)
+        && suffix
+            .iter()
+            .any(|s| !matches!(s, Statement::Empty(_) | Statement::Comment(_)))
 }
 
 /// Length of the branch suffix equal to a prefix of the parent continuation,
@@ -310,6 +705,8 @@ pub(crate) fn block_alpha_bindings_with_locals(
     let ctx = MatchCtx {
         params: &params,
         locals: &locals,
+        captures: None,
+        fold: None,
     };
     let mut bindings = Bindings::default();
     alpha_block(pattern, candidate, &ctx, &mut bindings).then_some(bindings)
@@ -459,6 +856,21 @@ mod tests {
         ))
     }
 
+    /// A merged tail keeps the calls a de-inliner rebuilt, whichever arm
+    /// held them: `Call` equality ignores `rebuilt`, and the merge keeps the
+    /// then arm's copy.
+    #[test]
+    fn a_merged_tail_keeps_the_rebuilt_attribute_of_either_copy() {
+        let helper = RcLocal::new(crate::Local::new(Some("helper".into())));
+        let source = Statement::Call(Call::new(helper.clone().into(), Vec::new()));
+        let rebuilt = Statement::Call(Call::new(helper.clone().into(), Vec::new()).reconstructed(crate::call_origins::Kind::StatementDeinline));
+        let mut body = Block(vec![cond_if(vec![call("left"), source], vec![call("right"), rebuilt])]);
+        assert!(factor_common_tails(&mut body));
+        let Some(Statement::Call(merged)) = body.0.last() else { panic!("{body}") };
+        assert_eq!(merged.rebuilt, Some(crate::call_origins::Kind::StatementDeinline));
+        assert!(body.to_string().ends_with("helper() -- inferred equivalent call"), "{body}");
+    }
+
     #[test]
     fn merges_identical_arm_suffix() {
         let mut body = Block(vec![cond_if(
@@ -474,6 +886,84 @@ mod tests {
         };
         assert_eq!(node.then_block.lock().0.len(), 1);
         assert_eq!(node.else_block.lock().0.len(), 1);
+    }
+
+    #[test]
+    fn function_pass_leaves_child_function_bodies_untouched() {
+        let child = crate::Closure {
+            node_origin: Default::default(),
+            function: by_address::ByAddress(Arc::new(Mutex::new(crate::Function {
+                body: Block(vec![cond_if(vec![call("left"), call("shared")], vec![
+                    call("right"),
+                    call("shared"),
+                ])]),
+                ..Default::default()
+            }))),
+            upvalues: vec![],
+        };
+        let local = RcLocal::default();
+        let assignment: Statement =
+            Assign::new(vec![LValue::Local(local)], vec![global("value")]).into();
+        let mut body = Block(vec![
+            cond_if(vec![call("a"), assignment.clone()], vec![
+                call("b"),
+                assignment,
+            ]),
+            Statement::Return(Return::new(vec![RValue::Closure(child.clone())])),
+        ]);
+        assert!(factor_function_tails(&mut body, &FxHashSet::default()));
+        assert_eq!(body.len(), 3);
+        // The same closure can be under construction in another lifter worker.
+        // Parent factoring must not alter its tree or depend on its completion.
+        assert_eq!(child.function.0.lock().body.len(), 1);
+        assert!(factor_common_tails(&mut body));
+        assert_eq!(child.function.0.lock().body.len(), 2);
+    }
+
+    #[test]
+    fn factoring_before_declarations_keeps_a_cloned_tail_local_in_its_arm() {
+        let local = RcLocal::default();
+        let tail = cond_if(
+            vec![
+                Assign::new(vec![LValue::Local(local.clone())], vec![global("value")]).into(),
+                Call::new(global("sink"), vec![RValue::Local(local)]).into(),
+            ],
+            vec![],
+        );
+        let mut body = Block(vec![cond_if(
+            vec![cond_if(vec![tail.clone()], vec![ret("done")])],
+            vec![tail],
+        )]);
+        assert!(factor_function_tails(&mut body, &FxHashSet::default()));
+        let root = Arc::new(Mutex::new(body));
+        crate::local_declarations::LocalDeclarer::default()
+            .declare_locals(root.clone(), &FxHashSet::default());
+        let root = root.lock();
+        assert_eq!(
+            root.len(),
+            2,
+            "the local must not be hoisted before both owners"
+        );
+        let tail = root[1].as_if().unwrap();
+        assert!(tail.then_block.lock()[0].as_assign().unwrap().prefix);
+    }
+
+    #[test]
+    fn early_factoring_preserves_guard_cleanup_of_an_existing_cell() {
+        let cell = RcLocal::default();
+        let cleanup: Statement =
+            Assign::new(vec![LValue::Local(cell.clone())], vec![Literal::Nil.into()]).into();
+        let mut body = Block(vec![cond_if(vec![cleanup.clone(), ret("done")], vec![
+            call("work"),
+            cleanup,
+            ret("done"),
+        ])]);
+        assert!(!factor_function_tails(
+            &mut body,
+            &[cell].into_iter().collect()
+        ));
+        assert_eq!(body.len(), 1);
+        assert!(factor_common_tails(&mut body));
     }
 
     #[test]
@@ -504,16 +994,18 @@ mod tests {
     fn keeps_branch_scoped_dependency_inside_arms() {
         let local = RcLocal::default();
         let declaration = Statement::Assign(Assign {
+            node_origin: Default::default(),
             left: vec![LValue::Local(local.clone())],
             right: vec![RValue::Literal(Literal::Number(1.0))],
             prefix: true,
-            parallel: false,
+            parallel: false, compound: false,
         });
         let other_declaration = Statement::Assign(Assign {
+            node_origin: Default::default(),
             left: vec![LValue::Local(local.clone())],
             right: vec![RValue::Literal(Literal::Number(2.0))],
             prefix: true,
-            parallel: false,
+            parallel: false, compound: false,
         });
         let use_local = Statement::Call(Call::new(global("print"), vec![RValue::Local(local)]));
         let mut body = Block(vec![cond_if(
@@ -548,10 +1040,11 @@ mod tests {
         let candidate_temp = RcLocal::default();
         let assign = |local: &RcLocal| {
             Statement::Assign(Assign {
+                node_origin: Default::default(),
                 left: vec![LValue::Local(local.clone())],
                 right: vec![global("source")],
                 prefix: false,
-                parallel: false,
+                parallel: false, compound: false,
             })
         };
         let use_temp = |local: &RcLocal| {
@@ -590,5 +1083,190 @@ mod tests {
         assert!(!Arc::ptr_eq(&first.then_block, &second.then_block));
         assert_eq!(first.then_block.lock().0.len(), 2);
         assert_eq!(second.then_block.lock().0.len(), 2);
+    }
+
+    fn loop_body(stmts: Vec<Statement>) -> Statement {
+        Statement::While(crate::While::new(
+            RValue::Literal(Literal::Boolean(true)),
+            Block(stmts),
+        ))
+    }
+
+    #[test]
+    fn hoists_leaf_tail_out_of_nested_arms_with_continue() {
+        // while true do
+        //   if c then
+        //     if d then a else b; S end        -- S cloned into a leaf
+        //   else S end
+        // end
+        let big_tail = vec![call("s1"), call("s2"), call("s3")];
+        let inner = cond_if(vec![call("a")], vec![call("b"), call("s1"), call("s2"), call("s3")]);
+        let mut body = Block(vec![loop_body(vec![cond_if(vec![inner], big_tail.clone())])]);
+
+        assert!(factor_common_tails(&mut body));
+        let Statement::While(w) = &body.0[0] else {
+            panic!()
+        };
+        let stmts = &w.block.lock().0;
+        assert_eq!(stmts.len(), 1 + 3, "S hoisted once after the if");
+        assert!(block_alpha_eq(&stmts[1..], &big_tail));
+        let Statement::If(outer) = &stmts[0] else {
+            panic!()
+        };
+        assert!(outer.else_block.lock().0.is_empty(), "the else copy moved out");
+        let then = outer.then_block.lock();
+        let Statement::If(inner) = &then.0[0] else {
+            panic!()
+        };
+        // the non-S leaf got the loop terminator; the S leaf was stripped and falls through
+        assert!(block_alpha_eq(
+            &inner.then_block.lock().0,
+            &[call("a"), Statement::Continue(Continue {})]
+        ));
+        assert!(block_alpha_eq(&inner.else_block.lock().0, &[call("b")]));
+    }
+
+    #[test]
+    fn leaf_hoist_needs_tail_position() {
+        // Same shape but the `if` is followed by another statement: falling
+        // through the arms no longer reaches the end of the loop body.
+        let inner = cond_if(vec![call("a")], vec![call("b"), call("s1"), call("s2"), call("s3")]);
+        let mut body = Block(vec![loop_body(vec![
+            cond_if(vec![inner], vec![call("s1"), call("s2"), call("s3")]),
+            call("after"),
+        ])]);
+        assert!(!factor_common_tails(&mut body));
+    }
+
+    #[test]
+    fn leaf_hoist_skips_repeat_bodies() {
+        let inner = cond_if(vec![call("a")], vec![call("b"), call("s1"), call("s2"), call("s3")]);
+        let mut body = Block(vec![Statement::Repeat(crate::Repeat::new(
+            RValue::Literal(Literal::Boolean(true)),
+            Block(vec![cond_if(vec![inner], vec![call("s1"), call("s2"), call("s3")])]),
+        ))]);
+        assert!(!factor_common_tails(&mut body));
+    }
+
+    #[test]
+    fn trailing_marker_stays_with_its_statement() {
+        let marker = || Statement::Comment(crate::Comment::trailing("inlined".to_string()));
+        let mut body = Block(vec![cond_if(
+            vec![call("left"), marker()],
+            vec![call("right"), marker()],
+        )]);
+        assert!(!factor_common_tails(&mut body));
+        assert_eq!(body.0.len(), 1);
+    }
+
+    fn assert_same_fixed_point(mut body: Block, tail: Option<Tail>, mode: FactorMode<'_>) {
+        unshare_blocks_impl(&mut body, matches!(mode, FactorMode::WholeChunk));
+        let mut reference = crate::simplify_gotos::dc_block(&body);
+        let expected_changed = factor_block::<false>(&mut reference.0, tail, mode);
+        let actual_changed = factor_block::<true>(&mut body.0, tail, mode);
+        assert_eq!(actual_changed, expected_changed);
+        // Block equality includes structured-container identity; the oracle
+        // intentionally owns different containers. Debug retains local IDs,
+        // statement/value kinds, literals and structure without Arc addresses.
+        assert_eq!(format!("{body:?}"), format!("{reference:?}"));
+        assert!(!factor_block::<true>(&mut body.0, tail, mode));
+    }
+
+    #[test]
+    fn dirty_tail_revisits_new_parent_adjacency_and_earlier_candidates() {
+        // Hoisting the common inner if creates a NEW parent continuation for
+        // that if; revisiting only the original if (or scanning only earlier
+        // parent statements) misses its ReuseParent opportunity.
+        let inner = cond_if(vec![call("work"), ret("done")], vec![call("other")]);
+        let outer = cond_if(vec![call("left"), inner.clone()], vec![call("right"), inner]);
+        let body = Block(vec![
+            cond_if(vec![call("prefix"), outer.clone(), ret("done")], vec![call("alternative")]),
+            outer,
+            ret("done"),
+        ]);
+        for tail in [None, Some(Tail::Return), Some(Tail::Continue)] {
+            assert_same_fixed_point(crate::simplify_gotos::dc_block(&body), tail, FactorMode::WholeChunk);
+        }
+    }
+
+    #[test]
+    fn dirty_tail_matches_full_rescan_on_generated_structured_trees() {
+        // A fixed seed generates both refusals and overlapping opportunities.
+        // This oracle differs in scheduling at EVERY recursive block; it keeps
+        // the original full child walk after each committed action.
+        fn next(seed: &mut u64) -> usize {
+            *seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (*seed >> 32) as usize
+        }
+        fn generate(seed: &mut u64, depth: usize, local: &RcLocal) -> Block {
+            let mut statements = Vec::new();
+            for _ in 0..next(seed) % 4 {
+                let choice = next(seed) % if depth > 0 { 9 } else { 4 };
+                let statement = match choice {
+                    0 => call(if next(seed) % 2 == 0 { "work" } else { "other" }),
+                    1 => ret("done"),
+                    2 => Statement::Assign(Assign {
+                        node_origin: Default::default(),
+                        left: vec![LValue::Local(local.clone())], right: vec![global("source")],
+                        prefix: next(seed) % 2 == 0, parallel: false, compound: false,
+                    }),
+                    3 => Statement::Comment(crate::Comment::trailing("inferred call".to_string())),
+                    4 => loop_body(generate(seed, depth - 1, local).0),
+                    5 => Statement::Repeat(crate::Repeat::new(global("stop"), generate(seed, depth - 1, local))),
+                    _ => {
+                        let left = generate(seed, depth - 1, local);
+                        let right = generate(seed, depth - 1, local);
+                        let shared = generate(seed, depth - 1, local);
+                        let mut a = left.0;
+                        let mut b = right.0;
+                        a.extend(crate::simplify_gotos::dc_block(&shared).0);
+                        b.extend(shared.0);
+                        cond_if(a, b)
+                    }
+                };
+                statements.push(statement);
+            }
+            Block(statements)
+        }
+        let mut seed = 0xc01d_cafe_0102_0304;
+        let local = RcLocal::default();
+        let protected = [local.clone()].into_iter().collect();
+        let unprotected = FxHashSet::default();
+        for _ in 0..1200 {
+            let body = generate(&mut seed, 3, &local);
+            for tail in [None, Some(Tail::Return), Some(Tail::Continue)] {
+                for mode in [FactorMode::WholeChunk, FactorMode::BeforeDeclarations(&protected),
+                             FactorMode::BeforeDeclarations(&unprotected)] {
+                    assert_same_fixed_point(crate::simplify_gotos::dc_block(&body), tail, mode);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dirty_tail_keeps_shared_closure_identity_and_body_fixed_point() {
+        fn make() -> (Block, crate::Closure) {
+            let child = crate::Closure {
+                node_origin: Default::default(),
+                function: by_address::ByAddress(Arc::new(Mutex::new(crate::Function {
+                    body: Block(vec![cond_if(vec![call("left"), ret("done")], vec![call("right"), ret("done")])]),
+                    ..Default::default()
+                }))), upvalues: vec![],
+            };
+            let use_child: Statement = Call::new(global("use"), vec![RValue::Closure(child.clone())]).into();
+            (Block(vec![use_child.clone(), cond_if(vec![use_child.clone(), ret("done")], vec![ret("done")]),
+                        use_child, ret("done")]), child)
+        }
+        // Construct independent closure graphs: ordinary dc_block deliberately
+        // retains function identities and would not isolate this comparison.
+        let (mut body, child) = make();
+        let (mut reference, reference_child) = make();
+        unshare_blocks(&mut body);
+        unshare_blocks(&mut reference);
+        let expected = factor_block::<false>(&mut reference.0, Some(Tail::Return), FactorMode::WholeChunk);
+        assert_eq!(factor_block::<true>(&mut body.0, Some(Tail::Return), FactorMode::WholeChunk), expected);
+        assert_eq!(body.to_string(), reference.to_string());
+        assert_eq!(format!("{:?}", child.function.0.lock().body), format!("{:?}", reference_child.function.0.lock().body));
+        assert_eq!(Arc::strong_count(&child.function.0), Arc::strong_count(&reference_child.function.0));
     }
 }

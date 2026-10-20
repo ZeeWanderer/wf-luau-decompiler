@@ -3,9 +3,7 @@ use nom::{
     IResult,
     number::complete::{le_f32, le_f64, le_i32, le_u8, le_u32},
 };
-use nom_leb128::leb128_usize;
-
-use super::Dialect;
+use nom_leb128::{leb128_u64, leb128_usize};
 
 const CONSTANT_NIL: u8 = 0;
 const CONSTANT_BOOLEAN: u8 = 1;
@@ -40,24 +38,26 @@ pub enum Constant {
 }
 
 impl Constant {
-    pub(crate) fn parse(input: &[u8], version: u8, dialect: Dialect) -> IResult<&[u8], Self> {
+    pub(crate) fn parse_with_dialect(input: &[u8], version: u8, dialect: super::Dialect) -> IResult<&[u8], Self> {
+        if dialect == super::Dialect::Warframe && input.first() == Some(&CONSTANT_BOOLEAN) {
+            let (rest, value) = le_u32(&input[1..])?;
+            return Ok((rest, match value {
+                0 => Constant::Boolean(false),
+                1 => Constant::Boolean(true),
+                value => Constant::Atom(value),
+            }));
+        }
+        Self::parse(input, version)
+    }
+
+    pub(crate) fn parse(input: &[u8], version: u8) -> IResult<&[u8], Self> {
         let (input, tag) = le_u8(input)?;
         match tag {
             CONSTANT_NIL => Ok((input, Constant::Nil)),
-            CONSTANT_BOOLEAN => match dialect {
-                Dialect::Luau => {
-                    let (input, value) = le_u8(input)?;
-                    Ok((input, Constant::Boolean(value != 0)))
-                }
-                Dialect::Warframe => {
-                    let (input, value) = le_u32(input)?;
-                    if value <= 1 {
-                        Ok((input, Constant::Boolean(value != 0)))
-                    } else {
-                        Ok((input, Constant::Atom(value)))
-                    }
-                }
-            },
+            CONSTANT_BOOLEAN => {
+                let (input, value) = le_u8(input)?;
+                Ok((input, Constant::Boolean(value != 0u8)))
+            }
             CONSTANT_NUMBER => {
                 let (input, value) = le_f64(input)?;
                 Ok((input, Constant::Number(value)))
@@ -110,7 +110,22 @@ impl Constant {
             // isNegative byte, then varint magnitude
             CONSTANT_INTEGER => {
                 let (input, is_negative) = le_u8(input)?;
-                let (input, magnitude) = leb128_usize(input)?;
+                // nom-leb128 0.2 accepts overflowing payload bits in the last
+                // byte. Reject them before a truncated magnitude can pass the
+                // signed-range check (e.g. 2^64 becoming zero).
+                if input.iter().take(9).all(|byte| byte & 0x80 != 0)
+                    && input.get(9).is_some_and(|byte| *byte > 1)
+                {
+                    return Err(nom::Err::Failure(nom::error::Error::new(
+                        input, nom::error::ErrorKind::TooLarge,
+                    )));
+                }
+                let (input, magnitude) = leb128_u64(input)?;
+                if magnitude > (i64::MAX as u64) + u64::from(is_negative != 0) {
+                    return Err(nom::Err::Failure(nom::error::Error::new(
+                        input, nom::error::ErrorKind::TooLarge,
+                    )));
+                }
                 let value = if is_negative != 0 {
                     (magnitude as i64).wrapping_neg()
                 } else {
@@ -138,29 +153,29 @@ impl Constant {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::{Constant, Dialect};
+mod integer_tests {
+    use super::*;
 
-    #[test]
-    fn luau_boolean_uses_one_byte_payload() {
-        let (rest, constant) = Constant::parse(&[1, 1, 0xaa], 9, Dialect::Luau).unwrap();
-        assert!(matches!(constant, Constant::Boolean(true)));
-        assert_eq!(rest, &[0xaa]);
+    fn encoded(negative: u8, mut magnitude: u64) -> Vec<u8> {
+        let mut bytes = vec![9, negative];
+        loop {
+            let low = (magnitude & 127) as u8;
+            magnitude >>= 7;
+            bytes.push(low | if magnitude == 0 { 0 } else { 128 });
+            if magnitude == 0 { return bytes; }
+        }
     }
 
     #[test]
-    fn warframe_boolean_uses_four_byte_payload() {
-        let (rest, constant) =
-            Constant::parse(&[1, 1, 0, 0, 0, 0xaa], 9, Dialect::Warframe).unwrap();
-        assert!(matches!(constant, Constant::Boolean(true)));
-        assert_eq!(rest, &[0xaa]);
-    }
-
-    #[test]
-    fn warframe_non_boolean_tag_one_is_atom() {
-        let (rest, constant) =
-            Constant::parse(&[1, 0xfc, 0x25, 0xdd, 0x2f, 0xaa], 9, Dialect::Warframe).unwrap();
-        assert!(matches!(constant, Constant::Atom(0x2fdd25fc)));
-        assert_eq!(rest, &[0xaa]);
+    fn integer_width_and_signed_limits_do_not_depend_on_usize() {
+        for value in [0, 127, 128, 1 << 32, (1 << 32) + 1, i64::MAX as u64] {
+            assert!(matches!(Constant::parse(&encoded(0, value), 9),
+                Ok(([], Constant::Integer(parsed))) if parsed == value as i64));
+        }
+        assert!(matches!(Constant::parse(&encoded(1, 1 << 63), 9), Ok(([], Constant::Integer(i64::MIN)))));
+        assert!(Constant::parse(&encoded(0, 1 << 63), 9).is_err());
+        let mut overflow = vec![9, 0];
+        overflow.extend([0x80; 9]); overflow.push(2);
+        assert!(Constant::parse(&overflow, 9).is_err());
     }
 }

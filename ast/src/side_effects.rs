@@ -57,6 +57,25 @@ pub fn is_total_pure(value: &crate::RValue) -> bool {
         {
             is_total_pure(&binary.left) && is_total_pure(&binary.right)
         }
+        // Concatenating string/number literals and arithmetic on number
+        // literals never raise and reach no metamethod (division by zero
+        // yields inf/NaN). The compiler folds the arithmetic but never the
+        // concatenation, so `"slot" .. 1` survives as a movable value.
+        RValue::Binary(binary) => {
+            let text = |value: &RValue| matches!(value, RValue::Literal(crate::Literal::String(_) | crate::Literal::Number(_)));
+            let number = |value: &RValue| matches!(value, RValue::Literal(crate::Literal::Number(_)));
+            match binary.operation {
+                BinaryOperation::Concat => text(&binary.left) && text(&binary.right),
+                BinaryOperation::Add
+                | BinaryOperation::Sub
+                | BinaryOperation::Mul
+                | BinaryOperation::Div
+                | BinaryOperation::IDiv
+                | BinaryOperation::Mod
+                | BinaryOperation::Pow => number(&binary.left) && number(&binary.right),
+                _ => false,
+            }
+        }
         // A table constructor with a computed key can raise for nil/NaN even
         // though evaluating the key itself has no side effect. Only literal
         // keys known to be valid table keys are total; all computed keys are
@@ -77,18 +96,28 @@ pub fn is_total_pure(value: &crate::RValue) -> bool {
 /// local/global key may evaluate to nil or NaN even when its expression has no
 /// explicit side effects, so it is not safe to move the constructor across a
 /// call merely because the key is a leaf read.
-pub(crate) fn is_total_table_key(key: &crate::RValue) -> bool {
+pub fn is_total_table_key(key: &crate::RValue) -> bool {
     use crate::{Literal, RValue};
     match key {
         RValue::Literal(Literal::Nil) => false,
         RValue::Literal(Literal::Number(number)) => !number.is_nan(),
-        RValue::Literal(Literal::Vector(x, y, z)) => {
-            !x.is_nan() && !y.is_nan() && !z.is_nan()
-        }
-        RValue::Literal(Literal::VectorD(x, y, z)) => {
-            !x.is_nan() && !y.is_nan() && !z.is_nan()
-        }
+        RValue::Literal(Literal::Vector(x, y, z)) => !x.is_nan() && !y.is_nan() && !z.is_nan(),
+        RValue::Literal(Literal::VectorD(x, y, z)) => !x.is_nan() && !y.is_nan() && !z.is_nan(),
         RValue::Literal(_) => true,
+        _ => false,
+    }
+}
+
+/// Whether two keys provably name one table slot: literals compared as the
+/// table compares them, numbers by value (`[0]` and `[-0]` are one slot),
+/// vectors by component. A key that is not a literal proves nothing.
+pub fn same_table_key(left: &crate::RValue, right: &crate::RValue) -> bool {
+    use crate::{Literal, RValue};
+    match (left, right) {
+        (RValue::Literal(Literal::Number(a)), RValue::Literal(Literal::Number(b))) => a == b,
+        (RValue::Literal(Literal::Vector(a, b, c)), RValue::Literal(Literal::Vector(x, y, z))) => a == x && b == y && c == z,
+        (RValue::Literal(Literal::VectorD(a, b, c)), RValue::Literal(Literal::VectorD(x, y, z))) => a == x && b == y && c == z,
+        (RValue::Literal(left), RValue::Literal(right)) => left == right,
         _ => false,
     }
 }
@@ -114,7 +143,7 @@ pub fn is_observable(value: &crate::RValue) -> bool {
 /// statement's direct expression roots; `is_total_pure` recursively inspects
 /// each root, so nested calls/keys are covered without a second traversal.
 pub fn statement_is_observable(statement: &crate::Statement) -> bool {
-    statement.has_side_effects() || statement.rvalues().into_iter().any(is_observable)
+    statement.has_side_effects() || !statement.visit_rvalues(&mut |value| !is_observable(value))
 }
 
 #[cfg(test)]
@@ -125,7 +154,7 @@ mod tests {
     #[test]
     fn dynamic_table_keys_are_not_total_or_reorderable() {
         let key = RcLocal::new(Local::new(Some("key".to_owned())));
-        let table = RValue::Table(Table(vec![(
+        let table = RValue::Table(Table::new(vec![(
             Some(RValue::Local(key)),
             RValue::Literal(Literal::Number(1.0)),
         )]));

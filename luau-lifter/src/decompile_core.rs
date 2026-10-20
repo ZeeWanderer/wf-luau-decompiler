@@ -146,10 +146,23 @@ pub(crate) struct ExportManifestInventory {
     pub diagnostics: Vec<ExportManifestDiagnostic>,
 }
 
+/// An input the folder walk cannot turn into work: an entry it could not read,
+/// whose subtree is then never searched, or one of several inputs that would
+/// write the same output, where the last write would silently win. Each is a
+/// failure, so a run that misses an input never reports success.
+#[derive(Debug)]
+pub(crate) struct DiscoveryFailure {
+    /// Path relative to SRC, forward-slashed.
+    pub rel: String,
+    pub code: &'static str,
+    pub message: String,
+}
+
 /// Discover every `*.lua` file under SRC (recursive, sorted), resolve the SRC/OUT
-/// roots, and build the fully-resolved [`Work`] list. Returns a process exit code
-/// (`Err`) on a fatal path error, mirroring the original `batch::run` behavior.
-pub(crate) fn build_work(src: &Path, out: &Path) -> Result<(PathBuf, PathBuf, Vec<Work>), i32> {
+/// roots, and build the fully-resolved [`Work`] list, with the inputs it could
+/// not include. Returns a process exit code (`Err`) on a fatal path error,
+/// mirroring the original `batch::run` behavior.
+pub(crate) fn build_work(src: &Path, out: &Path) -> Result<(PathBuf, PathBuf, Vec<Work>, Vec<DiscoveryFailure>), i32> {
     build_work_with_extension(src, out, "luau")
 }
 
@@ -157,7 +170,7 @@ pub(crate) fn build_work_with_extension(
     src: &Path,
     out: &Path,
     output_extension: &str,
-) -> Result<(PathBuf, PathBuf, Vec<Work>), i32> {
+) -> Result<(PathBuf, PathBuf, Vec<Work>, Vec<DiscoveryFailure>), i32> {
     // canonicalize SRC (must exist) so the walk + strip_prefix share one verbatim
     // form; OUT may not exist yet, so use `absolute` (no existence requirement,
     // and keeps long paths Windows-safe). This asymmetry is load-bearing — do not
@@ -177,25 +190,43 @@ pub(crate) fn build_work_with_extension(
         }
     };
 
-    let mut files: Vec<PathBuf> = walkdir::WalkDir::new(&src_root)
-        .into_iter()
-        .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
-        .map(walkdir::DirEntry::into_path)
-        .filter(|p| p.extension().is_some_and(|x| x.eq_ignore_ascii_case("lua")))
-        .collect();
+    let relative = |path: &Path| match path.strip_prefix(&src_root).unwrap_or(path).to_string_lossy().replace('\\', "/") {
+        rel if rel.is_empty() => ".".to_string(),
+        rel => rel,
+    };
+    let mut failures = Vec::new();
+    let mut files = Vec::new();
+    for entry in walkdir::WalkDir::new(&src_root) {
+        match entry {
+            Ok(entry) => {
+                if entry.file_type().is_file()
+                    && entry.path().extension().is_some_and(|x| x.eq_ignore_ascii_case("lua"))
+                {
+                    files.push(entry.into_path());
+                }
+            }
+            Err(error) => failures.push(DiscoveryFailure {
+                rel: error.path().map_or_else(|| ".".to_string(), &relative),
+                code: "unreadable_source_path",
+                message: match error.io_error() {
+                    Some(io) => format!("cannot read: {io}"),
+                    None => format!("cannot read: {error}"),
+                },
+            }),
+        }
+    }
     files.sort();
 
     let work: Vec<Work> = files
-        .iter()
+        .into_iter()
         .map(|input| {
-            let rel_path = input.strip_prefix(&src_root).unwrap_or(input);
+            let rel_path = input.strip_prefix(&src_root).unwrap_or(&input);
             let source_rel_path = rel_path.with_extension(output_extension);
             let output = out_root.join(&source_rel_path);
             let rel = rel_path.to_string_lossy().replace('\\', "/");
             let source_rel = source_rel_path.to_string_lossy().replace('\\', "/");
             Work {
-                input: input.clone(),
+                input,
                 output,
                 output_root: out_root.clone(),
                 rel,
@@ -205,8 +236,46 @@ pub(crate) fn build_work_with_extension(
             }
         })
         .collect();
+    let work = reject_shared_outputs(work, &mut failures);
+    failures.sort_by(|left, right| left.rel.cmp(&right.rel));
 
-    Ok((src_root, out_root, work))
+    Ok((src_root, out_root, work, failures))
+}
+
+/// Take out every input whose output another input also writes: `A.lua` and
+/// `A.LUA` both become `A.luau`, and where the file system ignores case
+/// (Windows, macOS) so do `Main.lua` and `main.lua`. Keeping either would make
+/// the result depend on which write lands last, so all of them fail.
+fn reject_shared_outputs(work: Vec<Work>, failures: &mut Vec<DiscoveryFailure>) -> Vec<Work> {
+    let destination = |work: &Work| {
+        if cfg!(any(windows, target_os = "macos")) { work.source_rel.to_lowercase() } else { work.source_rel.clone() }
+    };
+    let mut writers: HashMap<String, Vec<usize>> = HashMap::with_capacity(work.len());
+    for (index, item) in work.iter().enumerate() {
+        writers.entry(destination(item)).or_default().push(index);
+    }
+    if writers.len() == work.len() {
+        return work;
+    }
+    let shared: HashSet<usize> = writers.values().filter(|inputs| inputs.len() > 1).flatten().copied().collect();
+    for &index in &shared {
+        let others = writers[&destination(&work[index])]
+            .iter()
+            .filter(|&&other| other != index)
+            .map(|&other| work[other].rel.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        failures.push(DiscoveryFailure {
+            rel: work[index].rel.clone(),
+            code: "colliding_output_path",
+            message: format!("output {} is also written by {others}", work[index].source_rel),
+        });
+    }
+    work.into_iter()
+        .enumerate()
+        .filter(|(index, _)| !shared.contains(index))
+        .map(|(_, item)| item)
+        .collect()
 }
 
 #[derive(Deserialize)]
@@ -1045,6 +1114,69 @@ pub(crate) fn validate_analysis_root_for_write(analysis_root: &Path) -> Result<(
     Ok(())
 }
 
+/// Writes `bytes` to `path` without writing through a link: a symbolic or
+/// hard link left in the output tree would carry the write into another file
+/// (an input, or another output), so it is replaced by a new file. A plain
+/// file only this path names is rewritten in place, and a new path costs one
+/// call, as a plain write does.
+fn write_fresh(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let create = || std::fs::OpenOptions::new().write(true).create_new(true).open(path);
+    let mut file = match create() {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => match open_unaliased(path) {
+            Some(file) => {
+                file.set_len(0)?;
+                file
+            }
+            None => {
+                std::fs::remove_file(path)?;
+                create()?
+            }
+        },
+        result => result?,
+    };
+    file.write_all(bytes)
+}
+
+/// The plain file at `path`, opened for writing without following a link,
+/// when no other name shares its contents.
+fn open_unaliased(path: &Path) -> Option<std::fs::File> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        let file = std::fs::OpenOptions::new().write(true).custom_flags(FILE_FLAG_OPEN_REPARSE_POINT).open(path).ok()?;
+        windows_contained_fs::is_unaliased_file(&file).then_some(file)
+    }
+    #[cfg(not(windows))]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        (metadata.is_file() && metadata.nlink() == 1).then(|| std::fs::OpenOptions::new().write(true).open(path).ok())?
+    }
+}
+
+/// No directory under the output root may be a symbolic link, as on Windows,
+/// where each is opened without following a reparse point: a link could make
+/// two outputs one file (`out/B -> out/A`) or lead out of the root.
+#[cfg(not(windows))]
+fn reject_directory_links(root: &Path, dir: &Path) -> std::io::Result<()> {
+    let relative = dir.strip_prefix(root).map_err(|_| {
+        std::io::Error::new(std::io::ErrorKind::PermissionDenied, "output directory outside the output root")
+    })?;
+    let mut path = root.to_path_buf();
+    for component in relative.components() {
+        path.push(component);
+        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                format!("output directory {} is a symbolic link", path.display()),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Pre-create every unique parent directory single-threaded, so the parallel
 /// phase only ever writes files (no concurrent `create_dir_all` race).
 pub(crate) fn precreate_dirs(work: &[Work]) -> Result<(), i32> {
@@ -1058,7 +1190,7 @@ pub(crate) fn precreate_dirs(work: &[Work]) -> Result<(), i32> {
         #[cfg(windows)]
         let result = windows_contained_fs::ensure_directory(root, dir);
         #[cfg(not(windows))]
-        let result = std::fs::create_dir_all(dir);
+        let result = std::fs::create_dir_all(dir).and_then(|()| reject_directory_links(root, dir));
         if let Err(e) = result {
             eprintln!("error: create dir {}: {e}", dir.display());
             return Err(2);
@@ -1067,22 +1199,19 @@ pub(crate) fn precreate_dirs(work: &[Work]) -> Result<(), i32> {
     Ok(())
 }
 
-/// Size the global rayon pool once, before the first parallel call. `threads == 0`
-/// leaves rayon's default (= logical CPU count).
+/// Size the global rayon pool once, before the first parallel call, with the
+/// decompile stack ([`luau_lifter::DECOMPILE_STACK_BYTES`]). `threads == 0` keeps
+/// rayon's default count (= logical CPU count).
 pub(crate) fn size_pool(threads: usize) {
-    if threads != 0 {
-        if let Err(e) = rayon::ThreadPoolBuilder::new()
-            .num_threads(threads)
-            .build_global()
-        {
-            eprintln!("warning: could not set thread count ({e}); using default pool");
-        }
+    if let Err(e) = luau_lifter::configure_thread_pool(threads) {
+        eprintln!("warning: could not configure the thread pool ({e}); using the existing pool");
     }
 }
 
 /// Decode + decompile + write one file. Never panics out: a panic anywhere in
 /// the decompile pipeline is caught and reported as a `Fail`. Thin wrapper used
 /// by `decompile-folder`, which discards the source string.
+#[cfg(test)]
 pub(crate) fn process_one(
     w: &Work,
     key: u8,
@@ -1090,9 +1219,17 @@ pub(crate) fn process_one(
     verbose: bool,
     options: DecompileOptions,
 ) -> Outcome {
-    decode_and_decompile(w, key, b64, true, false, verbose, options, None).0
+    decode_and_decompile(w, key, b64, true, false, verbose, options, None, None).0
 }
 
+pub(crate) fn process_one_cached(
+    w: &Work, key: u8, b64: &mut Vec<u8>, verbose: bool,
+    options: DecompileOptions, cache: Option<&crate::decompile_cache::Cache>,
+) -> Outcome {
+    decode_and_decompile(w, key, b64, true, false, verbose, options, None, cache).0
+}
+
+#[cfg(test)]
 pub(crate) fn process_one_with_analysis(
     w: &Work,
     key: u8,
@@ -1100,6 +1237,23 @@ pub(crate) fn process_one_with_analysis(
     verbose: bool,
     options: DecompileOptions,
     analysis_root: &Path,
+) -> (
+    Outcome,
+    Option<AnalysisManifestEntry>,
+    Option<AnalysisUnavailable>,
+    Option<GeneratedSourceRecord>,
+) {
+    process_one_with_analysis_cached(w, key, b64, verbose, options, analysis_root, None)
+}
+
+pub(crate) fn process_one_with_analysis_cached(
+    w: &Work,
+    key: u8,
+    b64: &mut Vec<u8>,
+    verbose: bool,
+    options: DecompileOptions,
+    analysis_root: &Path,
+    cache: Option<&crate::decompile_cache::Cache>,
 ) -> (
     Outcome,
     Option<AnalysisManifestEntry>,
@@ -1115,7 +1269,17 @@ pub(crate) fn process_one_with_analysis(
         verbose,
         options,
         Some(analysis_root),
+        cache,
     );
+    finish_analysis(w, outcome, entry, source_record)
+}
+
+fn finish_analysis(
+    w: &Work,
+    outcome: Outcome,
+    entry: Option<AnalysisManifestEntry>,
+    source_record: Option<GeneratedSourceRecord>,
+) -> (Outcome, Option<AnalysisManifestEntry>, Option<AnalysisUnavailable>, Option<GeneratedSourceRecord>) {
     let unavailable = if matches!(outcome, Outcome::Ok) && entry.is_none() {
         Some(match w.kind {
             WorkKind::SourceFallback => AnalysisUnavailable {
@@ -1150,8 +1314,47 @@ pub(crate) fn process_one_capture(
     options: DecompileOptions,
 ) -> (Outcome, Option<String>) {
     let (outcome, source, _, _) =
-        decode_and_decompile(w, key, b64, write_skipped, true, false, options, None);
+        decode_and_decompile(w, key, b64, write_skipped, true, false, options, None, None);
     (outcome, source)
+}
+
+/// Process the exact bytes already read and hashed by a folder worker.
+/// The artifact of the previous input of a duplicate group. Identical bytecode
+/// with the same module hint, options and decode key decompiles to the same
+/// artifact (the invariant the artifact cache key relies on), so later members
+/// reuse it instead of decompiling again. Failures are never shared.
+#[derive(Default)]
+pub(crate) struct DuplicateMemo(std::cell::RefCell<Option<(Vec<u8>, luau_lifter::DecompileArtifact)>>);
+
+impl DuplicateMemo {
+    fn get_or_compute(
+        &self,
+        bytecode: &[u8],
+        on_hit: impl FnOnce(),
+        compute: impl FnOnce() -> Result<luau_lifter::DecompileArtifact, String>,
+    ) -> Result<luau_lifter::DecompileArtifact, String> {
+        if let Some((previous, artifact)) = &*self.0.borrow()
+            && previous.as_slice() == bytecode
+        {
+            on_hit();
+            return Ok(artifact.clone());
+        }
+        let artifact = compute()?;
+        *self.0.borrow_mut() = Some((bytecode.to_vec(), artifact.clone()));
+        Ok(artifact)
+    }
+}
+
+pub(crate) fn process_one_preloaded(
+    w: &Work, text: &[u8], key: u8, b64: &mut Vec<u8>, verbose: bool,
+    options: DecompileOptions, analysis_root: Option<&Path>,
+    cache: Option<&crate::decompile_cache::Cache>, memo: Option<&DuplicateMemo>,
+) -> (Outcome, Option<AnalysisManifestEntry>, Option<AnalysisUnavailable>, Option<GeneratedSourceRecord>) {
+    let (outcome, _, entry, source_record) = decode_preloaded(
+        w, text, key, b64, true, false, verbose, options, analysis_root, cache, memo,
+    );
+    if analysis_root.is_some() { finish_analysis(w, outcome, entry, source_record) }
+    else { (outcome, None, None, None) }
 }
 
 /// The actual decode/decompile/write logic shared by both entry points.
@@ -1171,6 +1374,7 @@ fn decode_and_decompile(
     verbose: bool,
     options: DecompileOptions,
     analysis_root: Option<&Path>,
+    cache: Option<&crate::decompile_cache::Cache>,
 ) -> (
     Outcome,
     Option<String>,
@@ -1182,19 +1386,39 @@ fn decode_and_decompile(
         Err(e) => return (Outcome::Fail(format!("read: {e}")), None, None, None),
     };
 
-    // Replicate `grep -v '^--' | tr -d ' \t\r\n'`: drop lines starting with
-    // "--" (start-of-line anchor — no trim), keep all non-whitespace bytes.
+    decode_preloaded(w, &text, key, b64, write_skipped, capture, verbose, options, analysis_root, cache, None)
+}
+
+/// Replicate `grep -v '^--' | tr -d ' \t\r\n'` for both the folder scheduler
+/// and the decoder. The start-of-line comment check intentionally does not trim.
+pub(crate) fn compact_wrapper_payload(text: &[u8], b64: &mut Vec<u8>) {
     b64.clear();
     for line in text.split(|&b| b == b'\n') {
-        if line.starts_with(b"--") {
-            continue;
+        if !line.starts_with(b"--") {
+            let line = line.strip_suffix(b"\r").unwrap_or(line);
+            if line.iter().any(|&b| matches!(b, b' ' | b'\t' | b'\r')) {
+                b64.extend(line.iter().copied().filter(|&b| b != b' ' && b != b'\t' && b != b'\r'));
+            } else {
+                b64.extend_from_slice(line);
+            }
         }
-        b64.extend(
-            line.iter()
-                .copied()
-                .filter(|&b| b != b' ' && b != b'\t' && b != b'\r'),
-        );
     }
+}
+
+fn decode_preloaded(
+    w: &Work,
+    text: &[u8],
+    key: u8,
+    b64: &mut Vec<u8>,
+    write_skipped: bool,
+    capture: bool,
+    verbose: bool,
+    options: DecompileOptions,
+    analysis_root: Option<&Path>,
+    cache: Option<&crate::decompile_cache::Cache>,
+    memo: Option<&DuplicateMemo>,
+) -> (Outcome, Option<String>, Option<AnalysisManifestEntry>, Option<GeneratedSourceRecord>) {
+    compact_wrapper_payload(text, b64);
 
     if let Some(metadata) = w.volt_export.as_ref() {
         let declared = metadata
@@ -1238,7 +1462,7 @@ fn decode_and_decompile(
             let write_result = if analysis_root.is_some() || w.volt_export.is_some() {
                 atomic_write_contained(&w.output_root, &w.output, b"", w.volt_export.is_none())
             } else {
-                std::fs::write(&w.output, b"")
+                write_fresh(&w.output, b"")
             };
             if let Err(e) = write_result {
                 return (Outcome::Fail(format!("write: {e}")), None, None, None);
@@ -1261,7 +1485,7 @@ fn decode_and_decompile(
                 w.volt_export.is_none(),
             )
         } else {
-            std::fs::write(&w.output, &bytecode)
+            write_fresh(&w.output, &bytecode)
         };
         if let Err(error) = write_result {
             return (
@@ -1285,36 +1509,32 @@ fn decode_and_decompile(
 
     // catch_unwind is the backstop for deep panics in the lifter/ssa/restructure
     // passes. The common deserialize-failure path already comes back as Err.
-    let (source, upvalue_analysis) = if analysis_root.is_some() {
-        let result = catch_unwind(AssertUnwindSafe(|| {
-            luau_lifter::try_decompile_bytecode_artifact_with_options(
-                &bytecode,
-                key,
-                Some(&w.rel),
-                options,
-            )
-        }));
-        let artifact = match result {
-            Ok(Ok(artifact)) => artifact,
-            Ok(Err(reason)) => return (Outcome::Fail(reason), None, None, None),
-            Err(payload) => {
-                return (Outcome::Fail(panic_message(payload)), None, None, None);
-            }
-        };
-        (artifact.source, artifact.upvalue_analysis)
-    } else {
-        let result = catch_unwind(AssertUnwindSafe(|| {
+    let compute = || -> Result<luau_lifter::DecompileArtifact, String> {
+        if analysis_root.is_some() {
+            luau_lifter::try_decompile_bytecode_artifact_with_diagnostics(
+                &bytecode, key, Some(&w.rel), options,
+            ).map_err(|reason| reason.to_string())
+        } else {
             luau_lifter::try_decompile_bytecode_with_options(&bytecode, key, Some(&w.rel), options)
-        }));
-        let source = match result {
-            Ok(Ok(source)) => source,
-            Ok(Err(reason)) => return (Outcome::Fail(reason), None, None, None),
-            Err(payload) => {
-                return (Outcome::Fail(panic_message(payload)), None, None, None);
-            }
-        };
-        (source, None)
+                .map(|source| luau_lifter::DecompileArtifact { source, upvalue_analysis: None })
+        }
     };
+    let cached_compute = || match cache {
+        Some(cache) => cache.get_or_compute(&bytecode, key, &w.rel, options, analysis_root.is_some(), compute),
+        None => compute(),
+    };
+    let result = catch_unwind(AssertUnwindSafe(|| match memo {
+        Some(memo) => memo.get_or_compute(&bytecode, || {
+            if let Some(cache) = cache { cache.record_memory_hit(); }
+        }, cached_compute),
+        None => cached_compute(),
+    }));
+    let artifact = match result {
+        Ok(Ok(artifact)) => artifact,
+        Ok(Err(reason)) => return (Outcome::Fail(reason), None, None, None),
+        Err(payload) => return (Outcome::Fail(panic_message(payload)), None, None, None),
+    };
+    let luau_lifter::DecompileArtifact { source, upvalue_analysis } = artifact;
 
     // Append a trailing newline so output is byte-identical to the single-file
     // mode (which prints via `println!`). When `capture` is set we keep the
@@ -1333,7 +1553,7 @@ fn decode_and_decompile(
             w.volt_export.is_none(),
         )
     } else {
-        std::fs::write(&w.output, &source_bytes)
+        write_fresh(&w.output, &source_bytes)
     };
     if let Err(e) = write_result {
         return (Outcome::Fail(format!("write: {e}")), None, None, None);
@@ -1654,6 +1874,11 @@ fn hex_digest(bytes: impl AsRef<[u8]>) -> String {
 
 #[cfg(any(test, not(windows)))]
 pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    atomic_write_with_guard(path, bytes, || Ok(()))
+}
+
+#[cfg(any(test, not(windows)))]
+fn atomic_write_with_guard<G>(path: &Path, bytes: &[u8], before_publish: impl FnOnce() -> std::io::Result<G>) -> std::io::Result<G> {
     let parent = path.parent().ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidInput, "path has no parent")
     })?;
@@ -1692,12 +1917,17 @@ pub(crate) fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
         return Err(error);
     }
 
+    let guard = match before_publish() {
+        Ok(guard) => guard,
+        Err(error) => { let _ = std::fs::remove_file(&temp_path); return Err(error); }
+    };
     let result = replace_file(&temp_path, path);
     if result.is_err() {
         let _ = std::fs::remove_file(&temp_path);
     }
     result?;
-    sync_parent_directory(&canonical_parent)
+    sync_parent_directory(&canonical_parent)?;
+    Ok(guard)
 }
 
 /// Atomically publishes a file below a trusted canonical root. Manifest-backed
@@ -1709,9 +1939,22 @@ pub(crate) fn atomic_write_contained(
     bytes: &[u8],
     replace_existing: bool,
 ) -> std::io::Result<()> {
+    atomic_write_contained_guarded(root, path, bytes, replace_existing, || Ok(()))
+}
+
+/// Write/sync the temporary file before acquiring a publication guard. Cache
+/// writers can prepare files concurrently while quota changes and the final
+/// atomic rename remain serialized and protected by the same guard.
+pub(crate) fn atomic_write_contained_guarded<G>(
+    root: &Path,
+    path: &Path,
+    bytes: &[u8],
+    replace_existing: bool,
+    before_publish: impl FnOnce() -> std::io::Result<G>,
+) -> std::io::Result<G> {
     #[cfg(windows)]
     {
-        windows_contained_fs::atomic_write(root, path, bytes, replace_existing)
+        windows_contained_fs::atomic_write(root, path, bytes, replace_existing, before_publish)
     }
     #[cfg(not(windows))]
     {
@@ -1759,12 +2002,17 @@ pub(crate) fn atomic_write_contained(
                 return Err(error);
             }
             drop(file);
+            let guard = match before_publish() {
+                Ok(guard) => guard,
+                Err(error) => { let _ = std::fs::remove_file(&temp_path); return Err(error); }
+            };
             let result = publish_new_file(&temp_path, path);
             let _ = std::fs::remove_file(&temp_path);
             result?;
-            return sync_parent_directory(&canonical_parent);
+            sync_parent_directory(&canonical_parent)?;
+            return Ok(guard);
         }
-        atomic_write(path, bytes)
+        atomic_write_with_guard(path, bytes, before_publish)
     }
 }
 
@@ -1805,6 +2053,7 @@ mod windows_contained_fs {
     const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x20;
     const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+    const FILE_STANDARD_INFO_CLASS: i32 = 1;
     const FILE_ATTRIBUTE_TAG_INFO_CLASS: i32 = 9;
     const FILE_DISPOSITION_INFO_CLASS: i32 = 4;
     const ERROR_ALREADY_EXISTS: i32 = 183;
@@ -1837,6 +2086,16 @@ mod windows_contained_fs {
     struct FileAttributeTagInfo {
         file_attributes: u32,
         reparse_tag: u32,
+    }
+
+    #[repr(C)]
+    #[derive(Default)]
+    struct FileStandardInfo {
+        allocation_size: i64,
+        end_of_file: i64,
+        number_of_links: u32,
+        delete_pending: u8,
+        directory: u8,
     }
 
     #[repr(C)]
@@ -1923,12 +2182,13 @@ mod windows_contained_fs {
         }
     }
 
-    pub(super) fn atomic_write(
+    pub(super) fn atomic_write<G>(
         root: &Path,
         path: &Path,
         bytes: &[u8],
         replace_existing: bool,
-    ) -> io::Result<()> {
+        before_publish: impl FnOnce() -> io::Result<G>,
+    ) -> io::Result<G> {
         let (components, file_name) = split_contained_path(root, path)?;
         let chain = open_directory_chain(root, &components, true)
             .map_err(|error| contextual("open contained parent", error))?;
@@ -1939,6 +2199,10 @@ mod windows_contained_fs {
             let _ = delete_open_file(&temp);
             return Err(error);
         }
+        let guard = match before_publish() {
+            Ok(guard) => guard,
+            Err(error) => { let _ = delete_open_file(&temp); return Err(error); }
+        };
         #[cfg(test)]
         BEFORE_RENAME_HOOK.with(|hook| {
             if let Some(hook) = hook.borrow_mut().take() {
@@ -1951,7 +2215,7 @@ mod windows_contained_fs {
         }
         drop(temp);
         drop(chain);
-        Ok(())
+        Ok(guard)
     }
 
     #[cfg(test)]
@@ -2299,6 +2563,23 @@ mod windows_contained_fs {
         }
     }
 
+    /// Whether `file`, opened on a reparse point itself, is a plain file that
+    /// no other name shares: no reparse point, one link.
+    pub(super) fn is_unaliased_file(file: &File) -> bool {
+        let mut tag = FileAttributeTagInfo { file_attributes: 0, reparse_tag: 0 };
+        let mut standard = FileStandardInfo::default();
+        let queried = unsafe {
+            GetFileInformationByHandleEx(file.as_raw_handle() as Handle, FILE_ATTRIBUTE_TAG_INFO_CLASS,
+                &mut tag as *mut _ as *mut c_void, size_of::<FileAttributeTagInfo>() as u32) != 0
+                && GetFileInformationByHandleEx(file.as_raw_handle() as Handle, FILE_STANDARD_INFO_CLASS,
+                    &mut standard as *mut _ as *mut c_void, size_of::<FileStandardInfo>() as u32) != 0
+        };
+        queried
+            && tag.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT == 0
+            && standard.number_of_links == 1
+            && standard.directory == 0
+    }
+
     fn reject_reparse(file: &File) -> io::Result<()> {
         let mut info = FileAttributeTagInfo {
             file_attributes: 0,
@@ -2450,6 +2731,90 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
+
+    #[test]
+    fn duplicate_memo_checks_exact_bytes_and_does_not_reuse_failures() {
+        use std::cell::Cell;
+        let memo = DuplicateMemo::default();
+        let computes = Cell::new(0);
+        let hits = Cell::new(0);
+        let compute = |bytes: &[u8]| {
+            memo.get_or_compute(bytes, || hits.set(hits.get() + 1), || {
+                computes.set(computes.get() + 1);
+                if bytes == b"bad" { return Err("invalid bytecode".into()); }
+                Ok(luau_lifter::DecompileArtifact {
+                    source: String::from_utf8(bytes.to_vec()).unwrap(), upvalue_analysis: None,
+                })
+            })
+        };
+        assert_eq!(compute(b"one").unwrap().source, "one");
+        assert_eq!(compute(b"one").unwrap().source, "one");
+        // Simulate a fingerprint collision or a changed, reread input.
+        assert_eq!(compute(b"two").unwrap().source, "two");
+        assert!(compute(b"bad").is_err());
+        assert!(compute(b"bad").is_err());
+        assert_eq!(compute(b"two").unwrap().source, "two");
+        assert_eq!(computes.get(), 4);
+        assert_eq!(hits.get(), 2);
+    }
+
+    #[test]
+    fn invalid_duplicate_wrappers_fail_before_reusing_a_valid_memo() {
+        let temp = TestDir::new("invalid-duplicate-memo");
+        let work = Work {
+            input: temp.0.join("Module.lua"), output: temp.0.join("Module.luau"),
+            output_root: temp.0.clone(), rel: "Module.lua".into(), source_rel: "Module.luau".into(),
+            kind: WorkKind::RawBytecode, volt_export: None,
+        };
+        let memo = DuplicateMemo::default();
+        memo.get_or_compute(b"a", || panic!("empty memo cannot hit"), || {
+            Ok(luau_lifter::DecompileArtifact { source: "return 1".into(), upvalue_analysis: None })
+        }).unwrap();
+        let mut scratch = Vec::new();
+        // YQ== is canonical for b"a". YR== has nonzero trailing bits; YQ lacks
+        // required padding. All wrappers must fail even with a matching decoded
+        // artifact already in the memo, and repeated failures remain isolated.
+        for text in [b"YR==".as_slice(), b"-- duplicate\nY R==\n", b"YQ", b"bad!"] {
+            let (outcome, entry, unavailable, source) = process_one_preloaded(
+                &work, text, 1, &mut scratch, false, DecompileOptions::default(), None, None, Some(&memo),
+            );
+            assert!(matches!(outcome, Outcome::Fail(reason) if reason.starts_with("base64:")));
+            assert!(entry.is_none() && unavailable.is_none() && source.is_none());
+            assert!(!work.output.exists());
+        }
+    }
+
+    #[test]
+    fn concurrent_atomic_writes_prepare_before_serialized_publication() {
+        let directory = TestDir::new("parallel-publication");
+        let root = std::fs::canonicalize(&directory.0).unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let mut releases = Vec::new();
+        std::thread::scope(|scope| {
+            for index in 0..4 {
+                let root = &root;
+                let ready_tx = ready_tx.clone();
+                let (release_tx, release_rx) = std::sync::mpsc::channel();
+                releases.push(release_tx);
+                scope.spawn(move || {
+                    let path = root.join(format!("{index}.txt"));
+                    atomic_write_contained_guarded(root, &path, b"prepared", true, || {
+                        assert!(!path.exists(), "published before obtaining guard");
+                        ready_tx.send(()).unwrap();
+                        release_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+                        Ok(())
+                    }).unwrap();
+                    assert_eq!(std::fs::read(path).unwrap(), b"prepared");
+                });
+            }
+            // All four writers must reach the guard without waiting for any
+            // earlier writer to publish. No global lock covers file writes.
+            for _ in 0..4 {
+                ready_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            }
+            for release in releases { release.send(()).unwrap(); }
+        });
+    }
 
     struct TestDir(PathBuf);
 
@@ -3279,7 +3644,31 @@ mod tests {
     }
 
     #[test]
-    fn source_fallback_without_analysis_uses_direct_write() {
+    /// `out/Alias -> out/Real` would make `Real/Item` and `Alias/Item` one
+    /// file: a directory link under the output root refuses the run.
+    #[cfg(unix)]
+    #[test]
+    fn directory_links_under_the_output_root_are_refused() {
+        let temp = TestDir::new("directory-link");
+        let real = temp.0.join("Real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::os::unix::fs::symlink(&real, temp.0.join("Alias")).unwrap();
+        let work = |directory: &str| Work {
+            input: temp.0.join("input.lua"),
+            output: temp.0.join(directory).join("Item.luau"),
+            output_root: temp.0.clone(),
+            rel: format!("{directory}/Item.lua"),
+            source_rel: format!("{directory}/Item.luau"),
+            kind: WorkKind::SourceFallback,
+            volt_export: None,
+        };
+        assert!(precreate_dirs(&[work("Real")]).is_ok());
+        assert!(precreate_dirs(&[work("Real"), work("Alias")]).is_err());
+    }
+
+    /// Plain mode writes the output directly, as a new file: a hard link left
+    /// at the output path keeps its old contents instead of taking the write.
+    fn source_fallback_without_analysis_writes_a_fresh_file() {
         let temp = TestDir::new("fallback-direct-write");
         let input = temp.0.join("input.lua");
         let output = temp.0.join("output.lua");
@@ -3309,7 +3698,7 @@ mod tests {
             Outcome::Ok
         ));
         assert_eq!(std::fs::read(&work.output).unwrap(), source);
-        assert_eq!(std::fs::read(hard_link).unwrap(), source);
+        assert_eq!(std::fs::read(hard_link).unwrap(), b"old");
     }
 
     #[test]
@@ -3404,7 +3793,13 @@ mod tests {
         let out_root = std::fs::canonicalize(&out).unwrap();
         assert!(prepare_analysis_root(&out_root).is_err());
 
+        // Unix exposes directory symlinks as symlink files, so `remove_dir`
+        // returns ENOTDIR even though the link itself is valid.  Windows
+        // requires the directory-specific removal API for the same fixture.
+        #[cfg(windows)]
         std::fs::remove_dir(&link).unwrap();
+        #[cfg(unix)]
+        std::fs::remove_file(&link).unwrap();
         std::fs::create_dir_all(&link).unwrap();
         let scripts_link = link.join("scripts");
         #[cfg(windows)]
@@ -3412,5 +3807,86 @@ mod tests {
         #[cfg(unix)]
         std::os::unix::fs::symlink(&outside, &scripts_link).unwrap();
         assert!(prepare_analysis_root(&out_root).is_err());
+    }
+
+    fn folder_work(rel: &str, source_rel: &str) -> Work {
+        Work {
+            input: PathBuf::from(rel),
+            output: PathBuf::from(source_rel),
+            output_root: PathBuf::new(),
+            rel: rel.to_string(),
+            source_rel: source_rel.to_string(),
+            kind: WorkKind::RawBytecode,
+            volt_export: None,
+        }
+    }
+
+    #[test]
+    fn inputs_writing_one_output_all_fail() {
+        let mut failures = Vec::new();
+        let work = reject_shared_outputs(vec![
+            folder_work("A.LUA", "A.luau"),
+            folder_work("A.lua", "A.luau"),
+            folder_work("B.lua", "B.luau"),
+            folder_work("Main.lua", "Main.luau"),
+            folder_work("main.lua", "main.luau"),
+        ], &mut failures);
+        let kept = work.iter().map(|item| item.rel.as_str()).collect::<Vec<_>>();
+        failures.sort_by(|left, right| left.rel.cmp(&right.rel));
+        let failed = failures.iter().map(|failure| failure.rel.as_str()).collect::<Vec<_>>();
+        if cfg!(any(windows, target_os = "macos")) {
+            assert_eq!(kept, ["B.lua"]);
+            assert_eq!(failed, ["A.LUA", "A.lua", "Main.lua", "main.lua"]);
+        } else {
+            assert_eq!(kept, ["B.lua", "Main.lua", "main.lua"]);
+            assert_eq!(failed, ["A.LUA", "A.lua"]);
+        }
+        assert!(failures.iter().all(|failure| failure.code == "colliding_output_path"));
+        assert_eq!(failures[0].message, "output A.luau is also written by A.lua");
+        assert_eq!(failures[1].message, "output A.luau is also written by A.LUA");
+    }
+
+    #[test]
+    fn folder_inputs_differing_in_extension_case_are_reported() {
+        let temp = TestDir::new("extension-case");
+        let src = temp.0.join("src");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("A.lua"), b"first").unwrap();
+        std::fs::write(src.join("A.LUA"), b"second").unwrap();
+        std::fs::write(src.join("B.lua"), b"third").unwrap();
+        let (_, _, work, failures) = build_work(&src, &temp.0.join("out")).unwrap();
+        let kept = work.iter().map(|item| item.rel.as_str()).collect::<Vec<_>>();
+        // A case-insensitive file system keeps a single `A.lua` here.
+        if std::fs::read_dir(&src).unwrap().count() == 3 {
+            assert_eq!(kept, ["B.lua"]);
+            assert_eq!(failures.len(), 2);
+        } else {
+            assert_eq!(kept, ["A.lua", "B.lua"]);
+            assert!(failures.is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_folder_is_a_failure_not_a_skip() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = TestDir::new("unreadable");
+        let src = temp.0.join("src");
+        let denied = src.join("denied");
+        std::fs::create_dir_all(&denied).unwrap();
+        std::fs::write(src.join("visible.lua"), b"x").unwrap();
+        std::fs::write(denied.join("hidden.lua"), b"x").unwrap();
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable = std::fs::read_dir(&denied).is_ok();
+        let result = build_work(&src, &temp.0.join("out"));
+        std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if readable {
+            return; // root ignores the permission bits
+        }
+        let (_, _, work, failures) = result.unwrap();
+        assert_eq!(work.iter().map(|item| item.rel.as_str()).collect::<Vec<_>>(), ["visible.lua"]);
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].rel, "denied");
+        assert_eq!(failures[0].code, "unreadable_source_path");
     }
 }

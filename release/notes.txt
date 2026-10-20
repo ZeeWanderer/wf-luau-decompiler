@@ -1,0 +1,35 @@
+Tovek V2.6.1 fixes a control-flow structuring failure in scripts such as Events.lua.
+
+Fix
+- A loop's early return can share its bytecode block with a branch outside the
+  loop. The structurer previously treated that return as another continuing
+  loop exit and rejected the script with "residual goto/label would be invalid
+  Luau" when no common continuation existed.
+- Shared terminal returns now stay returns on their incoming paths. Generic,
+  numeric and while loops use the same rule, including sequential loops that
+  reach the same return block. Output uses ordinary structured Luau, with no
+  goto or synthetic control-flow dispatcher.
+- Normal exhaustion, edge transfers, loop-result rewrites and capture checks
+  keep their existing proofs. The existing join proof runs first, so the new
+  search is only needed when that proof cannot find a continuation.
+
+Validation
+- 362 Rust tests passed across the lifter and structurer checks.
+- 690 semantic round-trip profiles passed at O0/O1/O2, plus 60 independent
+  review profiles covering nested/sequential loops, captured state, closures,
+  multiple return values, nil and varargs.
+- All seven existing real residual-control fixtures still decompile and
+  recompile. Events.lua recompiles with the official Luau compiler, produces
+  identical output at 1/4/16 threads, and succeeds on all three local HTTP APIs.
+- The reported bytecode and source/CFG regression cases are saved in the repo.
+
+These checks cover the reported failure and tested variants; they do not
+promise that every possible bytecode input can be structured.
+
+Downloads: Windows x86_64, Linux x86_64, Linux aarch64 and macOS (Apple silicon).
+Each package contains luau-lifter (CLI), web-server (local HTTP server), and the
+MIT licence. SHA256SUMS.txt lists the checksums.
+
+Usage: https://github.com/Kiet1308/Tovek/blob/main/README.md
+Source: https://github.com/Kiet1308/Tovek/tree/v2.6.1
+V2.6 feature notes: https://kiet1308.github.io/Tovek/changelog/v2.6/

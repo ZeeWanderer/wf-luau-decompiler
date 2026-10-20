@@ -48,13 +48,15 @@ impl BinaryOperation {
 ///
 /// `not X` is always boolean regardless of `X`. Method names alone are not type
 /// proofs: an arbitrary table can expose an `IsA` method returning any value.
-pub(crate) fn is_boolean(r: &RValue) -> bool {
+/// Whether `r` always yields a boolean.
+pub fn is_boolean(r: &RValue) -> bool {
     match r {
         RValue::Binary(binary) if binary.operation.is_comparator() => true,
         RValue::Binary(Binary {
             left,
             right,
             operation: BinaryOperation::And | BinaryOperation::Or,
+            ..
         }) => is_boolean(left) && is_boolean(right),
         RValue::Unary(unary) if unary.operation == crate::UnaryOperation::Not => true,
         RValue::Literal(Literal::Boolean(_)) => true,
@@ -91,14 +93,23 @@ impl fmt::Display for BinaryOperation {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Clone, PartialEq)]
 pub struct Binary {
+    pub node_origin: crate::node_origins::Origin,
     pub left: Box<RValue>,
     pub right: Box<RValue>,
     pub operation: BinaryOperation,
 }
 
 impl Traverse for Binary {
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        visit(&self.left) && visit(&self.right)
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        visit(&mut self.left) && visit(&mut self.right)
+    }
+
     fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
         vec![&mut self.left, &mut self.right]
     }
@@ -120,24 +131,50 @@ impl SideEffects for Binary {
     }
 }
 
+/// `(p and x) and x` is `p and x` for a pure `x`, and likewise for `or`: once
+/// the first `x` runs, the second repeats its value.
+fn repeats_last_operand(left: &RValue, right: &RValue, operation: BinaryOperation) -> bool {
+    matches!(operation, BinaryOperation::And | BinaryOperation::Or)
+        && matches!(left, RValue::Binary(inner) if inner.operation == operation && *inner.right == *right)
+        && crate::is_total_pure(right)
+}
+
+/// `a and (a and b)` / `a or (a or b)` with a pure `a`: the inner test of
+/// `a` repeats the outer one and decides nothing.
+fn repeats_first_operand(left: &RValue, right: &RValue, operation: BinaryOperation) -> bool {
+    matches!(operation, BinaryOperation::And | BinaryOperation::Or)
+        && matches!(right, RValue::Binary(inner) if inner.operation == operation && *inner.left == *left)
+        && crate::is_total_pure(left)
+}
+
 impl<'a: 'b, 'b> Reduce for Binary {
     fn reduce(self) -> RValue {
         // TODO: true == true, true == false, etc.
         // really anything without side effects should be true if l == r
-        match (self.left.reduce(), self.right.reduce(), self.operation) {
+        // Retain storage while reducing the owned children. The unchanged
+        // fallback reinstalls them instead of allocating two replacement boxes.
+        let mut left_box = self.left;
+        let mut right_box = self.right;
+        let left = std::mem::replace(left_box.as_mut(), Literal::Nil.into()).reduce();
+        let right = std::mem::replace(right_box.as_mut(), Literal::Nil.into()).reduce();
+        match (left, right, self.operation) {
             (
                 RValue::Unary(Unary {
                     operation: UnaryOperation::Not,
                     value: left,
+                    ..
                 }),
                 RValue::Unary(Unary {
                     operation: UnaryOperation::Not,
                     value: right,
+                    ..
                 }),
                 BinaryOperation::And | BinaryOperation::Or,
             ) => Unary {
+                node_origin: Default::default(),
                 value: Box::new(
                     Binary {
+                        node_origin: Default::default(),
                         left,
                         right,
                         operation: if self.operation == BinaryOperation::And {
@@ -186,6 +223,7 @@ impl<'a: 'b, 'b> Reduce for Binary {
                         }),
                     right: box RValue::Literal(Literal::Boolean(true)),
                     operation: BinaryOperation::And,
+                    ..
                 }),
                 RValue::Literal(Literal::Boolean(false)),
                 BinaryOperation::Or,
@@ -203,36 +241,42 @@ impl<'a: 'b, 'b> Reduce for Binary {
             ) => RValue::Literal(Literal::String(
                 left.into_iter().chain(right.into_iter()).collect(),
             )),
-            (left, right, operation) => Self {
-                left: Box::new(left),
-                right: Box::new(right),
-                operation,
+            (left, right, operation) if repeats_last_operand(&left, &right, operation) => left,
+            (left, right, operation) if repeats_first_operand(&left, &right, operation) => right,
+            (left, right, operation) => {
+                *left_box = left;
+                *right_box = right;
+                Self { node_origin: Default::default(), left: left_box, right: right_box, operation }.into()
             }
-            .into(),
         }
     }
 
     fn reduce_condition(self) -> RValue {
-        let (left, right) = if matches!(self.operation, BinaryOperation::And | BinaryOperation::Or)
-        {
-            (self.left.reduce_condition(), self.right.reduce_condition())
-        } else {
-            (self.left.reduce(), self.right.reduce())
-        };
+        let mut left_box = self.left;
+        let mut right_box = self.right;
+        let conditions = matches!(self.operation, BinaryOperation::And | BinaryOperation::Or);
+        let left = std::mem::replace(left_box.as_mut(), Literal::Nil.into());
+        let left = if conditions { left.reduce_condition() } else { left.reduce() };
+        let right = std::mem::replace(right_box.as_mut(), Literal::Nil.into());
+        let right = if conditions { right.reduce_condition() } else { right.reduce() };
         match (left, right, self.operation) {
             (
                 RValue::Unary(Unary {
                     operation: UnaryOperation::Not,
                     value: left,
+                    ..
                 }),
                 RValue::Unary(Unary {
                     operation: UnaryOperation::Not,
                     value: right,
+                    ..
                 }),
                 BinaryOperation::And | BinaryOperation::Or,
             ) => Unary {
+                node_origin: Default::default(),
                 value: Box::new(
                     Binary {
+                        node_origin: Default::default(),
                         left,
                         right,
                         operation: if self.operation == BinaryOperation::And {
@@ -284,7 +328,9 @@ impl<'a: 'b, 'b> Reduce for Binary {
                 // and dynamic table-key errors.
                 _ if crate::is_total_pure(&left) => RValue::Literal(Literal::Boolean(right)),
                 operation => {
-                    Binary::new(left, RValue::Literal(Literal::Boolean(right)), operation).into()
+                    *left_box = left;
+                    *right_box = RValue::Literal(Literal::Boolean(right));
+                    Self { node_origin: Default::default(), left: left_box, right: right_box, operation }.into()
                 }
             },
             // TODO: concat numbers
@@ -295,12 +341,13 @@ impl<'a: 'b, 'b> Reduce for Binary {
             ) => RValue::Literal(Literal::String(
                 left.into_iter().chain(right.into_iter()).collect(),
             )),
-            (left, right, operation) => Self {
-                left: Box::new(left),
-                right: Box::new(right),
-                operation,
+            (left, right, operation) if repeats_last_operand(&left, &right, operation) => left,
+            (left, right, operation) if repeats_first_operand(&left, &right, operation) => right,
+            (left, right, operation) => {
+                *left_box = left;
+                *right_box = right;
+                Self { node_origin: Default::default(), left: left_box, right: right_box, operation }.into()
             }
-            .into(),
         }
     }
 }
@@ -308,6 +355,7 @@ impl<'a: 'b, 'b> Reduce for Binary {
 impl Binary {
     pub fn new(left: RValue, right: RValue, operation: BinaryOperation) -> Self {
         Self {
+            node_origin: Default::default(),
             left: Box::new(left),
             right: Box::new(right),
             operation,
@@ -341,9 +389,14 @@ impl Binary {
         )
     }
 
+    /// Whether the left operand prints parenthesized. A comparison inside a
+    /// comparison is, though left association needs none: `(a == b) == c`
+    /// says what `a == b == c` leaves the reader to work out.
     pub fn left_group(&self) -> bool {
         self.precedence() > self.left.precedence()
             || (self.precedence() == self.left.precedence() && self.right_associative())
+            || (self.operation.is_comparator()
+                && matches!(self.left.as_ref(), RValue::Binary(left) if left.operation.is_comparator()))
     }
 
     pub fn right_group(&self) -> bool {
@@ -353,20 +406,20 @@ impl Binary {
 }
 
 impl LocalRw for Binary {
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.left.visit_local_reads(visit) && self.right.visit_local_reads(visit)
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.left
-            .values_read()
-            .into_iter()
-            .chain(self.right.values_read().into_iter())
-            .collect()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.left.visit_local_reads_mut(visit) && self.right.visit_local_reads_mut(visit)
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.left
-            .values_read_mut()
-            .into_iter()
-            .chain(self.right.values_read_mut().into_iter())
-            .collect()
+        crate::local::collect_reads_mut(self)
     }
 }
 
@@ -424,6 +477,29 @@ mod tests {
         assert!(is_binary(&kept, BinaryOperation::Or));
     }
 
+    #[test]
+    fn signed_zero_operands_are_not_the_same_value() {
+        // `-0 and 0` is `0`, which `1 / x` tells from `-0`.
+        let number = |value: f64| RValue::Literal(Literal::Number(value));
+        for operation in [BinaryOperation::And, BinaryOperation::Or] {
+            let reduced = Binary::new(number(-0.0), number(0.0), operation).reduce();
+            assert!(is_binary(&reduced, operation), "{operation:?}");
+        }
+        let nan = number(f64::NAN);
+        assert_eq!(Binary::new(nan.clone(), nan.clone(), BinaryOperation::And).reduce(), nan);
+    }
+
+    #[test]
+    fn a_repeated_last_operand_folds_only_when_pure() {
+        let (p, x) = (RcLocal::default(), RcLocal::default());
+        let and = |l: RValue, r: RValue| -> RValue { Binary::new(l, r, BinaryOperation::And).into() };
+        let doubled = Binary::new(and(RValue::Local(p.clone()), RValue::Local(x.clone())), RValue::Local(x.clone()), BinaryOperation::And);
+        assert_eq!(doubled.clone().reduce(), and(RValue::Local(p.clone()), RValue::Local(x.clone())));
+        assert_eq!(doubled.reduce_condition(), and(RValue::Local(p.clone()), RValue::Local(x.clone())));
+        let read = Binary::new(and(RValue::Local(p.clone()), global("x")), global("x"), BinaryOperation::And).reduce();
+        assert!(matches!(&read, RValue::Binary(outer) if is_binary(&outer.left, BinaryOperation::And)));
+    }
+
     // P2 (reduce_condition): `X and false` -> false and `X or true` -> true drop the
     // ALWAYS-evaluated left operand, so they may only fold when X is side-effect-free.
     #[test]
@@ -472,3 +548,5 @@ mod tests {
         assert_eq!(kept, global("foo"));
     }
 }
+
+crate::node_origins::semantic_debug!(Binary; left,right,operation);

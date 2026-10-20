@@ -4,8 +4,125 @@ use crate::{
 
 use std::{fmt, iter};
 
-#[derive(Debug, Clone, PartialEq, Default)]
-pub struct Table(pub Vec<(Option<RValue>, RValue)>);
+#[derive(Clone, PartialEq, Default)]
+pub struct Table(pub Vec<(Option<RValue>, RValue)>, pub crate::node_origins::Origin, pub TableShape);
+
+impl Table {
+    pub fn new(fields: Vec<(Option<RValue>, RValue)>) -> Self { Self(fields, Default::default(), Default::default()) }
+}
+
+/// How the bytecode built a table, which decides the order `next` and
+/// `pairs` visit its keys in: the size of its hash part, and whether a store
+/// of `nil` leaves a key in it. A DUPTABLE copies a template whose keys all
+/// exist before any store, so a key stored `nil` keeps its node; a NEWTABLE
+/// of hash size `hash` gets a key only when a store of a value creates it.
+/// A table grown past its hash part rehashes, which moves its keys. Layout
+/// only: never part of AST equality.
+#[derive(Clone, Copy, Debug, Default)]
+pub enum TableShape {
+    #[default]
+    Unknown,
+    NewTable { hash: u32 },
+    Template { keys: u32 },
+}
+
+impl PartialEq for TableShape {
+    fn eq(&self, _: &Self) -> bool { true }
+}
+
+impl TableShape {
+    /// The nodes Luau gives a hash part sized for `keys` keys.
+    pub fn nodes(keys: u32) -> u32 {
+        if keys == 0 { 0 } else { keys.next_power_of_two() }
+    }
+}
+
+/// Whether a store adding a key may fold into `table`'s constructor without
+/// changing the order `pairs` visits its keys in. A DUPTABLE's hash part has
+/// nodes for its template keys rounded up to a power of two; a store adding a
+/// key past that rehashes the table, and a constructor printing the key would
+/// be a larger template, laid out otherwise: `{a = 1, b = 2}; t.c = 3` is not
+/// `{a = 1, b = 2, c = 3}` under `pairs` (fr-t1110 F2).
+pub fn template_takes_another_key(table: &Table) -> bool {
+    let TableShape::Template { keys } = table.2 else { return true };
+    let listed = table.0.iter().filter(|(key, _)| key.is_some()).count();
+    u32::try_from(listed + 1).is_ok_and(|after| after <= TableShape::nodes(keys))
+}
+
+/// Whether `table` is a DUPTABLE copy: all its template keys exist before
+/// any store, in template order, so a constructor must keep each one in its
+/// place (no store may move a `nil` slot to the end).
+pub fn is_template_copy(table: &Table) -> bool {
+    matches!(table.2, TableShape::Template { .. })
+}
+impl fmt::Debug for Table {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.debug_tuple("Table").field(&self.0).finish() }
+}
+
+/// A DUPTABLE template field. The VM loader creates every template key with the
+/// value `0` before any store runs (older lifts modelled it as `nil`), so the
+/// entry evaluates nothing and a store that follows may take its slot.
+pub fn is_template_placeholder(value: &RValue) -> bool {
+    matches!(value, RValue::Literal(Literal::Nil | Literal::Number(0.0)))
+}
+
+/// Whether a store to `key` may fold into the constructor entry `listed =
+/// value` for its slot, keeping the listed key. Keys naming one slot by
+/// value can still differ under `pairs` (`[0]`, `[-0]`): a slot holding a
+/// value keeps the key it was created with, but a `nil` slot may be taken
+/// over by a later insertion or dropped by a rehash, and the store then
+/// creates the key it spells. Which one happens depends on the hash layout.
+pub fn keeps_listed_key(listed: Option<&RValue>, value: &RValue, key: &RValue) -> bool {
+    matches!((listed, key), (Some(RValue::Literal(listed)), RValue::Literal(key)) if listed == key)
+        || !matches!(value, RValue::Literal(Literal::Nil))
+}
+
+/// A constructor entry whose value evaluates nothing: a template placeholder or
+/// a constant the template carries. A later store may take its slot, and a
+/// value may be moved ahead of it, without reordering any evaluation.
+pub fn is_inert_entry_value(value: &RValue) -> bool {
+    matches!(value, RValue::Literal(_))
+}
+
+/// Literal keys a constructor already lists. A later store to one of them
+/// mutates a finished table; folding it would print the key twice, which is
+/// never how a table is written. Hashes keep the check O(1) on long field runs,
+/// and a hit is confirmed against the entries.
+#[derive(Default)]
+pub struct ListedKeys(rustc_hash::FxHashSet<u64>);
+
+impl ListedKeys {
+    pub fn new(table: &Table) -> Self {
+        Self(table.0.iter().filter_map(|(key, _)| key.as_ref().and_then(literal_key_hash)).collect())
+    }
+
+    pub fn lists(&self, table: &Table, key: &RValue) -> bool {
+        literal_key_hash(key).is_some_and(|hash| {
+            self.0.contains(&hash)
+                && table.0.iter().any(|(listed, _)| listed.as_ref().is_some_and(|listed| crate::same_table_key(listed, key)))
+        })
+    }
+
+    pub fn add(&mut self, key: &RValue) {
+        if let Some(hash) = literal_key_hash(key) {
+            self.0.insert(hash);
+        }
+    }
+}
+
+fn literal_key_hash(key: &RValue) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = rustc_hash::FxHasher::default();
+    match key {
+        RValue::Literal(Literal::String(bytes)) => (0u8, bytes).hash(&mut hasher),
+        // `t[0]` and `t[-0]` are the same slot.
+        RValue::Literal(Literal::Number(number)) => {
+            (1u8, if *number == 0.0 { 0 } else { number.to_bits() }).hash(&mut hasher)
+        }
+        _ => return None,
+    }
+    Some(hasher.finish())
+}
 
 impl Reduce for Table {
     fn reduce(self) -> RValue {
@@ -58,24 +175,42 @@ impl Reduce for Table {
 }*/
 
 impl LocalRw for Table {
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.0.iter().all(|(key, value)| {
+            key.as_ref().is_none_or(|key| key.visit_local_reads(visit))
+                && value.visit_local_reads(visit)
+        })
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.0
-            .iter()
-            .flat_map(|(k, v)| k.iter().chain(iter::once(v)))
-            .flat_map(|v| v.values_read())
-            .collect()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.0.iter_mut().all(|(key, value)| {
+            key.as_mut().is_none_or(|key| key.visit_local_reads_mut(visit))
+                && value.visit_local_reads_mut(visit)
+        })
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.0
-            .iter_mut()
-            .flat_map(|(k, v)| k.iter_mut().chain(iter::once(v)))
-            .flat_map(|v| v.values_read_mut())
-            .collect()
+        crate::local::collect_reads_mut(self)
     }
 }
 
 impl Traverse for Table {
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        self.0.iter().all(|(key, value)| {
+            key.as_ref().is_none_or(|key| visit(key)) && visit(value)
+        })
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        self.0.iter_mut().all(|(key, value)| {
+            key.as_mut().is_none_or(|key| visit(key)) && visit(value)
+        })
+    }
+
     fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
         self.0
             .iter_mut()
@@ -122,9 +257,13 @@ impl fmt::Display for Table {
             indentation_level: 0,
             indentation_mode: Default::default(),
             output: f,
-            colon_method_calls: Vec::new(),
+            colon_method_calls: Default::default(),
             position_query: None,
             closure_observer: None,
+            emission_map: None,
+            layout_budget: None,
+            compact_annotations: false,
+            inferred_calls: Default::default(),
         }
         .format_table(self)
     }

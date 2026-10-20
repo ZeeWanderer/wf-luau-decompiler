@@ -14,13 +14,19 @@ use std::{
 
 mod assign;
 mod binary;
+mod boxed_statement;
 mod r#break;
 mod call;
+pub mod call_origins;
+pub mod node_origins;
+pub mod annotations;
 mod close;
 mod closure;
+pub mod closure_identity;
 mod r#continue;
 mod r#for;
 pub mod formatter;
+pub mod emission_map;
 mod global;
 mod goto;
 mod r#if;
@@ -28,62 +34,99 @@ mod if_expression;
 mod index;
 mod literal;
 mod local;
+pub mod local_producers;
 //mod name_gen;
 pub mod canonicalize_branches;
+pub mod branch_constructors;
 pub mod cleanup_final;
 pub mod cleanup_returns;
+pub mod coalesce_locals;
+pub mod compact_conditionals;
+pub mod compound_bases;
 pub mod conditional_expressions;
+pub mod terminal_returns;
 pub mod copy_cleanup;
 pub mod deinline;
+pub mod fold_function_names;
+pub mod folded_captures;
+pub mod fold_import_callees;
+pub mod fold_tuple_copies;
+pub mod reconstruction_search;
+pub mod reconstruction_stats;
+mod deinline_safety;
+pub use deinline_safety::{library_import, ChunkGlobals};
+pub mod telemetry;
+pub mod dense;
+#[doc(hidden)]
+pub mod prof;
 pub mod eliminate_nil;
 pub mod expr_deinline;
 pub mod expression_budget;
+pub mod effects;
+mod numeric_facts;
+pub mod evaluation_order;
 pub mod factor_common_tails;
 pub mod flatten_guards;
+pub mod forward_declarations;
+pub mod fresh_closures;
+pub mod guard_exhaustion_adapters;
 pub mod inline_temps;
 pub mod local_declarations;
+pub mod lower_conditionals;
 pub mod materialize_call_receivers;
 pub mod materialize_value_captures;
+pub mod materialize_vectors;
 pub mod name_locals;
+pub(crate) mod name_spelling;
+pub mod naming_evidence;
+pub mod naming_api;
+pub mod refine_names;
 pub mod normalize_conditions;
 pub mod rebalance_expressions;
 pub mod rebuild_table_literals;
-pub mod recover_dropped_connection;
 pub mod recover_guard_continue;
 pub mod recover_methods;
+pub mod register_pressure;
 pub mod rehoist_constants;
+pub mod reroll_arithmetic;
 mod repeat;
 pub mod replace_locals;
+pub mod library_constants;
+pub mod link_upvalues;
+pub mod literal_sharing;
 mod r#return;
+mod select_value;
 mod set_list;
 mod side_effects;
 pub mod simplify_gotos;
+pub mod spell_constants;
 pub mod synthesize_terminal_helpers;
 mod table;
 mod traverse;
 pub mod type_system;
 mod unary;
+pub mod untruncate_arguments;
 mod vararg;
 mod r#while;
 
 pub use assign::*;
 pub use binary::*;
+pub use select_value::select_value;
+pub use r#break::*;
 pub use call::*;
 pub use close::*;
 pub use closure::*;
+pub use r#continue::*;
+pub use r#for::*;
 pub use global::*;
 pub use goto::*;
+pub use r#if::*;
 pub use if_expression::*;
 pub use index::*;
 pub use literal::*;
 pub use local::*;
-pub use r#break::*;
-pub use r#continue::*;
-pub use r#for::*;
-pub use r#if::*;
-pub use r#return::*;
-pub use r#while::*;
 pub use repeat::*;
+pub use r#return::*;
 pub use set_list::*;
 pub use side_effects::*;
 pub use table::*;
@@ -91,6 +134,23 @@ pub use traverse::*;
 use type_system::{Type, TypeSystem};
 pub use unary::*;
 pub use vararg::*;
+pub use r#while::*;
+
+/// Whether a diagnostic environment variable is set, read once per process.
+/// Hot per-function paths consult these switches; the environment is never
+/// modified while decompiling.
+#[macro_export]
+macro_rules! env_flag {
+    ($name:literal) => {{
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FLAG.get_or_init(|| std::env::var_os($name).is_some())
+    }};
+}
+
+/// Insertion-ordered map/set with the fast deterministic hasher. Iteration
+/// order is insertion order, independent of the hash function.
+pub type FxIndexMap<K, V> = indexmap::IndexMap<K, V, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
+pub type FxIndexSet<K> = indexmap::IndexSet<K, std::hash::BuildHasherDefault<rustc_hash::FxHasher>>;
 
 pub trait Reduce {
     fn reduce(self) -> RValue;
@@ -103,6 +163,18 @@ pub enum Select {
     VarArg(VarArg),
     Call(Call),
     MethodCall(MethodCall),
+}
+
+/// `value` without a `Select`'s one-result adjustment, for a place that
+/// takes one value anyway (an operand) or passes it to a callee that drops
+/// the rest (a non-variadic helper's last argument).
+pub(crate) fn untruncated(value: RValue) -> RValue {
+    match value {
+        RValue::Select(Select::Call(call)) => RValue::Call(call),
+        RValue::Select(Select::MethodCall(call)) => RValue::MethodCall(call),
+        RValue::Select(Select::VarArg(vararg)) => RValue::VarArg(vararg),
+        value => value,
+    }
 }
 
 impl fmt::Display for Select {
@@ -153,7 +225,8 @@ impl type_system::Infer for RValue {
 
 impl<'a: 'b, 'b> Reduce for RValue {
     fn reduce(self) -> RValue {
-        match self {
+        let origin = node_origins::value(&self).map(|o| o.snapshot());
+        let mut result = match self {
             Self::Unary(unary) => unary.reduce(),
             Self::Binary(binary) => binary.reduce(),
             Self::Literal(literal) => literal.reduce(),
@@ -161,11 +234,14 @@ impl<'a: 'b, 'b> Reduce for RValue {
             Self::Closure(closure) => closure.reduce(),
             Self::IfExpression(if_expression) => if_expression.reduce(),
             other => other,
-        }
+        };
+        node_origins::inherit(&mut result, origin.as_ref());
+        result
     }
 
     fn reduce_condition(self) -> RValue {
-        match self {
+        let origin = node_origins::value(&self).map(|o| o.snapshot());
+        let mut result = match self {
             Self::Unary(unary) => unary.reduce_condition(),
             Self::Binary(binary) => binary.reduce_condition(),
             Self::Literal(literal) => literal.reduce_condition(),
@@ -173,19 +249,32 @@ impl<'a: 'b, 'b> Reduce for RValue {
             Self::Closure(closure) => closure.reduce_condition(),
             Self::IfExpression(if_expression) => if_expression.reduce_condition(),
             other => other,
-        }
+        };
+        node_origins::inherit(&mut result, origin.as_ref());
+        result
     }
 }
 
+/// How deep inlining may nest an expression. An accumulation of thousands
+/// of single-use temps (`sum += n` per line) would otherwise fold into one
+/// tree too deep for the recursive passes after it (a stack overflow aborts
+/// the whole process), and far too long to read on one line.
+pub const MAX_INLINED_DEPTH: usize = 128;
+
 impl RValue {
+    /// Whether this expression nests deeper than `levels`. Walks no further
+    /// than that, so a deep tree costs no more to check than a shallow one;
+    /// a closure's body is a function of its own and does not count.
+    pub fn nests_deeper_than(&self, levels: usize) -> bool {
+        levels == 0 || !self.visit_rvalues(&mut |child| !child.nests_deeper_than(levels - 1))
+    }
+
     pub fn precedence(&self) -> usize {
         match self {
             Self::Binary(binary) => binary.precedence(),
             Self::Unary(unary) => unary.precedence(),
             Self::IfExpression(_) => 0,
-            RValue::Literal(Literal::Number(n)) if n.is_sign_negative() && !n.is_nan() => {
-                return 7;
-            }
+            RValue::Literal(literal) if literal.prints_negated() => 7,
             _ => 9,
         }
     }
@@ -229,19 +318,39 @@ pub enum LValue {
 }
 
 impl LocalRw for LValue {
-    fn values_read(&self) -> Vec<&RcLocal> {
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
         match self {
-            LValue::Local(_) => Vec::new(),
-            LValue::Global(global) => global.values_read(),
-            LValue::Index(index) => index.values_read(),
+            LValue::Local(_) | LValue::Global(_) => true,
+            LValue::Index(index) => index.visit_local_reads(visit),
+        }
+    }
+
+    fn values_read(&self) -> Vec<&RcLocal> {
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        match self {
+            LValue::Local(_) | LValue::Global(_) => true,
+            LValue::Index(index) => index.visit_local_reads_mut(visit),
         }
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
+        crate::local::collect_reads_mut(self)
+    }
+
+    fn visit_local_writes<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
         match self {
-            LValue::Local(_) => Vec::new(),
-            LValue::Global(global) => global.values_read_mut(),
-            LValue::Index(index) => index.values_read_mut(),
+            LValue::Local(local) => visit(local),
+            LValue::Global(_) | LValue::Index(_) => true,
+        }
+    }
+
+    fn visit_local_writes_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        match self {
+            LValue::Local(local) => visit(local),
+            LValue::Global(_) | LValue::Index(_) => true,
         }
     }
 
@@ -282,6 +391,9 @@ pub struct Comment {
     /// comment that follows a single-line statement; a leading comment (the
     /// default) keeps its own line.
     pub trailing: bool,
+    /// A hot comment such as `--!native`, written with no space after `--`
+    /// (the compiler reads `-- !native` as an ordinary comment).
+    pub hot: bool,
 }
 
 impl Comment {
@@ -289,6 +401,16 @@ impl Comment {
         Self {
             text,
             trailing: false,
+            hot: false,
+        }
+    }
+
+    /// The hot comment `--!name`, which belongs before any statement.
+    pub fn hot(name: &str) -> Self {
+        Self {
+            text: format!("!{name}"),
+            trailing: false,
+            hot: true,
         }
     }
 
@@ -297,6 +419,7 @@ impl Comment {
         Self {
             text,
             trailing: true,
+            hot: false,
         }
     }
 }
@@ -319,11 +442,11 @@ pub enum Statement {
     Label(Label),
     While(While),
     Repeat(Repeat),
-    NumForInit(NumForInit),
-    NumForNext(NumForNext),
-    NumericFor(NumericFor),
+    NumForInit(Box<NumForInit>),
+    NumForNext(Box<NumForNext>),
+    NumericFor(Box<NumericFor>),
     GenericForInit(GenericForInit),
-    GenericForNext(GenericForNext),
+    GenericForNext(Box<GenericForNext>),
     GenericFor(GenericFor),
     Return(Return),
     Continue(Continue),
@@ -350,7 +473,11 @@ impl fmt::Display for Empty {
 
 impl fmt::Display for Comment {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "-- {}", self.text)
+        if self.hot {
+            write!(f, "--{}", self.text)
+        } else {
+            write!(f, "-- {}", self.text)
+        }
     }
 }
 
@@ -399,6 +526,41 @@ impl Deref for Block {
 impl DerefMut for Block {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.0
+    }
+}
+
+impl Block {
+    /// Whether `predicate` holds for a statement of this function body,
+    /// including nested control-flow blocks but not nested closure bodies.
+    pub fn any_statement(&self, predicate: &mut impl FnMut(&Statement) -> bool) -> bool {
+        self.0.iter().any(|statement| {
+            predicate(statement)
+                || match statement {
+                    Statement::If(node) => {
+                        node.then_block.lock().any_statement(predicate)
+                            || node.else_block.lock().any_statement(predicate)
+                    }
+                    Statement::While(node) => node.block.lock().any_statement(predicate),
+                    Statement::Repeat(node) => node.block.lock().any_statement(predicate),
+                    Statement::NumericFor(node) => node.block.lock().any_statement(predicate),
+                    Statement::GenericFor(node) => node.block.lock().any_statement(predicate),
+                    _ => false,
+                }
+        })
+    }
+
+    /// Like [`Block::any_statement`], also searching every nested closure body.
+    pub fn any_statement_deep(&self, predicate: &mut impl FnMut(&Statement) -> bool) -> bool {
+        fn closures_any(value: &RValue, predicate: &mut impl FnMut(&Statement) -> bool) -> bool {
+            if let RValue::Closure(closure) = value {
+                return closure.function.lock().body.any_statement_deep(predicate);
+            }
+            !value.visit_rvalues(&mut |child| !closures_any(child, predicate))
+        }
+        self.any_statement(&mut |statement| {
+            predicate(statement)
+                || !crate::deinline::visit_stmt_rvalues(statement, &mut |value| !closures_any(value, predicate))
+        })
     }
 }
 

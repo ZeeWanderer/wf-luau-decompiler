@@ -1,0 +1,167 @@
+//! Optional final-text locations. These identify emitted syntax and binding
+//! identities, not value origins, instruction ownership or rewrite proofs.
+use crate::formatter::SourceSpan;
+
+pub const OCCURRENCE_LIMIT: usize = 100_000;
+pub const ANNOTATION_BYTE_LIMIT: usize = 4096;
+pub const CALL_OCCURRENCE_LIMIT: usize = 100_000;
+pub const REGION_LIMIT: usize = 100_000;
+
+pub fn value_kind(value: &crate::RValue) -> &'static str {
+    use crate::RValue;
+    match value {
+        RValue::Local(_) => "local", RValue::Global(_) => "global",
+        RValue::Literal(_) => "literal", RValue::Call(_) => "call",
+        RValue::MethodCall(_) => "method_call", RValue::VarArg(_) => "vararg",
+        RValue::Table(_) => "table", RValue::Index(_) => "index",
+        RValue::Unary(_) => "unary", RValue::Binary(_) => "binary",
+        RValue::Closure(_) => "closure", RValue::IfExpression(_) => "conditional_value",
+        RValue::Select(_) => "scalar_adjustment",
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct SyntaxRegion {
+    pub kind: &'static str,
+    pub bindings: Vec<u64>,
+    pub span: SourceSpan,
+    pub origin: crate::node_origins::Origin,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CallOccurrence {
+    pub event_id: u32,
+    pub current_callee_binding: Option<u64>,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BindingOccurrence {
+    pub binding_id: u64,
+    pub role: &'static str,
+    pub span: SourceSpan,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AnnotationOccurrence {
+    pub text: String,
+    pub truncated: bool,
+    pub span: SourceSpan,
+    pub displayed_text: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OpaqueOccurrence {
+    pub reason: &'static str,
+    pub span: SourceSpan,
+}
+
+/// Collected during actual emission only; layout previews must never contribute.
+/// No RcLocal owners are retained and no IDs are allocated by this collector.
+#[derive(Default, Debug)]
+pub struct EmissionMap {
+    pub regions: Vec<SyntaxRegion>,
+    pub omitted_regions: usize,
+    pub bindings: Vec<BindingOccurrence>,
+    pub annotations: Vec<AnnotationOccurrence>,
+    pub opaque_regions: Vec<OpaqueOccurrence>,
+    pub omitted_occurrences: usize,
+    pub reconstructed_calls: Vec<CallOccurrence>,
+    pub omitted_reconstructed_calls: usize,
+}
+
+impl EmissionMap {
+    /// `bindings` are collected only when the region is admitted: walking an
+    /// expression's subtree can cost much more than storing its region.
+    pub fn region(&mut self, kind: &'static str, bindings: impl FnOnce() -> Vec<u64>, span: SourceSpan,
+                  origin: Option<&crate::node_origins::Origin>) {
+        if self.regions.len() < REGION_LIMIT {
+            self.regions.push(SyntaxRegion { kind, bindings: bindings(), span, origin: origin.map(|o| o.snapshot()).unwrap_or_default() });
+        } else { self.omitted_regions += 1; }
+    }
+    pub(crate) fn can_record(&self) -> bool {
+        self.bindings.len() + self.annotations.len() + self.opaque_regions.len() < OCCURRENCE_LIMIT
+    }
+    pub fn reconstructed_call(&mut self, event_id: u32, current_callee_binding: Option<u64>, span: SourceSpan) {
+        if self.reconstructed_calls.len() < CALL_OCCURRENCE_LIMIT {
+            self.reconstructed_calls.push(CallOccurrence { event_id, current_callee_binding, span });
+        } else {
+            self.omitted_reconstructed_calls += 1;
+        }
+    }
+    fn room(&mut self) -> bool {
+        if self.can_record() {
+            true
+        } else {
+            self.omitted_occurrences += 1;
+            false
+        }
+    }
+
+    pub fn binding(&mut self, binding_id: u64, role: &'static str, span: SourceSpan) {
+        if self.room() {
+            self.bindings.push(BindingOccurrence { binding_id, role, span });
+        }
+    }
+
+    pub fn annotation(&mut self, text: &str, span: SourceSpan) {
+        if !self.room() { return; }
+        let mut end = text.len().min(ANNOTATION_BYTE_LIMIT);
+        while !text.is_char_boundary(end) { end -= 1; }
+        self.annotations.push(AnnotationOccurrence {
+            text: text[..end].to_owned(), truncated: end != text.len(), span, displayed_text: None,
+        });
+    }
+
+    pub fn opaque(&mut self, reason: &'static str, span: SourceSpan) {
+        if self.room() { self.opaque_regions.push(OpaqueOccurrence { reason, span }); }
+    }
+
+    pub fn sort(&mut self) {
+        self.regions.sort_by_key(|r| (r.span.start.byte_offset, r.span.end.byte_offset, r.kind));
+        self.bindings.sort_by_key(|item| (item.span.start.byte_offset, item.span.end.byte_offset, item.binding_id));
+        self.annotations.sort_by_key(|item| item.span.start.byte_offset);
+        self.opaque_regions.sort_by_key(|item| item.span.start.byte_offset);
+        self.reconstructed_calls.sort_by_key(|item| (item.span.start.byte_offset, item.span.end.byte_offset, item.event_id));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::formatter::SourcePosition;
+
+    #[test]
+    fn bounds_and_unicode_truncation_are_explicit() {
+        let start = SourcePosition { byte_offset: 0, line_one_based: 1, column_one_based: 1 };
+        let span = SourceSpan { start, end: start };
+        let mut map = EmissionMap::default();
+        map.annotation(&"界".repeat(2000), span);
+        assert!(map.annotations[0].truncated);
+        assert_eq!(map.annotations[0].text.len(), 4095);
+        for id in 0..OCCURRENCE_LIMIT { map.binding(id as u64, "read", span); }
+        assert_eq!(map.bindings.len() + map.annotations.len(), OCCURRENCE_LIMIT);
+        assert_eq!(map.omitted_occurrences, 1);
+    }
+
+    #[test]
+    fn exhausted_region_limit_skips_binding_collection() {
+        let position = SourcePosition { byte_offset: 0, line_one_based: 1, column_one_based: 1 };
+        let span = SourceSpan { start: position, end: position };
+        let mut map = EmissionMap::default();
+        map.regions = vec![SyntaxRegion {
+            kind: "test", bindings: vec![], span, origin: Default::default(),
+        }; REGION_LIMIT - 1];
+        let mut collections = 0;
+        for _ in 0..3 {
+            map.region("local", || {
+                collections += 1;
+                vec![42]
+            }, span, None);
+        }
+        assert_eq!(collections, 1);
+        assert_eq!(map.regions.len(), REGION_LIMIT);
+        assert_eq!(map.regions.last().unwrap().bindings, [42]);
+        assert_eq!(map.omitted_regions, 2);
+    }
+}

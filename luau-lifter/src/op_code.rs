@@ -404,6 +404,16 @@ pub enum OpCode {
     // AUX: proto id (NOT a constant index)
     LOP_CMPPROTO,
 
+    // FASTPCALL: fast path for a built-in protected call (added in bytecode v14).
+    // Like FASTCALL it is followed by the fallback sequence (GETIMPORT of the
+    // global `pcall`/`xpcall`) and the CALL it describes; when the fast path does
+    // not apply the VM simply falls through to that fallback, so it has no
+    // source-level form of its own.
+    // A: protected function id (0 - pcall, 1 - xpcall)
+    // B: number of explicit arguments before a variadic tail
+    // C: jump offset to get to following CALL
+    LOP_FASTPCALL,
+
     // Enum entry for number of opcodes, not a valid opcode by itself!
     LOP__COUNT,
 }
@@ -414,5 +424,40 @@ const _: () = assert!(
     OpCode::LOP_IDIVK as u8 == 82
         && OpCode::LOP_GETUDATAKS as u8 == 83
         && OpCode::LOP_CMPPROTO as u8 == 88
-        && OpCode::LOP__COUNT as u8 == 89
+        && OpCode::LOP_FASTPCALL as u8 == 89
+        && OpCode::LOP__COUNT as u8 == 90
 );
+
+impl OpCode {
+    pub(crate) fn has_aux(self) -> bool {
+        matches!(self, Self::LOP_GETGLOBAL
+            | Self::LOP_SETGLOBAL
+            | Self::LOP_GETIMPORT
+            | Self::LOP_GETTABLEKS
+            | Self::LOP_SETTABLEKS
+            | Self::LOP_NAMECALL
+            | Self::LOP_JUMPIFEQ
+            | Self::LOP_JUMPIFLE
+            | Self::LOP_JUMPIFLT
+            | Self::LOP_JUMPIFNOTEQ
+            | Self::LOP_JUMPIFNOTLE
+            | Self::LOP_JUMPIFNOTLT
+            | Self::LOP_NEWTABLE
+            | Self::LOP_SETLIST
+            | Self::LOP_FORGLOOP
+            | Self::LOP_LOADKX
+            | Self::LOP_FASTCALL2
+            | Self::LOP_FASTCALL2K
+            | Self::LOP_FASTCALL3
+            | Self::LOP_JUMPXEQKNIL
+            | Self::LOP_JUMPXEQKB
+            | Self::LOP_JUMPXEQKN
+            | Self::LOP_JUMPXEQKS
+            | Self::LOP_GETUDATAKS
+            | Self::LOP_SETUDATAKS
+            | Self::LOP_NAMECALLUDATA
+            | Self::LOP_NEWCLASSMEMBER
+            | Self::LOP_CALLFB
+            | Self::LOP_CMPPROTO)
+    }
+}

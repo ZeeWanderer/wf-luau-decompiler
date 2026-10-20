@@ -81,6 +81,10 @@ struct Description {
 
 fn main() {
     luau_lifter::install_quiet_panic_hook();
+    luau_lifter::with_decompile_stack(run);
+}
+
+fn run() {
     let cli = Cli::parse();
     if cli.describe {
         let description = Description {
@@ -102,6 +106,15 @@ fn main() {
         Dialect::Warframe => "warframe",
         Dialect::Luau => "luau",
     };
+    if let Err(error) = luau_lifter::configure_thread_pool(0) {
+        exit_error(
+            &cli,
+            dialect,
+            0,
+            started,
+            &format!("could not configure workers: {error}"),
+        );
+    }
 
     let bytecode = match read_input(&cli.input) {
         Ok(bytecode) => bytecode,
@@ -111,6 +124,7 @@ fn main() {
         dont_reuse_var: cli.dont_reuse_var,
         no_synth_helpers: cli.no_synth_helpers,
         assume_no_nan: cli.assume_no_nan,
+        ..Default::default()
     };
     let mut symbols = BTreeMap::new();
     for (hash, name) in &cli.symbols {

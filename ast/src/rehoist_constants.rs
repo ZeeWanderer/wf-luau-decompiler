@@ -1,9 +1,14 @@
-//! Recreate a small set of role-proven constants folded away by Luau `-O2`.
+//! Introduce names for a small set of repeated literals with syntactic roles.
 //!
 //! The pass is intentionally conservative. A literal is hoisted only when it
 //! occurs at least three times in one function scope and every counted use has
-//! the same explicit API role (wait duration, magnitude threshold, or asset-id
-//! property). It never guesses from raw frequency alone.
+//! the same syntactic role (wait duration, magnitude threshold, or asset-id
+//! property). This is synthesis, not evidence of an original source constant
+//! or API purity. Only the literal moves; lookups, calls and stores stay put.
+//!
+//! A number that prints short (`0.2`, `1e-6`) or as an exact fraction
+//! (`7 / 60`, [`crate::spell_constants`]) reads as well as any name, so it
+//! stays where it is.
 
 use itertools::Either;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -14,7 +19,8 @@ use crate::{
 };
 
 const MIN_OCCURRENCES: usize = 3;
-const MAX_ACTIVE_LOCALS: usize = 200;
+/// The longest printed number left in place for its length alone.
+const SHORT_NUMBER: usize = 8;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 enum Role {
@@ -40,7 +46,8 @@ struct CandidateKey {
 impl CandidateKey {
     fn new(role: Role, literal: &Literal) -> Option<Self> {
         let value = match literal {
-            Literal::Number(value) if value.is_finite() => ValueKey::Number(value.to_bits()),
+            Literal::Number(value) if value.is_finite() && Literal::format_number(*value).len() > SHORT_NUMBER
+                && crate::spell_constants::exact_fraction(*value).is_none() => ValueKey::Number(value.to_bits()),
             Literal::String(value) if value.len() >= 4 => ValueKey::String(value.clone()),
             _ => return None,
         };
@@ -78,30 +85,29 @@ impl CandidateKey {
     }
 }
 
-/// Hoist role-proven repeated literals in the module and every closure scope.
+/// Hoist repeated literals with matching roles in the module and closure scopes.
 /// Returns the number of declarations inserted.
 pub fn rehoist_constants(body: &mut Block) -> usize {
+    // Register estimation recursively examines values. Refuse an oversized
+    // tree before either analysis or mutation, using the shared emitter budget.
+    if crate::lower_conditionals::validate_local_rewrite_tree(body).is_err() {
+        return 0;
+    }
     crate::factor_common_tails::unshare_blocks(body);
-    rehoist_scope_tree(body, 0, &[])
+    rehoist_scope_tree(body, &[])
 }
 
 fn rehoist_scope_tree(
     body: &mut Block,
-    parameter_count: usize,
-    parameter_names: &[String],
+    parameters: &[RcLocal],
 ) -> usize {
-    let mut count = rehoist_one_scope(body, parameter_count, parameter_names);
+    let mut count = rehoist_one_scope(body, parameters);
     let mut functions = Vec::new();
     collect_nested_functions(&mut body.0, &mut functions);
     for function in functions {
         let mut function = function.0.lock();
-        let parameter_count = function.parameters.len();
-        let parameter_names = function
-            .parameters
-            .iter()
-            .filter_map(local_name)
-            .collect::<Vec<_>>();
-        count += rehoist_scope_tree(&mut function.body, parameter_count, &parameter_names);
+        let parameters = function.parameters.clone();
+        count += rehoist_scope_tree(&mut function.body, &parameters);
     }
     count
 }
@@ -110,27 +116,40 @@ fn local_name(local: &RcLocal) -> Option<String> {
     local.0 .0.lock().0.clone()
 }
 
-fn global_name(global: &Global) -> Option<String> {
-    std::str::from_utf8(&global.0).ok().map(str::to_string)
+fn reserve_local_name(local: &RcLocal, reserved: &mut FxHashSet<String>) {
+    let name = {
+        let local = local.0 .0.lock();
+        local.0.as_ref().filter(|name| !reserved.contains(name.as_str())).cloned()
+    };
+    // Release the local guard before inserting, as in the original collector.
+    if let Some(name) = name {
+        reserved.insert(name);
+    }
+}
+
+fn reserve_global_name(global: &Global, reserved: &mut FxHashSet<String>) {
+    if let Ok(name) = std::str::from_utf8(&global.0)
+        && !reserved.contains(name)
+    {
+        reserved.insert(name.to_owned());
+    }
 }
 
 /// Reserve every identifier whose textual binding could change when a new local
 /// is emitted at this scope's head. Descendant closures are included because an
 /// outer declaration also shadows their global lookups after recompilation.
+/// Consumers use this set only for membership and fresh-name insertion, never
+/// iteration or capacity. Repeated references need not copy an existing name.
 pub(crate) fn collect_reserved_identifiers(body: &mut Block, reserved: &mut FxHashSet<String>) {
     for statement in &mut body.0 {
         let mut functions = Vec::new();
         statement.post_traverse_values(&mut |value| -> Option<()> {
             match value {
                 Either::Right(RValue::Local(local)) | Either::Left(LValue::Local(local)) => {
-                    if let Some(name) = local_name(&local) {
-                        reserved.insert(name);
-                    }
+                    reserve_local_name(local, reserved);
                 }
                 Either::Right(RValue::Global(global)) | Either::Left(LValue::Global(global)) => {
-                    if let Some(name) = global_name(&global) {
-                        reserved.insert(name);
-                    }
+                    reserve_global_name(global, reserved);
                 }
                 Either::Right(RValue::Closure(closure)) => {
                     functions.push(closure.function.clone());
@@ -141,7 +160,9 @@ pub(crate) fn collect_reserved_identifiers(body: &mut Block, reserved: &mut FxHa
         });
         for function in functions {
             let mut function = function.lock();
-            reserved.extend(function.parameters.iter().filter_map(local_name));
+            for parameter in &function.parameters {
+                reserve_local_name(parameter, reserved);
+            }
             collect_reserved_identifiers(&mut function.body, reserved);
         }
         match statement {
@@ -156,13 +177,13 @@ pub(crate) fn collect_reserved_identifiers(body: &mut Block, reserved: &mut FxHa
                 collect_reserved_identifiers(&mut node.block.lock(), reserved)
             }
             Statement::NumericFor(node) => {
-                if let Some(name) = local_name(&node.counter) {
-                    reserved.insert(name);
-                }
+                reserve_local_name(&node.counter, reserved);
                 collect_reserved_identifiers(&mut node.block.lock(), reserved);
             }
             Statement::GenericFor(node) => {
-                reserved.extend(node.res_locals.iter().filter_map(local_name));
+                for local in &node.res_locals {
+                    reserve_local_name(local, reserved);
+                }
                 collect_reserved_identifiers(&mut node.block.lock(), reserved);
             }
             _ => {}
@@ -170,44 +191,15 @@ pub(crate) fn collect_reserved_identifiers(body: &mut Block, reserved: &mut FxHa
     }
 }
 
-fn max_active_locals(stmts: &[Statement]) -> usize {
-    let mut active = 0;
-    let mut maximum = 0;
-    for statement in stmts {
-        if let Statement::Assign(assign) = statement
-            && assign.prefix
-        {
-            active += assign
-                .left
-                .iter()
-                .filter(|left| matches!(left, LValue::Local(_)))
-                .count();
-            maximum = maximum.max(active);
-        }
-        let nested = match statement {
-            Statement::If(node) => max_active_locals(&node.then_block.lock().0)
-                .max(max_active_locals(&node.else_block.lock().0)),
-            Statement::While(node) => max_active_locals(&node.block.lock().0),
-            Statement::Repeat(node) => max_active_locals(&node.block.lock().0),
-            Statement::NumericFor(node) => 1 + max_active_locals(&node.block.lock().0),
-            Statement::GenericFor(node) => {
-                node.res_locals.len() + max_active_locals(&node.block.lock().0)
-            }
-            _ => 0,
-        };
-        maximum = maximum.max(active + nested);
-    }
-    maximum
-}
-
 fn collect_nested_functions(
     stmts: &mut [Statement],
     functions: &mut Vec<by_address::ByAddress<triomphe::Arc<parking_lot::Mutex<crate::Function>>>>,
 ) {
     for statement in stmts {
-        for value in crate::deinline::stmt_rvalues_mut(statement) {
+        crate::deinline::visit_stmt_rvalues_mut(statement, &mut |value| {
             collect_functions_in_rvalue(value, functions);
-        }
+            true
+        });
         match statement {
             Statement::If(node) => {
                 collect_nested_functions(&mut node.then_block.lock().0, functions);
@@ -236,15 +228,15 @@ fn collect_functions_in_rvalue(
         functions.push(closure.function.clone());
         return;
     }
-    for child in value.rvalues_mut() {
+    value.visit_rvalues_mut(&mut |child| {
         collect_functions_in_rvalue(child, functions);
-    }
+        true
+    });
 }
 
 fn rehoist_one_scope(
     body: &mut Block,
-    parameter_count: usize,
-    parameter_names: &[String],
+    parameters: &[RcLocal],
 ) -> usize {
     let mut counts = FxHashMap::default();
     count_block(&body.0, &mut counts);
@@ -253,25 +245,32 @@ fn rehoist_one_scope(
         .filter_map(|(candidate, count)| (count >= MIN_OCCURRENCES).then_some(candidate))
         .collect();
     selected.sort_by_key(CandidateKey::order_key);
-    let active = parameter_count.saturating_add(max_active_locals(&body.0));
-    selected.truncate(MAX_ACTIVE_LOCALS.saturating_sub(active));
+    if selected.is_empty() {
+        return 0;
+    }
+    // Local count alone is insufficient: a 180-parameter function with a
+    // 73-argument call compiles at O0, but two extra constants overflow the
+    // compiler's 255 registers. Include hidden loop registers and expression
+    // scratch, and retain the shared margin for later emitter rewrites.
+    selected.truncate(crate::lower_conditionals::local_rewrite_frame(body, parameters, 0).headroom);
     if selected.is_empty() {
         return 0;
     }
 
-    let mut used_names: FxHashSet<String> = parameter_names.iter().cloned().collect();
+    let mut used_names: FxHashSet<String> = parameters.iter().filter_map(local_name).collect();
     collect_reserved_identifiers(body, &mut used_names);
 
     let mut replacements = FxHashMap::default();
     let mut declarations = Vec::with_capacity(selected.len());
     for candidate in selected {
-        let name = unique_name(candidate.base_name(), &mut used_names);
-        let local = RcLocal::new(Local::new(Some(name)));
+        let local = unique_local(candidate.base_name(), &mut used_names);
         declarations.push(Statement::Assign(Assign {
+            node_origin: Default::default(),
             left: vec![LValue::Local(local.clone())],
             right: vec![RValue::Literal(candidate.literal())],
             prefix: true,
             parallel: false,
+            compound: false,
         }));
         replacements.insert(candidate, local);
     }
@@ -281,6 +280,20 @@ fn rehoist_one_scope(
     count
 }
 
+/// A new local named `base`, or `base_2`, `base_3`, ... when the function
+/// already uses `base`. The counter is recorded on the local
+/// ([`Local::set_counted_name`]), so the final namer may compact it back to
+/// `base` where that name is free; a `_N` the evidence spelled (`Wheel_2`)
+/// is never mistaken for one.
+pub(crate) fn unique_local(base: &str, used: &mut FxHashSet<String>) -> RcLocal {
+    let mut local = Local::default();
+    local.set_counted_name(unique_name(base, used), base);
+    RcLocal::new(local)
+}
+
+/// `base`, or the first of `base_2`, `base_3`, ... `used` lacks; reserved in
+/// `used`. A caller naming a local with it records the counter
+/// ([`unique_local`]).
 pub(crate) fn unique_name(base: &str, used: &mut FxHashSet<String>) -> String {
     if used.insert(base.to_string()) {
         return base.to_string();
@@ -314,9 +327,10 @@ fn count_block(stmts: &[Statement], counts: &mut FxHashMap<CandidateKey, usize>)
         if let Statement::Call(call) = statement {
             count_call(call, counts);
         }
-        for value in crate::deinline::stmt_rvalues(statement) {
+        crate::deinline::visit_stmt_rvalues(statement, &mut |value| {
             count_rvalue(value, counts);
-        }
+            true
+        });
         match statement {
             Statement::If(node) => {
                 count_block(&node.then_block.lock().0, counts);
@@ -345,9 +359,10 @@ fn count_rvalue(value: &RValue, counts: &mut FxHashMap<CandidateKey, usize>) {
         }
         _ => {}
     }
-    for child in value.rvalues() {
+    value.visit_rvalues(&mut |child| {
         count_rvalue(child, counts);
-    }
+        true
+    });
 }
 
 fn count_call(call: &Call, counts: &mut FxHashMap<CandidateKey, usize>) {
@@ -375,9 +390,10 @@ fn replace_block(stmts: &mut [Statement], replacements: &FxHashMap<CandidateKey,
         if let Statement::Call(call) = statement {
             replace_call(call, replacements);
         }
-        for value in crate::deinline::stmt_rvalues_mut(statement) {
+        crate::deinline::visit_stmt_rvalues_mut(statement, &mut |value| {
             replace_rvalue(value, replacements);
-        }
+            true
+        });
         match statement {
             Statement::If(node) => {
                 replace_block(&mut node.then_block.lock().0, replacements);
@@ -406,9 +422,10 @@ fn replace_rvalue(value: &mut RValue, replacements: &FxHashMap<CandidateKey, RcL
         }
         _ => {}
     }
-    for child in value.rvalues_mut() {
+    value.visit_rvalues_mut(&mut |child| {
         replace_rvalue(child, replacements);
-    }
+        true
+    });
 }
 
 fn replace_call(call: &mut Call, replacements: &FxHashMap<CandidateKey, RcLocal>) {
@@ -498,6 +515,11 @@ mod tests {
         RValue::Literal(Literal::Number(value))
     }
 
+    /// Durations that print long and have no exact fraction: the only
+    /// numbers left to hoist.
+    const LONG: f64 = 0.123456789;
+    const OTHER: f64 = 2.123456789;
+
     fn wait(value: f64) -> Statement {
         Statement::Call(Call::new(
             RValue::Index(Index::new(global("task"), string("wait"))),
@@ -515,10 +537,10 @@ mod tests {
     #[test]
     fn hoists_three_wait_intervals_across_nested_blocks() {
         let mut body = Block(vec![
-            wait(10.0),
+            wait(LONG),
             Statement::If(If::new(
                 RValue::Literal(Literal::Boolean(true)),
-                Block(vec![wait(10.0), wait(10.0)]),
+                Block(vec![wait(LONG), wait(LONG)]),
                 Block::default(),
             )),
         ]);
@@ -530,9 +552,18 @@ mod tests {
                 if local.0.0.lock().0.as_deref() == Some("WAIT_INTERVAL"))));
     }
 
+    /// `task.wait(7 / 60)` and `task.wait(0.2)` read as well as any name.
+    #[test]
+    fn short_numbers_and_exact_fractions_stay_inline() {
+        for value in [7.0 / 60.0, 0.2, 1e-6, 10.0] {
+            let mut body = Block(vec![wait(value), wait(value), wait(value)]);
+            assert_eq!(rehoist_constants(&mut body), 0, "{value}");
+        }
+    }
+
     #[test]
     fn two_occurrences_stay_inline() {
-        let mut body = Block(vec![wait(10.0), wait(10.0)]);
+        let mut body = Block(vec![wait(LONG), wait(LONG)]);
         assert_eq!(rehoist_constants(&mut body), 0);
         assert!(matches!(body.0[0], Statement::Call(_)));
     }
@@ -541,12 +572,12 @@ mod tests {
     fn roles_do_not_cross_count() {
         let magnitude = || RValue::Index(Index::new(global("delta"), string("Magnitude")));
         let mut body = Block(vec![
-            wait(10.0),
-            wait(10.0),
+            wait(LONG),
+            wait(LONG),
             Statement::If(If::new(
                 RValue::Binary(Binary::new(
                     magnitude(),
-                    number(10.0),
+                    number(LONG),
                     BinaryOperation::LessThan,
                 )),
                 Block::default(),
@@ -558,24 +589,25 @@ mod tests {
 
     #[test]
     fn wait_and_delay_durations_do_not_cross_count() {
-        let mut body = Block(vec![wait(10.0), wait(10.0), delay(10.0)]);
+        let mut body = Block(vec![wait(LONG), wait(LONG), delay(LONG)]);
         assert_eq!(rehoist_constants(&mut body), 0);
     }
 
     #[test]
     fn refuses_hoist_without_local_register_headroom() {
         let mut statements = Vec::new();
-        for index in 0..MAX_ACTIVE_LOCALS {
+        for index in 0..200 {
             statements.push(Statement::Assign(Assign {
+                node_origin: Default::default(),
                 left: vec![LValue::Local(RcLocal::new(Local::new(Some(format!(
                     "local{index}"
                 )))))],
                 right: vec![number(index as f64)],
                 prefix: true,
-                parallel: false,
+                parallel: false, compound: false,
             }));
         }
-        statements.extend([wait(10.0), wait(10.0), wait(10.0)]);
+        statements.extend([wait(LONG), wait(LONG), wait(LONG)]);
         let mut body = Block(statements);
         assert_eq!(rehoist_constants(&mut body), 0);
         assert!(!body.to_string().contains("WAIT_INTERVAL"));
@@ -584,11 +616,12 @@ mod tests {
     #[test]
     fn unnamed_parameters_still_consume_local_headroom() {
         let function = triomphe::Arc::new(parking_lot::Mutex::new(crate::Function {
-            parameters: (0..MAX_ACTIVE_LOCALS).map(|_| RcLocal::default()).collect(),
-            body: Block(vec![wait(10.0), wait(10.0), wait(10.0)]),
+            parameters: (0..200).map(|_| RcLocal::default()).collect(),
+            body: Block(vec![wait(LONG), wait(LONG), wait(LONG)]),
             ..crate::Function::default()
         }));
         let closure = RValue::Closure(crate::Closure {
+            node_origin: Default::default(),
             function: by_address::ByAddress(function.clone()),
             upvalues: Vec::new(),
         });
@@ -598,11 +631,35 @@ mod tests {
     }
 
     #[test]
+    fn call_arguments_consume_register_headroom_even_below_local_limit() {
+        let mut body = Block(vec![wait(LONG); 3]);
+        body.0.extend([delay(OTHER), delay(OTHER), delay(OTHER)]);
+        body.0.push(Call::new(global("sink"), vec![global("argument"); 73]).into());
+        let before = body.to_string();
+        let parameters = (0..180).map(|_| RcLocal::default()).collect::<Vec<_>>();
+        assert_eq!(rehoist_one_scope(&mut body, &parameters), 0);
+        assert_eq!(body.to_string(), before);
+    }
+
+    #[test]
+    fn over_depth_budget_refuses_before_mutation() {
+        let mut value = number(1.0);
+        for _ in 0..140 {
+            value = Index::new(value, string("field")).into();
+        }
+        let mut body = Block(vec![wait(LONG), wait(LONG), wait(LONG),
+            Return::new(vec![value]).into()]);
+        let before = body.to_string();
+        assert_eq!(rehoist_constants(&mut body), 0);
+        assert_eq!(body.to_string(), before);
+    }
+
+    #[test]
     fn ordinary_magnitude_value_uses_neutral_threshold_name() {
         let comparison = || {
             RValue::Binary(Binary::new(
                 RValue::Index(Index::new(global("delta"), string("Magnitude"))),
-                number(25.0),
+                number(25.123456789),
                 BinaryOperation::LessThan,
             ))
         };
@@ -620,7 +677,7 @@ mod tests {
         let comparison = || {
             RValue::Binary(Binary::new(
                 RValue::Index(Index::new(global("delta"), string("Magnitude"))),
-                number(0.001),
+                number(0.000123456789),
                 BinaryOperation::LessThan,
             ))
         };
@@ -688,15 +745,17 @@ mod tests {
             ..crate::Function::default()
         }));
         let closure = RValue::Closure(crate::Closure {
+            node_origin: Default::default(),
             function: by_address::ByAddress(function.clone()),
             upvalues: Vec::new(),
         });
         let binder = RcLocal::default();
         let mut body = Block(vec![Statement::Assign(Assign {
+            node_origin: Default::default(),
             left: vec![LValue::Local(binder)],
             right: vec![closure],
             prefix: true,
-            parallel: false,
+            parallel: false, compound: false,
         })]);
         assert_eq!(rehoist_constants(&mut body), 1);
         assert!(
@@ -713,22 +772,28 @@ mod tests {
     #[test]
     fn closure_occurrences_form_their_own_scope() {
         let mut function = crate::Function::default();
-        function.body = Block(vec![wait(5.0), wait(5.0)]);
+        function.body = Block(vec![wait(LONG), wait(LONG)]);
         let closure = RValue::Closure(crate::Closure {
+            node_origin: Default::default(),
             function: by_address::ByAddress(triomphe::Arc::new(parking_lot::Mutex::new(function))),
             upvalues: Vec::new(),
         });
         let local = RcLocal::default();
         let mut body = Block(vec![
-            wait(5.0),
+            wait(LONG),
             Statement::Assign(Assign {
+                node_origin: Default::default(),
                 left: vec![LValue::Local(local)],
                 right: vec![closure],
                 prefix: true,
-                parallel: false,
+                parallel: false, compound: false,
             }),
             Statement::Return(Return::default()),
         ]);
         assert_eq!(rehoist_constants(&mut body), 0);
     }
 }
+
+#[cfg(test)]
+#[path = "rehoist_constants/visitor_tests.rs"]
+mod visitor_tests;

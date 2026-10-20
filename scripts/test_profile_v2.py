@@ -1,0 +1,111 @@
+import unittest
+
+from profile_v2 import AST_PHASES, validate
+
+
+def valid_profile():
+    passes = sorted(AST_PHASES | {'DECOMPILE', 'D_COLLECT_TARGETS', 'D_WRITE_CENSUS'})
+    rows = []
+    for name in passes:
+        rows.append({'script': 'input.lua', 'prototype': None, 'pass': name,
+                     'inclusive_ns': 10, 'exclusive_ns': 4, 'max_inclusive_ns': 10,
+                     'calls': 1, 'node_samples': int(name in AST_PHASES),
+                     'node_samples_incomplete': 0, 'counters': {'iterations': 1} if name == 'S_DEINLINE'
+                     else {'deinline_factor_iterations': 1} if name == 'DECOMPILE' else {}})
+    return {'schema_version': 1, 'model': 'tovek-pass-thread-wall-v1',
+            'rows_count': len(rows), 'rows': rows, 'dropped_records': 0, 'misnested_spans': 0}
+
+
+class ProfileChecks(unittest.TestCase):
+    def test_complete_profile(self):
+        self.assertEqual(validate(valid_profile(), {'input.lua'}), [])
+
+    def test_a_skipped_deinline_needs_no_census_phases(self):
+        profile = valid_profile()
+        profile['rows'] = [r for r in profile['rows'] if r['pass'] not in ('D_COLLECT_TARGETS', 'D_WRITE_CENSUS')]
+        profile['rows_count'] = len(profile['rows'])
+        deinline = next(r for r in profile['rows'] if r['pass'] == 'S_DEINLINE')
+        deinline['counters'] = {'skipped_without_targets': 1}
+        self.assertEqual(validate(profile, {'input.lua'}), [])
+        # Without the skip counter, the missing census is a real gap.
+        deinline['counters'] = {}
+        self.assertIn('write census invocation count changed', validate(profile, {'input.lua'}))
+
+    def test_counter_total_and_iteration_mismatches(self):
+        for pass_name, counter in [('D_COLLECT_TARGETS', 'candidate_binders'), ('S_DEINLINE', 'iterations')]:
+            profile = valid_profile()
+            row = next(r for r in profile['rows'] if r['pass'] == pass_name)
+            row['counters'][counter] = 2
+            self.assertTrue(validate(profile, {'input.lua'}))
+
+    def test_context_and_interval_corruption(self):
+        for key, value in [('script', 'foreign.lua'), ('exclusive_ns', 11)]:
+            profile = valid_profile()
+            profile['rows'][0][key] = value
+            self.assertTrue(validate(profile, {'input.lua'}))
+
+    def test_shape_and_target_budgets_preserve_candidate_accounting(self):
+        profile = valid_profile()
+        row = next(r for r in profile['rows'] if r['pass'] == 'D_COLLECT_TARGETS')
+        row['counters'] = dict(candidate_binders=260, accepted_helpers=257, accepted_targets=301,
+                               reject_shape_budget=3, target_budget_exhausted=1)
+        self.assertEqual(validate(profile, {'input.lua'}), [])
+        row['counters']['reject_shape_budget'] = 2
+        self.assertIn('candidate/refusal accounting mismatch', validate(profile, {'input.lua'}))
+
+    def test_dropped_or_unmeasured_work_cannot_pass_complete_gate(self):
+        for key in ('dropped_records', 'misnested_spans'):
+            profile = valid_profile()
+            profile[key] = 1
+            self.assertTrue(validate(profile, {'input.lua'}))
+        profile = valid_profile()
+        next(r for r in profile['rows'] if r['pass'] == 'S_FACTOR_INITIAL')['node_samples'] = 0
+        self.assertTrue(validate(profile, {'input.lua'}))
+
+    def test_ssa_cache_requires_consistent_counts_and_function_context(self):
+        profile = valid_profile()
+        row = dict(profile['rows'][0], prototype=3, **{'pass': 'F_SSA_INLINE'})
+        row['counters'] = {f'ssa_fact_cache_{k}': v for k,v in
+                           dict(hits=20, misses=8, uncached=3, invalidations=2, slots=6).items()}
+        profile['rows'].append(row)
+        profile['rows_count'] += 1
+        self.assertEqual(validate(profile, {'input.lua'}), [])
+        row['counters']['ssa_fact_cache_invalidations'] = 1
+        self.assertIn('SSA cache accounting mismatch', validate(profile, {'input.lua'}))
+        row['counters']['ssa_fact_cache_invalidations'] = 2
+        row['prototype'] = None
+        self.assertIn('SSA cache counter context mismatch', validate(profile, {'input.lua'}))
+        del row['counters']['ssa_fact_cache_misses']
+        self.assertIn('invalid SSA cache counters', validate(profile, {'input.lua'}))
+
+    def test_tail_worklist_rejects_unexplained_visits_and_wrong_context(self):
+        profile = valid_profile()
+        row = dict(profile['rows'][0], prototype=None, **{'pass': 'TAIL_SCAN'})
+        row['counters'] = dict(tail_initial_child_visits=20, tail_actions=3,
+                               tail_revisited_children=7, tail_skipped_children=21)
+        profile['rows'].append(row)
+        profile['rows_count'] += 1
+        self.assertEqual(validate(profile, {'input.lua'}), [])
+        row['counters']['tail_actions'] = 0
+        self.assertIn('tail dirty-range accounting mismatch', validate(profile, {'input.lua'}))
+        row['counters']['tail_actions'] = 8
+        self.assertIn('tail dirty-range accounting mismatch', validate(profile, {'input.lua'}))
+        row['counters']['tail_actions'] = 3
+        row['pass'] = 'S_DEINLINE'
+        self.assertIn('tail traversal counter context mismatch', validate(profile, {'input.lua'}))
+
+    def test_ssa_bounded_cache_evictions_account_for_recomputed_facts(self):
+        profile = valid_profile()
+        row = dict(profile['rows'][0], prototype=3, **{'pass': 'F_SSA_INLINE'})
+        row['counters'] = {f'ssa_fact_cache_{k}': v for k, v in
+                           dict(hits=8, misses=100, uncached=0, invalidations=2,
+                                evictions=90, slots=8).items()}
+        profile['rows'].append(row)
+        profile['rows_count'] += 1
+        self.assertEqual(validate(profile, {'input.lua'}), [])
+        row['counters']['ssa_fact_cache_evictions'] = 89
+        self.assertIn('SSA cache accounting mismatch', validate(profile, {'input.lua'}))
+
+
+if __name__ == '__main__':
+    unittest.main()

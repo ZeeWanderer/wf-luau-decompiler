@@ -1,8 +1,12 @@
 [package]
 name = "cfg"
-version = "0.9.0-beta"
+version = "2.6.1"
 edition.workspace = true
 authors.workspace = true
+
+[features]
+# Performance ablation only: keep the original all-block inline sweep schedule.
+reference-inline-sweeps = []
 
 [dependencies]
 thiserror = "1.0.37"
@@ -19,3 +23,6 @@ hashlink = "0.8.1"
 array_tool = "1.0.3"
 rangemap = "1.0.3"
 tuple = "0.5.1"
+
+[dev-dependencies]
+triomphe = "0.1.8"

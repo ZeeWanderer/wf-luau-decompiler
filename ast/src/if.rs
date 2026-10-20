@@ -7,8 +7,9 @@ use super::{Block, RValue};
 
 use std::fmt;
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct If {
+    pub node_origin: crate::node_origins::Origin,
     pub condition: RValue,
     pub then_block: Arc<Mutex<Block>>,
     pub else_block: Arc<Mutex<Block>>,
@@ -24,6 +25,7 @@ impl PartialEq for If {
 impl If {
     pub fn new(condition: RValue, then_block: Block, else_block: Block) -> Self {
         Self {
+            node_origin: Default::default(),
             condition,
             then_block: Arc::new(then_block.into()),
             else_block: Arc::new(else_block.into()),
@@ -32,6 +34,14 @@ impl If {
 }
 
 impl Traverse for If {
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        visit(&self.condition)
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        visit(&mut self.condition)
+    }
+
     fn rvalues_mut(&mut self) -> Vec<&mut RValue> {
         vec![&mut self.condition]
     }
@@ -49,12 +59,20 @@ impl SideEffects for If {
 }
 
 impl LocalRw for If {
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.condition.visit_local_reads(visit)
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.condition.values_read()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.condition.visit_local_reads_mut(visit)
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.condition.values_read_mut()
+        crate::local::collect_reads_mut(self)
     }
 }
 
@@ -64,10 +82,16 @@ impl fmt::Display for If {
             indentation_level: 0,
             indentation_mode: Default::default(),
             output: f,
-            colon_method_calls: Vec::new(),
+            colon_method_calls: Default::default(),
             position_query: None,
             closure_observer: None,
+            emission_map: None,
+            layout_budget: None,
+            compact_annotations: false,
+            inferred_calls: Default::default(),
         }
         .format_if(self)
     }
 }
+
+crate::node_origins::semantic_debug!(If; condition,then_block,else_block);

@@ -1,10 +1,66 @@
 use crate::{
-    has_side_effects, Assign, Block, LValue, LocalRw, RValue, RcLocal, SideEffects, Traverse,
+    Assign, Block, LValue, LocalRw, RValue, RcLocal, SideEffects, Traverse, has_side_effects,
 };
 use itertools::Itertools;
 use parking_lot::Mutex;
 use std::fmt;
 use triomphe::Arc;
+
+/// The bytecode preparation strategy used by a generic-for loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForPrepKind {
+    Generic,
+    Next,
+    Inext,
+}
+
+/// VM semantics profile used to interpret the protocol metadata.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VmProfileId {
+    Luau,
+}
+
+/// Stable identity for one generic-for protocol pair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ForId {
+    pub prep_pc: usize,
+    pub step_pc: usize,
+}
+
+/// Provenance for a compiler-emitted generic-for protocol.
+///
+/// The pair `(prep_pc, step_pc)` is a stable loop identity.  The remaining
+/// fields preserve the exact control-flow and result shape that produced the
+/// internal marker, allowing structuring passes to reject ambiguous pairs.
+/// Metadata is optional only for compatibility with hand-built AST fixtures;
+/// production bytecode lifting always attaches it, and the typed source-like
+/// structurer rejects a reachable marker when the identity is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct ForOrigin {
+    pub prep_pc: usize,
+    pub step_pc: usize,
+    pub body_pc: usize,
+    pub follow_pc: usize,
+    pub prep_kind: ForPrepKind,
+    pub base_register: u8,
+    pub result_count: u8,
+    pub aux: u32,
+    pub bytecode_version: u8,
+    pub vm_profile: VmProfileId,
+    /// True when the source supplied an explicit single-result call followed
+    /// by nil iterator arguments.  The VM tuple is otherwise padded with
+    /// implicit nils for ordinary one-expression generic loops.
+    pub explicit_nil_args: bool,
+}
+
+impl ForOrigin {
+    pub fn id(self) -> ForId {
+        ForId {
+            prep_pc: self.prep_pc,
+            step_pc: self.step_pc,
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Clone)]
 pub struct NumForInit {
@@ -30,6 +86,26 @@ impl NumForInit {
 has_side_effects!(NumForInit);
 
 impl Traverse for NumForInit {
+    fn visit_lvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::LValue) -> bool) -> bool {
+        visit(&self.counter.0) && visit(&self.limit.0) && visit(&self.step.0)
+    }
+
+    fn visit_lvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::LValue) -> bool) -> bool {
+        visit(&mut self.counter.0) && visit(&mut self.limit.0) && visit(&mut self.step.0)
+    }
+
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        visit(&self.counter.1) && visit(&self.limit.1) && visit(&self.step.1)
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        visit(&mut self.counter.1) && visit(&mut self.limit.1) && visit(&mut self.step.1)
+    }
+
+    fn lvalues(&self) -> Vec<&LValue> {
+        vec![&self.counter.0, &self.limit.0, &self.step.0]
+    }
+
     fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
         vec![&mut self.counter.0, &mut self.limit.0, &mut self.step.0]
     }
@@ -44,24 +120,36 @@ impl Traverse for NumForInit {
 }
 
 impl LocalRw for NumForInit {
+    fn visit_local_writes<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.counter.0.visit_local_writes(visit)
+            && self.limit.0.visit_local_writes(visit)
+            && self.step.0.visit_local_writes(visit)
+    }
+
+    fn visit_local_writes_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.counter.0.visit_local_writes_mut(visit)
+            && self.limit.0.visit_local_writes_mut(visit)
+            && self.step.0.visit_local_writes_mut(visit)
+    }
+
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.counter.1.visit_local_reads(visit)
+            && self.limit.1.visit_local_reads(visit)
+            && self.step.1.visit_local_reads(visit)
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.counter
-            .1
-            .values_read()
-            .into_iter()
-            .chain(self.limit.1.values_read())
-            .chain(self.step.1.values_read().into_iter())
-            .collect()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.counter.1.visit_local_reads_mut(visit)
+            && self.limit.1.visit_local_reads_mut(visit)
+            && self.step.1.visit_local_reads_mut(visit)
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.counter
-            .1
-            .values_read_mut()
-            .into_iter()
-            .chain(self.limit.1.values_read_mut())
-            .chain(self.step.1.values_read_mut().into_iter())
-            .collect()
+        crate::local::collect_reads_mut(self)
     }
 
     fn values_written(&self) -> Vec<&RcLocal> {
@@ -119,6 +207,26 @@ impl NumForNext {
 }
 
 impl Traverse for NumForNext {
+    fn visit_lvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::LValue) -> bool) -> bool {
+        visit(&self.counter.0)
+    }
+
+    fn visit_lvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::LValue) -> bool) -> bool {
+        visit(&mut self.counter.0)
+    }
+
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        visit(&self.counter.1) && visit(&self.step) && visit(&self.limit)
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        visit(&mut self.counter.1) && visit(&mut self.step) && visit(&mut self.limit)
+    }
+
+    fn lvalues(&self) -> Vec<&LValue> {
+        vec![&self.counter.0]
+    }
+
     fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
         vec![&mut self.counter.0]
     }
@@ -133,24 +241,32 @@ impl Traverse for NumForNext {
 }
 
 impl LocalRw for NumForNext {
+    fn visit_local_writes<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.counter.0.visit_local_writes(visit)
+    }
+
+    fn visit_local_writes_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.counter.0.visit_local_writes_mut(visit)
+    }
+
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.counter.1.visit_local_reads(visit)
+            && self.step.visit_local_reads(visit)
+            && self.limit.visit_local_reads(visit)
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.counter
-            .1
-            .values_read()
-            .into_iter()
-            .chain(self.step.values_read().into_iter())
-            .chain(self.limit.values_read())
-            .collect()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.counter.1.visit_local_reads_mut(visit)
+            && self.step.visit_local_reads_mut(visit)
+            && self.limit.visit_local_reads_mut(visit)
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.counter
-            .1
-            .values_read_mut()
-            .into_iter()
-            .chain(self.step.values_read_mut().into_iter())
-            .chain(self.limit.values_read_mut())
-            .collect()
+        crate::local::collect_reads_mut(self)
     }
 
     fn values_written(&self) -> Vec<&RcLocal> {
@@ -211,22 +327,32 @@ impl NumericFor {
 }
 
 impl LocalRw for NumericFor {
+    fn visit_local_writes<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        visit(&self.counter)
+    }
+
+    fn visit_local_writes_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        visit(&mut self.counter)
+    }
+
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.initial.visit_local_reads(visit)
+            && self.limit.visit_local_reads(visit)
+            && self.step.visit_local_reads(visit)
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.initial
-            .values_read()
-            .into_iter()
-            .chain(self.limit.values_read())
-            .chain(self.step.values_read())
-            .collect()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.initial.visit_local_reads_mut(visit)
+            && self.limit.visit_local_reads_mut(visit)
+            && self.step.visit_local_reads_mut(visit)
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.initial
-            .values_read_mut()
-            .into_iter()
-            .chain(self.limit.values_read_mut())
-            .chain(self.step.values_read_mut())
-            .collect()
+        crate::local::collect_reads_mut(self)
     }
 
     fn values_written(&self) -> Vec<&RcLocal> {
@@ -239,6 +365,14 @@ impl LocalRw for NumericFor {
 }
 
 impl Traverse for NumericFor {
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        visit(&self.initial) && visit(&self.limit) && visit(&self.step)
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        visit(&mut self.initial) && visit(&mut self.limit) && visit(&mut self.step)
+    }
+
     fn rvalues(&self) -> Vec<&RValue> {
         vec![&self.initial, &self.limit, &self.step]
     }
@@ -267,18 +401,36 @@ impl fmt::Display for NumericFor {
 }
 
 #[derive(Debug, PartialEq, Clone)]
-pub struct GenericForInit(pub Assign);
+pub struct GenericForInit(pub Assign, pub Option<ForOrigin>);
 
 impl GenericForInit {
     pub fn new(generator: RcLocal, state: RcLocal, initial_control: RcLocal) -> Self {
-        Self(Assign::new(
-            vec![
-                generator.clone().into(),
-                state.clone().into(),
-                initial_control.clone().into(),
-            ],
-            vec![generator.into(), state.into(), initial_control.into()],
-        ))
+        Self(
+            Assign::new(
+                vec![
+                    generator.clone().into(),
+                    state.clone().into(),
+                    initial_control.clone().into(),
+                ],
+                vec![generator.into(), state.into(), initial_control.into()],
+            ),
+            None,
+        )
+    }
+
+    pub fn new_with_origin(
+        generator: RcLocal,
+        state: RcLocal,
+        initial_control: RcLocal,
+        origin: ForOrigin,
+    ) -> Self {
+        let mut init = Self::new(generator, state, initial_control);
+        init.1 = Some(origin);
+        init
+    }
+
+    pub fn origin(&self) -> Option<ForOrigin> {
+        self.1
     }
 }
 
@@ -289,6 +441,26 @@ impl SideEffects for GenericForInit {
 }
 
 impl Traverse for GenericForInit {
+    fn visit_lvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::LValue) -> bool) -> bool {
+        self.0.visit_lvalues(visit)
+    }
+
+    fn visit_lvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::LValue) -> bool) -> bool {
+        self.0.visit_lvalues_mut(visit)
+    }
+
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        self.0.visit_rvalues(visit)
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        self.0.visit_rvalues_mut(visit)
+    }
+
+    fn lvalues(&self) -> Vec<&LValue> {
+        self.0.lvalues()
+    }
+
     fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
         self.0.lvalues_mut()
     }
@@ -303,12 +475,28 @@ impl Traverse for GenericForInit {
 }
 
 impl LocalRw for GenericForInit {
+    fn visit_local_writes<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.0.visit_local_writes(visit)
+    }
+
+    fn visit_local_writes_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.0.visit_local_writes_mut(visit)
+    }
+
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.0.visit_local_reads(visit)
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.0.values_read()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.0.visit_local_reads_mut(visit)
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.0.values_read_mut()
+        crate::local::collect_reads_mut(self)
     }
 
     fn values_written(&self) -> Vec<&RcLocal> {
@@ -344,6 +532,7 @@ pub struct GenericForNext {
     /// made it impossible for a CFG fallback to lower a residual FORGLOOP
     /// without guessing which local carries the control value.
     pub control: RcLocal,
+    pub origin: Option<ForOrigin>,
 }
 
 impl GenericForNext {
@@ -359,7 +548,24 @@ impl GenericForNext {
             generator,
             state: RValue::Local(state),
             control,
+            origin: None,
         }
+    }
+
+    pub fn new_with_origin(
+        res_locals: Vec<RcLocal>,
+        generator: RValue,
+        state: RcLocal,
+        control: RcLocal,
+        origin: ForOrigin,
+    ) -> Self {
+        let mut next = Self::new(res_locals, generator, state, control);
+        next.origin = Some(origin);
+        next
+    }
+
+    pub fn origin(&self) -> Option<ForOrigin> {
+        self.origin
     }
 }
 
@@ -367,6 +573,26 @@ impl GenericForNext {
 has_side_effects!(GenericForNext);
 
 impl Traverse for GenericForNext {
+    fn visit_lvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::LValue) -> bool) -> bool {
+        self.res_locals.iter().all(visit)
+    }
+
+    fn visit_lvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::LValue) -> bool) -> bool {
+        self.res_locals.iter_mut().all(visit)
+    }
+
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        visit(&self.generator) && visit(&self.state)
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        visit(&mut self.generator) && visit(&mut self.state)
+    }
+
+    fn lvalues(&self) -> Vec<&LValue> {
+        self.res_locals.iter().collect()
+    }
+
     fn lvalues_mut(&mut self) -> Vec<&mut LValue> {
         self.res_locals.iter_mut().collect()
     }
@@ -384,24 +610,34 @@ impl Traverse for GenericForNext {
 }
 
 impl LocalRw for GenericForNext {
+    fn visit_local_writes<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        // The hidden control update belongs only to the non-nil edge. These
+        // visitors, like values_written below, expose definite block writes.
+        self.res_locals.iter().all(|local| local.visit_local_writes(visit))
+    }
+
+    fn visit_local_writes_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.res_locals.iter_mut().all(|local| local.visit_local_writes_mut(visit))
+    }
+
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.generator.visit_local_reads(visit)
+            && self.state.visit_local_reads(visit)
+            && visit(&self.control)
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.generator
-            .values_read()
-            .into_iter()
-            .chain(self.state.values_read())
-            .chain(std::iter::once(&self.control))
-            .collect()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.generator.visit_local_reads_mut(visit)
+            && self.state.visit_local_reads_mut(visit)
+            && visit(&mut self.control)
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        let mut reads = self
-            .generator
-            .values_read_mut()
-            .into_iter()
-            .chain(self.state.values_read_mut())
-            .collect::<Vec<_>>();
-        reads.push(&mut self.control);
-        reads
+        crate::local::collect_reads_mut(self)
     }
 
     fn values_written(&self) -> Vec<&RcLocal> {
@@ -447,6 +683,7 @@ pub struct GenericFor {
     pub res_locals: Vec<RcLocal>,
     pub right: Vec<RValue>,
     pub block: Arc<Mutex<Block>>,
+    pub origin: Option<ForOrigin>,
 }
 
 impl PartialEq for GenericFor {
@@ -462,22 +699,47 @@ impl GenericFor {
             res_locals,
             right,
             block: Arc::new(block.into()),
+            origin: None,
         }
+    }
+
+    pub fn new_with_origin(
+        res_locals: Vec<RcLocal>,
+        right: Vec<RValue>,
+        block: Block,
+        origin: ForOrigin,
+    ) -> Self {
+        let mut generic_for = Self::new(res_locals, right, block);
+        generic_for.origin = Some(origin);
+        generic_for
     }
 }
 
 has_side_effects!(GenericFor);
 
 impl LocalRw for GenericFor {
+    fn visit_local_writes<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.res_locals.iter().all(visit)
+    }
+
+    fn visit_local_writes_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.res_locals.iter_mut().all(visit)
+    }
+
+    fn visit_local_reads<'a>(&'a self, visit: &mut dyn FnMut(&'a RcLocal) -> bool) -> bool {
+        self.right.iter().all(|value| value.visit_local_reads(visit))
+    }
+
     fn values_read(&self) -> Vec<&RcLocal> {
-        self.right.iter().flat_map(|r| r.values_read()).collect()
+        crate::local::collect_reads(self)
+    }
+
+    fn visit_local_reads_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut RcLocal) -> bool) -> bool {
+        self.right.iter_mut().all(|value| value.visit_local_reads_mut(visit))
     }
 
     fn values_read_mut(&mut self) -> Vec<&mut RcLocal> {
-        self.right
-            .iter_mut()
-            .flat_map(|r| r.values_read_mut())
-            .collect()
+        crate::local::collect_reads_mut(self)
     }
 
     fn values_written(&self) -> Vec<&RcLocal> {
@@ -490,6 +752,14 @@ impl LocalRw for GenericFor {
 }
 
 impl Traverse for GenericFor {
+    fn visit_rvalues<'a>(&'a self, visit: &mut dyn FnMut(&'a crate::RValue) -> bool) -> bool {
+        self.right.iter().all(visit)
+    }
+
+    fn visit_rvalues_mut<'a>(&'a mut self, visit: &mut dyn FnMut(&'a mut crate::RValue) -> bool) -> bool {
+        self.right.iter_mut().all(visit)
+    }
+
     fn rvalues(&self) -> Vec<&RValue> {
         self.right.iter().collect()
     }

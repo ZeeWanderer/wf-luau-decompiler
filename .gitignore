@@ -9,7 +9,9 @@
 # Profiling / heap-debug output
 flamegraph.svg
 *.profraw
+*.profdata
 dhat-heap.json
+__pycache__/
 
 # Decompiler scratch output (test dumps, sample bytecode, ad-hoc runs)
 result.lua
@@ -17,6 +19,15 @@ result.lua
 *_out.json
 *.bin
 /_trace_*
+# Local corpus runs and one-off debugging. Keep checked-in fixtures under docs.
+/tmp_*
+/*.err
+/out/
+/dist/
+/out_*/
+/selectedOut_*/
+/review_src_*/
+/repro_*.luac
 
 # Editors / IDEs
 .idea/
@@ -27,6 +38,43 @@ result.lua
 # Local agent / tooling state
 .claude/
 
+# AI experiments remain local and disabled by default. Never publish weights
+# or model caches to GitHub (including through Git LFS).
+*.gguf
+*.ggml
+*.safetensors
+*.ckpt
+*.pt
+*.pth
+*.onnx
+*.tflite
+/ai-models/
+/model-cache/
+**/.cache/huggingface/
+**/.ollama/
+
 # OS cruft
 .DS_Store
 Thumbs.db
+
+# Internal plans, reviews and generated acceptance evidence stay local.
+*.md
+!/README.md
+!/WARFRAME.md
+/docs/roadmap_v2_acceptance/
+/docs/roadmap_v2_research/
+/docs/structurer_inventory/
+/docs/bytecode_roundtrip/baseline_corpus*.json
+/docs/bytecode_roundtrip/review_*.json
+/docs/assets/v2-history.json
+/scripts/build_site_history.py
+
+# Ad-hoc JSON reports are local; explicitly retain reproducible test inputs.
+*.json
+!/docs/failure_fixtures/**/*.json
+!/docs/source_corpus_v2.json
+!/docs/module_source_corpus_v2.json
+!/docs/source_registry_v2.json
+!/docs/output_size/baseline_fixtures.json
+!/docs/bytecode_roundtrip/baseline_residual_control_flow.json
+!/docs/bytecode_roundtrip/baseline_semantic_roundtrip.json

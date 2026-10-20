@@ -1,0 +1,516 @@
+name: Continuous Integration
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  rust:
+    name: Rust checks
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install nightly Rust
+        # Pin the compiler used by the native workspace checks.
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-15
+          components: rustfmt
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      # The repository predates the current nightly rustfmt style and contains
+      # unrelated formatting drift. Keep the report visible without making the
+      # roadmap CI job fail before its semantic checks; formatting can be
+      # migrated in a dedicated, repository-wide change.
+      - name: Report formatting status
+        run: |
+          if cargo +nightly-2026-06-15 fmt --all -- --check; then
+            echo "rustfmt: clean"
+          else
+            echo "::warning::rustfmt reports pre-existing repository-wide drift"
+          fi
+
+      - name: Run workspace tests
+        run: cargo +nightly-2026-06-15 test --workspace --all-targets
+
+      - name: Check lifter
+        run: cargo +nightly-2026-06-15 check -p luau-lifter
+
+      - name: Check instrumented API benchmark
+        run: cargo +nightly-2026-06-15 check -p luau-lifter --example benchmark_api --features allocation-counts
+
+      - name: Build release lifter
+        run: cargo +nightly-2026-06-15 build --release -p luau-lifter
+
+  worker:
+    name: Worker panic recovery in workerd
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-15
+          components: rust-src
+          targets: wasm32-unknown-unknown
+      # worker-build 0.8.7 explicitly invokes `cargo +nightly` for build-std.
+      # The moving nightly has removed features this workspace still uses, and
+      # rustup reserves the name `nightly`, so a small shim routes that request
+      # to the pinned toolchain.
+      - run: |
+          mkdir -p "$RUNNER_TEMP/cargo-shim"
+          cat > "$RUNNER_TEMP/cargo-shim/cargo" <<'SHIM'
+          #!/usr/bin/env bash
+          if [ "${1:-}" = "+nightly" ]; then shift; set -- +nightly-2026-06-15 "$@"; fi
+          exec "${CARGO_HOME:-$HOME/.cargo}/bin/cargo" "$@"
+          SHIM
+          chmod +x "$RUNNER_TEMP/cargo-shim/cargo"
+          echo "$RUNNER_TEMP/cargo-shim" >> "$GITHUB_PATH"
+          PATH="$RUNNER_TEMP/cargo-shim:$PATH" cargo +nightly --version
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+      - run: cargo install worker-build --version 0.8.7 --locked
+      - name: Build unwind-enabled Worker
+        working-directory: luau-worker
+        run: worker-build --release --panic-unwind --no-opt
+      - name: Check authentication and batch recovery in WASM
+        run: |
+          npm install --prefix "$RUNNER_TEMP/worker-runtime" --no-audit --no-fund miniflare@5.20260925.0-alpha
+          node scripts/check_worker_runtime.mjs luau-worker/build "$RUNNER_TEMP/worker-runtime"
+
+  # Keep the representative bytecode fixtures and the official Luau parser in
+  # the public CI contract.  Rust tests alone cannot catch a source-shaped
+  # transformation that is syntactically valid but semantically reordered.
+  fixtures:
+    name: Fixture and Luau audit
+    needs: rust
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Install build tools
+        run: sudo apt-get update && sudo apt-get install --yes cmake g++
+
+      - name: Install nightly Rust
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2026-06-15
+
+      - name: Cache Cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build lifter
+        run: cargo +nightly-2026-06-15 build --release -p luau-lifter
+
+      - name: Build official Luau compiler and runner (pinned)
+        env:
+          # Pinned upstream commit (release 0.736).  Do not float `master` in
+          # the acceptance job: the compiler's bytecode/opcode selection must
+          # be stable for the round-trip proofs below.
+          LUAU_COMMIT: c2ec0d4e5ca50796ba174a7565298f59aa572268
+        run: |
+          git clone https://github.com/luau-lang/luau.git "$RUNNER_TEMP/luau"
+          git -C "$RUNNER_TEMP/luau" checkout --quiet "$LUAU_COMMIT"
+          cmake -S "$RUNNER_TEMP/luau" -B "$RUNNER_TEMP/luau-build" -DCMAKE_BUILD_TYPE=Release
+          cmake --build "$RUNNER_TEMP/luau-build" --target Luau.Compile.CLI Luau.Repl.CLI Luau.Ast.CLI --parallel 2
+
+      - name: Check isolated benchmark VM (offline)
+        run: |
+          cmake -S scripts/benchmark_vm -B "$RUNNER_TEMP/benchmark-vm" \
+            -DCMAKE_BUILD_TYPE=Release -DLUAU_SOURCE_DIR="$RUNNER_TEMP/luau"
+          cmake --build "$RUNNER_TEMP/benchmark-vm" --target benchmark-vm --parallel 2
+          python3 scripts/check_benchmark_vm.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --vm "$RUNNER_TEMP/benchmark-vm/benchmark-vm"
+
+      - name: Run deep-review semantic regressions
+        run: |
+          python3 scripts/check_deep_review.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --vm "$RUNNER_TEMP/benchmark-vm/benchmark-vm" \
+            --lifter target/release/luau-lifter \
+            --work "$RUNNER_TEMP/deep-review"
+
+      - name: Typed fuzz round-trips against their bytecode (fixed seeds)
+        run: |
+          python3 scripts/fuzz_roundtrip.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --vm "$RUNNER_TEMP/benchmark-vm/benchmark-vm" \
+            --lifter target/release/luau-lifter \
+            --seeds 80 --mutate --reduce \
+            --work "$RUNNER_TEMP/fuzz" --report "$RUNNER_TEMP/fuzz.json"
+
+      - name: Run residual-control fixtures in strict modes
+        run: |
+          set -euo pipefail
+          fixture_root="docs/failure_fixtures/residual_control_flow"
+          for mode in default strict; do
+            out="${RUNNER_TEMP}/residual-control-${mode}"
+            args=()
+            if [[ "$mode" == strict ]]; then
+              args+=(--strict-no-synthetic-control)
+            fi
+            log="${RUNNER_TEMP}/residual-control-${mode}.log"
+            set +e
+            target/release/luau-lifter decompile-folder "$fixture_root" "$out" \
+              --key 203 --threads 1 --emit-upvalue-analysis --verbose "${args[@]}" \
+              >"$log" 2>&1
+            status=$?
+            set -e
+            # Every fixture must structure into source-shaped Luau in both
+            # modes: the init-edge transfers that used to be reported as a
+            # FORGPREP/FORNPREP "suffix" are now materialized before the
+            # preparation marker by the SSA destructor.
+            test "$status" -eq 0
+            test "$(grep -c '^FAIL ' "$log")" -eq 0
+            count=$(find "$out" -type f -name '*.luau' | wc -l)
+            test "$count" -eq 7
+            if rg -n --glob '*.luau' '(^|[^[:alnum:]_])goto[[:space:]]|controlFlowState|GenericFor(Init|Next)' "$out"; then
+              echo 'internal control marker found in fixture output' >&2
+              exit 1
+            fi
+          done
+
+      - name: Parse and compile every fixture output with official Luau
+        run: |
+          set -euo pipefail
+          compiler="$RUNNER_TEMP/luau-build/luau-compile"
+          test -x "$compiler"
+          for output_root in "$RUNNER_TEMP"/residual-control-*; do
+            while IFS= read -r -d '' file; do
+              "$compiler" --only-parse "$file" >/dev/null
+              "$compiler" --binary -O0 "$file" >/dev/null
+            done < <(find "$output_root" -type f -name '*.luau' -print0)
+          done
+
+      - name: Semantic round-trip of loop-structuring fixtures
+        run: |
+          set -euo pipefail
+          python3 scripts/semantic_roundtrip.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --lifter target/release/luau-lifter \
+            --keep "$RUNNER_TEMP/semantic-roundtrip"
+
+      - name: Gate per-file output size
+        run: |
+          set -euo pipefail
+          python3 -m unittest discover -s scripts -p 'test_*.py'
+          python3 scripts/output_size.py \
+            --root "residual=$RUNNER_TEMP/residual-control-strict" \
+            --root "semantic=$RUNNER_TEMP/semantic-roundtrip/out" \
+            --baseline docs/output_size/baseline_fixtures.json \
+            --report "$RUNNER_TEMP/output-size.json"
+
+      - name: V2 source, dataflow and runtime controls
+        run: |
+          python3 scripts/roadmap_v2.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --lifter target/release/luau-lifter \
+            --report "$RUNNER_TEMP/roadmap-v2.json" \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --keep "$RUNNER_TEMP/roadmap-v2" --determinism
+
+      - name: V2 optional SSA lineage and metadata determinism
+        run: |
+          python3 scripts/provenance_fixtures.py \
+            --fixtures-report "$RUNNER_TEMP/roadmap-v2.json" \
+            --lifter target/release/luau-lifter \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/roadmap-v2-lineage.json" \
+            --keep "$RUNNER_TEMP/roadmap-v2-lineage" --cache --compact-annotations
+
+      - name: Roblox bytecode v12 runtime and determinism
+        run: |
+          python3 scripts/roadmap_v2.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --lifter target/release/luau-lifter \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --bytecode-version 12 --determinism \
+            --report "$RUNNER_TEMP/bytecode-v12.json" \
+            --keep "$RUNNER_TEMP/bytecode-v12"
+
+      - name: Luau bytecode v14 (FASTPCALL) runtime and determinism
+        run: |
+          python3 scripts/roadmap_v2.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --lifter target/release/luau-lifter \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --bytecode-version 14 --determinism \
+            --report "$RUNNER_TEMP/bytecode-v14.json" \
+            --keep "$RUNNER_TEMP/bytecode-v14"
+
+      - name: Compact style runtime and determinism
+        run: |
+          python3 scripts/roadmap_v2.py             --compiler "$RUNNER_TEMP/luau-build/luau-compile"             --luau "$RUNNER_TEMP/luau-build/luau"             --lifter target/release/luau-lifter             --ast "$RUNNER_TEMP/luau-build/luau-ast"             --determinism --lifter-arg=--style --lifter-arg=compact             --report "$RUNNER_TEMP/compact-style.json"             --keep "$RUNNER_TEMP/compact-style"
+
+      - name: Execute v12 reader in wasm32
+        run: |
+          rustup target add wasm32-unknown-unknown --toolchain nightly-2026-06-15
+          python3 scripts/check_v12_wasm.py --keep "$RUNNER_TEMP/v12-wasm"
+
+      - name: V2 binding preservation VM controls
+        run: |
+          python3 scripts/binding_preservation_controls.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --keep "$RUNNER_TEMP/binding-preservation-controls" \
+            --report "$RUNNER_TEMP/binding-preservation-controls.json"
+
+      - name: V2 nested assignment function dataflow
+        run: |
+          python3 scripts/assignment_order_audit.py \
+            --fixtures-report "$RUNNER_TEMP/roadmap-v2.json" \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --report "$RUNNER_TEMP/roadmap-v2-assignment-order.json"
+
+      - name: V2 private constructor order and observation controls
+        run: |
+          python3 scripts/branch_constructor_controls.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --keep "$RUNNER_TEMP/branch-constructor-controls" \
+            --report "$RUNNER_TEMP/branch-constructor-controls.json"
+
+      - name: V2 existing conditional IR lowering and VM controls
+        run: |
+          cargo +nightly-2026-06-15 run -p luau-lifter --example conditional_lowering -- "$RUNNER_TEMP/conditional-ir"
+          python3 scripts/conditional_ir_audit.py \
+            --fixtures "$RUNNER_TEMP/conditional-ir" \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/conditional-ir.json"
+
+      - name: V2 rehoist register budget and literal fidelity
+        run: |
+          cargo +nightly-2026-06-15 run -p luau-lifter --example rehoist_constants -- "$RUNNER_TEMP/rehoist-ir"
+          python3 scripts/rehoist_audit.py \
+            --fixtures "$RUNNER_TEMP/rehoist-ir" \
+            --lifter target/release/luau-lifter \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/rehoist-ir.json"
+
+      - name: V2 private constructor region counterexamples
+        run: |
+          python3 scripts/constructor_region_controls.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --keep "$RUNNER_TEMP/constructor-region-controls" \
+            --report "$RUNNER_TEMP/constructor-region-controls.json"
+
+      - name: V2 pinned compiler transformation families
+        run: |
+          python3 scripts/compiler_witnesses.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --lifter target/release/luau-lifter \
+            --keep "$RUNNER_TEMP/compiler-witnesses" \
+            --report "$RUNNER_TEMP/compiler-witnesses.json"
+
+      - name: V2 ordered reconstruction VM controls
+        run: |
+          python3 scripts/ordered_reconstruction_controls.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --keep "$RUNNER_TEMP/ordered-reconstruction-controls" \
+            --report "$RUNNER_TEMP/ordered-reconstruction-controls.json"
+
+      - name: V2 reconstruction regression and fixed-count loop study
+        run: |
+          for mode in default synthesis; do
+            options=()
+            if [ "$mode" = synthesis ]; then options+=(--synthesize-arithmetic-loops); fi
+            python3 scripts/compiler_witnesses.py \
+              --manifest docs/failure_fixtures/reconstruction_holdout/manifest.json \
+              --evaluation-use unblinded-regression \
+              --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+              --luau "$RUNNER_TEMP/luau-build/luau" \
+              --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+              --lifter target/release/luau-lifter \
+              --keep "$RUNNER_TEMP/reconstruction-holdout-$mode" \
+              --report "$RUNNER_TEMP/reconstruction-holdout-$mode.json" "${options[@]}"
+          done
+
+      - name: V2 source-known reconstruction site review
+        run: |
+          python3 scripts/reconstruction_study_review.py \
+            --initial docs/failure_fixtures/reconstruction_baseline/manifest.json \
+            --initial-work docs/failure_fixtures/reconstruction_baseline \
+            --current "$RUNNER_TEMP/reconstruction-holdout-default.json" \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/reconstruction-site-review.json"
+
+      - name: V2 lexical binding graph and scope controls
+        run: |
+          python3 scripts/binding_graph_controls.py \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/binding-graph-controls.json"
+          trace_dir=$(python3 -c 'import json,pathlib,sys; print(pathlib.Path(json.load(open(sys.argv[1]))["work"])/"trace1")' "$RUNNER_TEMP/roadmap-v2-lineage.json")
+          python3 scripts/binding_graph.py \
+            --root "$trace_dir" \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/binding-graph.json"
+          python3 scripts/local_producer_controls.py \
+            --root "$trace_dir" \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/local-producer-controls.json"
+
+      - name: V2 formatter observable evaluation counterexamples
+        run: |
+          python3 scripts/formatter_effect_controls.py \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --report "$RUNNER_TEMP/roadmap-v2-formatter-controls.json"
+
+      - name: V2 artifact cache context and corruption controls
+        run: |
+          python3 scripts/cache_controls.py \
+            --lifter target/release/luau-lifter \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --keep "$RUNNER_TEMP/roadmap-v2-cache-controls" \
+            --report "$RUNNER_TEMP/roadmap-v2-cache-controls.json"
+
+      - name: V2 pass profile context and counter determinism
+        run: |
+          input_dir=$(python3 -c 'import json,pathlib,sys; print(pathlib.Path(json.load(open(sys.argv[1]))["work"])/"input")' "$RUNNER_TEMP/roadmap-v2-lineage.json")
+          python3 scripts/profile_v2.py \
+            --before target/release/luau-lifter --after target/release/luau-lifter \
+            --corpus "$input_dir" --key 1 --threads 1 4 \
+            --keep "$RUNNER_TEMP/roadmap-v2-profile" \
+            --report "$RUNNER_TEMP/roadmap-v2-profile.json"
+
+      - name: V2 seeded programs and bounded failure reduction
+        run: |
+          python3 scripts/generated_roundtrip.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --luau "$RUNNER_TEMP/luau-build/luau" \
+            --lifter target/release/luau-lifter \
+            --keep "$RUNNER_TEMP/roadmap-v2-generated" \
+            --report "$RUNNER_TEMP/roadmap-v2-generated.json" --reduce
+
+      - name: V2 pinned public source and independent family holdout
+        run: |
+          python3 scripts/public_source_roundtrip.py \
+            --vendor "$RUNNER_TEMP/roadmap-v2-vendor" --checkout \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --lifter target/release/luau-lifter \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --keep "$RUNNER_TEMP/roadmap-v2-public" \
+            --report "$RUNNER_TEMP/roadmap-v2-public.json"
+
+      - name: V2 static module summaries and require cycles
+        run: |
+          python3 scripts/module_summaries.py \
+            --manifest docs/failure_fixtures/module_summaries/manifest.json \
+            --root docs/failure_fixtures/module_summaries \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/roadmap-v2-module-fixtures.json"
+          python3 scripts/module_summaries.py \
+            --manifest docs/module_source_corpus_v2.json \
+            --root "$RUNNER_TEMP/roadmap-v2-vendor" \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/roadmap-v2-module-public.json"
+
+      - name: V2 public binding locations and lineage determinism
+        run: |
+          python3 scripts/provenance_fixtures.py \
+            --public-report "$RUNNER_TEMP/roadmap-v2-public.json" \
+            --lifter target/release/luau-lifter \
+            --ast "$RUNNER_TEMP/luau-build/luau-ast" \
+            --report "$RUNNER_TEMP/roadmap-v2-public-lineage.json" \
+            --keep "$RUNNER_TEMP/roadmap-v2-public-lineage" --cache --compact-annotations
+
+      - name: V2 exact source registry and ambiguity controls
+        run: |
+          python3 scripts/source_registry_controls.py \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --keep "$RUNNER_TEMP/roadmap-v2-registry-controls" \
+            --report "$RUNNER_TEMP/roadmap-v2-registry-controls.json"
+          python3 scripts/source_registry.py build \
+            --vendor "$RUNNER_TEMP/roadmap-v2-vendor" \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --registry "$RUNNER_TEMP/roadmap-v2-registry"
+          python3 scripts/source_registry_audit.py \
+            --registry "$RUNNER_TEMP/roadmap-v2-registry" \
+            --compiler "$RUNNER_TEMP/luau-build/luau-compile" \
+            --report "$RUNNER_TEMP/roadmap-v2-registry-public.json"
+
+      # Bytecode round-trip oracle: decompile -> recompile with the pinned
+      # compiler -> compare normalised prototypes with the original bytecode.
+      # Gated against the committed baselines: no fixture may regress in
+      # status and no fixture may gain non-equivalent prototypes.
+      - name: Bytecode round-trip oracle (gated against baseline)
+        run: |
+          set -euo pipefail
+          compiler="$RUNNER_TEMP/luau-build/luau-compile"
+          python3 scripts/bytecode_roundtrip.py \
+            --lifter target/release/luau-lifter --compiler "$compiler" \
+            --corpus docs/failure_fixtures/residual_control_flow --key 203 \
+            --baseline docs/bytecode_roundtrip/baseline_residual_control_flow.json \
+            --report "$RUNNER_TEMP/bytecode-roundtrip-residual.json" \
+            --markdown "$RUNNER_TEMP/bytecode-roundtrip-residual.md"
+          python3 scripts/bytecode_roundtrip.py \
+            --lifter target/release/luau-lifter --compiler "$compiler" \
+            --sources docs/failure_fixtures/semantic_roundtrip \
+            --baseline docs/bytecode_roundtrip/baseline_semantic_roundtrip.json \
+            --report "$RUNNER_TEMP/bytecode-roundtrip-semantic.json" \
+            --markdown "$RUNNER_TEMP/bytecode-roundtrip-semantic.md"
+
+      - name: Upload fixture manifests and outputs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: pr3-fixture-audit
+          path: |
+            ${{ runner.temp }}/residual-control-*/.tovek-analysis/manifest.json
+            ${{ runner.temp }}/residual-control-*/**/*.luau
+            ${{ runner.temp }}/residual-control-*.log
+            ${{ runner.temp }}/semantic-roundtrip/**/*.luau
+            ${{ runner.temp }}/bytecode-roundtrip-*.json
+            ${{ runner.temp }}/bytecode-roundtrip-*.md
+            ${{ runner.temp }}/output-size.json
+            ${{ runner.temp }}/roadmap-v2.json
+            ${{ runner.temp }}/bytecode-v12.json
+            ${{ runner.temp }}/roadmap-v2-lineage.json
+            ${{ runner.temp }}/binding-preservation-controls.json
+            ${{ runner.temp }}/roadmap-v2-public-lineage.json
+            ${{ runner.temp }}/roadmap-v2-formatter-controls.json
+            ${{ runner.temp }}/roadmap-v2-assignment-order.json
+            ${{ runner.temp }}/branch-constructor-controls.json
+            ${{ runner.temp }}/constructor-region-controls.json
+            ${{ runner.temp }}/local-producer-controls.json
+            ${{ runner.temp }}/rehoist-ir.json
+            ${{ runner.temp }}/compiler-witnesses.json
+            ${{ runner.temp }}/ordered-reconstruction-controls.json
+            ${{ runner.temp }}/reconstruction-holdout-default.json
+            ${{ runner.temp }}/reconstruction-holdout-synthesis.json
+            ${{ runner.temp }}/reconstruction-site-review.json
+            ${{ runner.temp }}/roadmap-v2-cache-controls.json
+            ${{ runner.temp }}/roadmap-v2-profile.json
+            ${{ runner.temp }}/roadmap-v2/**/*.luau
+            ${{ runner.temp }}/roadmap-v2-generated.json
+            ${{ runner.temp }}/roadmap-v2-generated/**/*.luau
+            ${{ runner.temp }}/roadmap-v2-public.json
+            ${{ runner.temp }}/roadmap-v2-module-*.json
+            ${{ runner.temp }}/roadmap-v2-registry-*.json
+            ${{ runner.temp }}/roadmap-v2-registry/index.json
+          if-no-files-found: warn

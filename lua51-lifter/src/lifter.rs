@@ -26,7 +26,67 @@ pub struct Lifter<'a, 'b> {
     constants: FxHashMap<usize, ast::Literal>,
     function: Function,
     upvalues: Vec<RcLocal>,
+    vararg_counter: Option<RcLocal>,
     lifted_functions: &'b mut Vec<(Arc<Mutex<ast::Function>>, Function, Vec<RcLocal>)>,
+}
+
+#[cfg(test)]
+mod setlist_regressions {
+    use super::*;
+
+    #[test]
+    fn vararg_flags_initialize_only_the_compatibility_slot() {
+        for flags in [0, 1, 2, 3, 7] {
+            let mut bytes = vec![0; 12];
+            bytes.extend([0, 1, flags, 3]); // one fixed parameter, three registers
+            bytes.extend(1u32.to_le_bytes());
+            bytes.extend((30u32 | (1 << 23)).to_le_bytes()); // RETURN no values
+            bytes.extend([0; 20]); // constants, closures, positions, locals, upvalues
+            let (_, prototype) = BytecodeFunction::parse(&bytes).unwrap();
+            let (function, _) = Lifter::lift(&prototype, &mut Vec::new());
+            assert_eq!(function.is_variadic, flags & 2 != 0);
+            assert_eq!(function.parameters.len(), 1);
+            let entry = function.block(function.entry().unwrap()).unwrap();
+            assert_eq!(entry.len(), 2 + usize::from(flags & 4 != 0));
+            assert!(entry.iter().flat_map(|s| ast::LocalRw::values_written(s))
+                .all(|local| !function.parameters.contains(local)));
+            let tables: Vec<_> = entry.iter().filter_map(|s| s.as_assign())
+                .filter_map(|a| a.right[0].as_table()).collect();
+            assert_eq!(tables.len(), usize::from(flags & 4 != 0));
+            if let Some(table) = tables.first() {
+                assert_eq!(table.0.len(), 2);
+                assert_eq!(table.0[0].0, Some(ast::Literal::String(b"n".to_vec()).into()));
+                assert!(matches!(table.0[1], (None, ast::RValue::VarArg(_))));
+            }
+        }
+    }
+
+    #[test]
+    fn parsed_setlist_reaches_the_original_array_index() {
+        for block in [255u32, 256, 257, 511, 512] {
+            // NEWTABLE r0; LOADK r1, 42; SETLIST r0, 1, block;
+            // RETURN r0. C=0 uses an extra raw word above the 9-bit range.
+            let mut words = vec![10, 1 | (1 << 6), 34 | (1 << 23)];
+            if block > 511 { words.push(block); }
+            else { words[2] |= block << 14; }
+            words.push(30 | (2 << 23));
+            let mut bytes = vec![0; 12]; // name and line ranges
+            bytes.extend([0, 0, 0, 2]); // upvalues, parameters, vararg, stack
+            bytes.extend((words.len() as u32).to_le_bytes());
+            bytes.extend(words.into_iter().flat_map(u32::to_le_bytes));
+            bytes.extend(1u32.to_le_bytes()); // one number constant
+            bytes.push(3);
+            bytes.extend(42f64.to_le_bytes());
+            bytes.extend([0; 16]); // closures, positions, locals, upvalues
+            let (_, prototype) = BytecodeFunction::parse(&bytes).unwrap();
+            let (function, _) = Lifter::lift(&prototype, &mut Vec::new());
+            let indices: Vec<_> = function.graph().node_weights()
+                .flat_map(|body| body.iter())
+                .filter_map(|statement| statement.as_set_list().map(|list| list.index))
+                .collect();
+            assert_eq!(indices, vec![(block as usize - 1) * 50 + 1]);
+        }
+    }
 }
 
 impl<'a, 'b> Lifter<'a, 'b> {
@@ -55,12 +115,7 @@ impl<'a, 'b> Lifter<'a, 'b> {
         self.nodes.insert(0, self.function.new_block());
         for (insn_index, insn) in self.bytecode.code.iter().enumerate() {
             match *insn {
-                Instruction::SetList {
-                    block_number: 0, ..
-                } => {
-                    // TODO: skip next instruction
-                    todo!();
-                }
+                Instruction::ExtraArgument => {}
                 Instruction::LoadBoolean {
                     skip_next: true, ..
                 } => {
@@ -160,6 +215,7 @@ impl<'a, 'b> Lifter<'a, 'b> {
         let mut iter = self.bytecode.code[start..=end].iter();
         while let Some(instruction) = iter.next() {
             match instruction {
+                Instruction::ExtraArgument => {}
                 Instruction::Move {
                     destination,
                     source,
@@ -454,6 +510,7 @@ impl<'a, 'b> Lifter<'a, 'b> {
                         ast::If::new(
                             if *invert {
                                 ast::Unary {
+                                    node_origin: Default::default(),
                                     value: Box::new(value.clone()),
                                     operation: ast::UnaryOperation::Not,
                                 }
@@ -467,15 +524,17 @@ impl<'a, 'b> Lifter<'a, 'b> {
                         .into(),
                     );
 
+                    // The copy runs only on the edge into the jump after
+                    // TESTSET, a block other jumps may share.
                     let assign = ast::Assign::new(
                         vec![self.locals[destination].clone().into()],
                         vec![value.clone()],
                     );
-
-                    self.function
-                        .block_mut(self.nodes[&(end + 1)])
-                        .unwrap()
-                        .push(assign.into());
+                    let jump_node = self.get_node(&(end + 1));
+                    assert!(self
+                        .insert_between
+                        .insert(self.nodes[&start], (jump_node, assign.into()))
+                        .is_none());
                 }
                 &Instruction::PrepMethodCall {
                     destination,
@@ -608,7 +667,9 @@ impl<'a, 'b> Lifter<'a, 'b> {
 
                     let ast_function = Arc::<Mutex<_>>::default();
 
-                    let (function, upvalues) = Lifter::lift(closure, self.lifted_functions);
+                    let (function, upvalues) = Lifter::lift_function(
+                        closure, self.lifted_functions, self.vararg_counter.clone(), false,
+                    );
                     self.lifted_functions
                         .push((ast_function.clone(), function, upvalues));
 
@@ -616,10 +677,12 @@ impl<'a, 'b> Lifter<'a, 'b> {
                         ast::Assign::new(
                             vec![self.locals[destination].clone().into()],
                             vec![ast::Closure {
+                                node_origin: Default::default(),
                                 function: ByAddress(ast_function),
                                 upvalues: upvalues_passed
                                     .into_iter()
                                     .map(ast::Upvalue::Ref)
+                                    .chain(self.vararg_counter.iter().cloned().map(ast::Upvalue::Copy))
                                     .collect(),
                             }
                             .into()],
@@ -679,6 +742,7 @@ impl<'a, 'b> Lifter<'a, 'b> {
                     statements.push(
                         ast::Assign::new(
                             vec![ast::Index {
+                                node_origin: Default::default(),
                                 left: Box::new(self.locals[&object].clone().into()),
                                 right: Box::new(key),
                             }
@@ -878,6 +942,20 @@ impl<'a, 'b> Lifter<'a, 'b> {
         bytecode: &'a BytecodeFunction,
         lifted_functions: &'b mut Vec<(Arc<Mutex<ast::Function>>, Function, Vec<RcLocal>)>,
     ) -> (Function, Vec<RcLocal>) {
+        fn needs_counter(function: &BytecodeFunction) -> bool {
+            function.needs_arg_table() || function.closures.iter().any(needs_counter)
+        }
+        let counter = needs_counter(bytecode)
+            .then(|| RcLocal::new(ast::Local::new(Some("selectVarargs".into()))));
+        Self::lift_function(bytecode, lifted_functions, counter, true)
+    }
+
+    fn lift_function(
+        bytecode: &'a BytecodeFunction,
+        lifted_functions: &'b mut Vec<(Arc<Mutex<ast::Function>>, Function, Vec<RcLocal>)>,
+        vararg_counter: Option<RcLocal>,
+        root: bool,
+    ) -> (Function, Vec<RcLocal>) {
         let mut context = Self {
             bytecode,
             nodes: FxHashMap::default(),
@@ -886,11 +964,15 @@ impl<'a, 'b> Lifter<'a, 'b> {
             constants: FxHashMap::default(),
             function: Function::new(0),
             upvalues: Vec::new(),
+            vararg_counter,
             lifted_functions,
         };
 
         context.create_block_map();
+        // Lua 5.1 encodes HASARG=1, ISVARARG=2 and NEEDSARG=4 separately.
+        context.function.is_variadic = bytecode.is_variadic();
         context.allocate_locals();
+        if !root { context.upvalues.extend(context.vararg_counter.iter().cloned()); }
         context.lift_blocks();
 
         // TODO: STYLE: instead of naming NodeIndex vars `{}_node`, we should name them
@@ -898,11 +980,34 @@ impl<'a, 'b> Lifter<'a, 'b> {
         let stack_init_node = context.function.new_block();
         let stack_init_block = context.function.block_mut(stack_init_node).unwrap();
         stack_init_block.reserve(context.locals.len());
-        for (_, local) in context.locals {
+        if root && let Some(counter) = &context.vararg_counter {
+            // The VM creates arg without consulting globals. Capture the
+            // standard runtime helper before recovered code can replace select.
+            stack_init_block.push(ast::Assign::new(vec![counter.clone().into()],
+                vec![ast::Global(b"select".to_vec()).into()]).into());
+        }
+        for (register, local) in context.locals {
             if !context.function.parameters.contains(&local) {
                 let stack_init_block = context.function.block_mut(stack_init_node).unwrap();
+                let value = if bytecode.needs_arg_table()
+                    && register.0 == bytecode.number_of_parameters
+                {
+                    // The compatibility slot is initialized by the VM, not nil.
+                    // A constructor preserves holes and select counts trailing
+                    // nils, unlike #arg. Keep varargs in the open tail position.
+                    ast::Table::new(vec![
+                        (Some(ast::Literal::String(b"n".to_vec()).into()),
+                         ast::Select::Call(ast::Call::new(
+                            context.vararg_counter.as_ref().unwrap().clone().into(),
+                            vec![ast::Literal::String(b"#".to_vec()).into(), ast::VarArg.into()],
+                         )).into()),
+                        (None, ast::VarArg.into()),
+                    ]).into()
+                } else {
+                    ast::Literal::Nil.into()
+                };
                 stack_init_block.push(
-                    ast::Assign::new(vec![local.into()], vec![ast::Literal::Nil.into()]).into(),
+                    ast::Assign::new(vec![local.into()], vec![value]).into(),
                 )
             }
         }

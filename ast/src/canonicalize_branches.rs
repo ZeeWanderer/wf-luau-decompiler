@@ -9,23 +9,32 @@ use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     deinline::rvalue_exact_eq, flatten_guards::block_size, BinaryOperation, Block, Global, If,
-    Index, LValue, Literal, Local, NumericFor, RValue, RcLocal, Repeat, Statement,
+    Index, LValue, Literal, NumericFor, RValue, RcLocal, Repeat, Statement,
     Traverse, Unary, UnaryOperation,
 };
 
 pub fn canonicalize_branches(block: &mut Block) {
     crate::factor_common_tails::unshare_blocks(block);
-    let facts = FunctionFacts::collect(block, &[]);
-    canonicalize_block(block, &facts);
+    let facts = FunctionFacts::collect(block, &[], Vec::new());
+    canonicalize_block(block, &facts, 0);
 }
 
 struct FunctionFacts {
     declared: FxHashSet<RcLocal>,
     captured: FxHashSet<RcLocal>,
+    /// The function's upvalues, which take a register to read.
+    upvalues: Vec<RcLocal>,
 }
 
 impl FunctionFacts {
-    fn collect(block: &Block, parameters: &[RcLocal]) -> Self {
+    fn collect(block: &Block, parameters: &[RcLocal], upvalues: Vec<RcLocal>) -> Self {
+        // The facts only gate parent-walk recovery, which needs a `while true`
+        // loop of this function. No rewrite in this pass creates one.
+        if !block.any_statement(&mut |statement| {
+            matches!(statement, Statement::While(node) if is_true(&node.condition))
+        }) {
+            return Self { declared: FxHashSet::default(), captured: FxHashSet::default(), upvalues };
+        }
         let usage = crate::inline_temps::collect_usage(block);
         let captured = usage
             .into_iter()
@@ -33,7 +42,7 @@ impl FunctionFacts {
             .collect();
         let mut declared = parameters.iter().cloned().collect();
         collect_declared_locals(block, &mut declared);
-        Self { declared, captured }
+        Self { declared, captured, upvalues }
     }
 }
 
@@ -67,35 +76,97 @@ fn collect_declared_locals(block: &Block, declared: &mut FxHashSet<RcLocal>) {
     }
 }
 
-fn canonicalize_block(block: &mut Block, facts: &FunctionFacts) {
+/// `live`: the registers the function holds around `block` (its parameters,
+/// the locals enclosing blocks declare, enclosing loops' own registers).
+fn canonicalize_block(block: &mut Block, facts: &FunctionFacts, live: usize) {
+    let mut live = live;
     for statement in &mut block.0 {
         let mut functions = Vec::new();
-        for value in crate::deinline::stmt_rvalues_mut(statement) {
+        crate::deinline::visit_stmt_rvalues_mut(statement, &mut |value| {
             collect_functions(value, &mut functions);
-        }
-        for function in functions {
+            true
+        });
+        for (function, upvalues) in functions {
             let mut function = function.lock();
-            let nested_facts = FunctionFacts::collect(&function.body, &function.parameters);
-            canonicalize_block(&mut function.body, &nested_facts);
+            let nested_facts = FunctionFacts::collect(&function.body, &function.parameters, upvalues);
+            let parameters = function.parameters.len();
+            canonicalize_block(&mut function.body, &nested_facts, parameters);
         }
 
+        // A numeric loop holds three hidden registers (and its counter, when
+        // the body assigns it); a generic one three and room for at least
+        // two variables.
         match statement {
             Statement::If(node) => {
-                canonicalize_block(&mut node.then_block.lock(), facts);
-                canonicalize_block(&mut node.else_block.lock(), facts);
+                canonicalize_block(&mut node.then_block.lock(), facts, live);
+                canonicalize_block(&mut node.else_block.lock(), facts, live);
             }
-            Statement::While(node) => canonicalize_block(&mut node.block.lock(), facts),
-            Statement::Repeat(node) => canonicalize_block(&mut node.block.lock(), facts),
-            Statement::NumericFor(node) => canonicalize_block(&mut node.block.lock(), facts),
-            Statement::GenericFor(node) => canonicalize_block(&mut node.block.lock(), facts),
+            Statement::While(node) => canonicalize_block(&mut node.block.lock(), facts, live),
+            Statement::Repeat(node) => canonicalize_block(&mut node.block.lock(), facts, live),
+            Statement::NumericFor(node) => canonicalize_block(&mut node.block.lock(), facts, live + 4),
+            Statement::GenericFor(node) => {
+                canonicalize_block(&mut node.block.lock(), facts, live + 3 + node.res_locals.len().max(2))
+            }
+            Statement::Assign(assign) if assign.prefix => live += assign.left.len(),
             _ => {}
         }
         flatten_leading_repeat_in_infinite_while(statement);
         reroll_terminal_while(statement);
     }
     recover_parent_walks(block, facts);
-    reroll_two_index_blocks(block);
+    reroll_two_index_blocks(block, live, &facts.upvalues);
     chain_adjacent_return_ifs(&mut block.0);
+    merge_nested_conjunct_ifs(&mut block.0);
+}
+
+/// ROADMAP E1: `if a then if b then BODY end end` (both arms else-less, the
+/// outer arm holding nothing but the inner `if`) -> `if a and b then BODY end`.
+/// Exact: `a and b` evaluates `a`, then `b` only when `a` is truthy — the same
+/// order, count and short-circuit as the nested form — and no other statement
+/// depends on the intermediate nesting. Iterates so `if a then if b then if c`
+/// collapses in one pass (the inner pair was already merged bottom-up).
+/// The leftmost operand of an `and` chain (`a` of `a and b and c`).
+fn first_conjunct(value: &RValue) -> &RValue {
+    match value {
+        RValue::Binary(binary) if binary.operation == BinaryOperation::And => first_conjunct(&binary.left),
+        _ => value,
+    }
+}
+
+fn merge_nested_conjunct_ifs(statements: &mut [Statement]) {
+    for statement in statements.iter_mut() {
+        loop {
+            let Statement::If(outer) = statement else {
+                break;
+            };
+            if !outer.else_block.lock().0.is_empty() {
+                break;
+            }
+            let inner = {
+                let then = outer.then_block.lock();
+                match then.0.as_slice() {
+                    [Statement::If(inner)] if inner.else_block.lock().0.is_empty() => {
+                        Some((inner.condition.clone(), inner.then_block.clone()))
+                    }
+                    _ => None,
+                }
+            };
+            let Some((inner_condition, inner_then)) = inner else {
+                break;
+            };
+            let outer_condition = std::mem::replace(&mut outer.condition, RValue::Literal(Literal::Nil));
+            // `if v then if v and v.Parent then`: the inner test starts by
+            // repeating the pure outer one, which then decides nothing.
+            outer.condition = if crate::is_total_pure(&outer_condition)
+                && *first_conjunct(&inner_condition) == outer_condition
+            {
+                inner_condition
+            } else {
+                RValue::Binary(crate::Binary::new(outer_condition, inner_condition, BinaryOperation::And))
+            };
+            outer.then_block = inner_then;
+        }
+    }
 }
 
 /// Recover the characteristic ancestor iterator
@@ -183,7 +254,7 @@ fn is_parent_advance(statement: &Statement, cursor: &RcLocal) -> bool {
     let [LValue::Local(destination)] = assign.left.as_slice() else {
         return false;
     };
-    let [RValue::Index(Index { left, right })] = assign.right.as_slice() else {
+    let [RValue::Index(Index { left, right, .. })] = assign.right.as_slice() else {
         return false;
     };
     destination == cursor
@@ -195,9 +266,29 @@ fn is_parent_advance(statement: &Statement, cursor: &RcLocal) -> bool {
 /// xs[2]; BODY(b)` into a two-iteration numeric loop. The alpha matcher permits
 /// only the element-local rename; the sole expression hole is therefore the
 /// proven consecutive index literal.
-fn reroll_two_index_blocks(block: &mut Block) {
+/// `live`: the registers held around the loop, every local `block` declares
+/// included; `upvalues`: the function's.
+fn reroll_two_index_blocks(block: &mut Block, live: usize, upvalues: &[RcLocal]) {
+    reroll_two_index_blocks_impl::<true>(block, live, upvalues);
+}
+
+fn reroll_two_index_blocks_impl<const PREFILTER: bool>(block: &mut Block, live: usize, upvalues: &[RcLocal]) {
     if block.0.len() < 4 {
         return;
+    }
+    // Before the first accepted pair this loop cannot mutate the block. The
+    // exact candidate matcher requires declarations at offsets 0/2 indexed by
+    // literal 1/2; if no such window exists, neither the full descendant usage
+    // map nor the reserved-name census can affect any rewrite. This precheck
+    // borrows syntax only and retains no local or shared-block owners.
+    if PREFILTER {
+        let candidate = block.0.windows(4).any(|window| {
+            indexed_local_declaration(&window[0]).is_some_and(|(_, _, index)| index == 1)
+                && indexed_local_declaration(&window[2]).is_some_and(|(_, _, index)| index == 2)
+        });
+        crate::telemetry::count(if candidate { "canonicalize_reroll_census_required" }
+            else { "canonicalize_reroll_census_skipped" }, 1);
+        if !candidate { return; }
     }
     let usage = crate::inline_temps::collect_usage(block);
     let mut reserved = FxHashSet::default();
@@ -208,13 +299,20 @@ fn reroll_two_index_blocks(block: &mut Block) {
             index += 1;
             continue;
         };
+        // The loop's three registers come on top of what is live, its body
+        // above them. A source that would not compile keeps the two copies.
+        if crate::register_pressure::block_registers(&block.0[index..index + 2], live + 3, upvalues)
+            > crate::register_pressure::REGISTER_LIMIT
+        {
+            index += 1;
+            continue;
+        }
 
-        let counter_name = crate::rehoist_constants::unique_name("i", &mut reserved);
-        let counter = RcLocal::new(Local::new(Some(counter_name)));
+        let counter = crate::rehoist_constants::unique_local("i", &mut reserved);
         if crate::inline_temps::is_generated_temp(&element) {
             let item_base = indexed_item_name(&base);
             let item_name = crate::rehoist_constants::unique_name(&item_base, &mut reserved);
-            element.0 .0.lock().0 = Some(item_name);
+            element.0 .0.lock().set_counted_name(item_name, &item_base);
         }
 
         let mut declaration = block.0.remove(index).into_assign().unwrap();
@@ -331,15 +429,23 @@ fn indexed_item_name(base: &RValue) -> String {
 
 fn collect_functions(
     value: &mut RValue,
-    functions: &mut Vec<by_address::ByAddress<triomphe::Arc<parking_lot::Mutex<crate::Function>>>>,
+    functions: &mut Vec<(by_address::ByAddress<triomphe::Arc<parking_lot::Mutex<crate::Function>>>, Vec<RcLocal>)>,
 ) {
     if let RValue::Closure(closure) = value {
-        functions.push(closure.function.clone());
+        let upvalues = closure
+            .upvalues
+            .iter()
+            .map(|upvalue| match upvalue {
+                crate::Upvalue::Copy(local) | crate::Upvalue::Ref(local) => local.clone(),
+            })
+            .collect();
+        functions.push((closure.function.clone(), upvalues));
         return;
     }
-    for child in value.rvalues_mut() {
+    value.visit_rvalues_mut(&mut |child| {
         collect_functions(child, functions);
-    }
+        true
+    });
 }
 
 fn ends_in_return(block: &Block) -> bool {
@@ -480,7 +586,7 @@ fn is_single_task_wait(block: &Block) -> bool {
     let [Statement::Call(call)] = block.0.as_slice() else {
         return false;
     };
-    let RValue::Index(Index { left, right }) = &*call.value else {
+    let RValue::Index(Index { left, right, .. }) = &*call.value else {
         return false;
     };
     matches!(&**left, RValue::Global(Global(name)) if name.as_slice() == b"task")
@@ -562,6 +668,39 @@ mod tests {
 
     fn call(name: &str) -> Statement {
         Statement::Call(Call::new(global(name), vec![]))
+    }
+
+    #[test]
+    fn merges_nested_else_less_ifs_into_conjunction() {
+        let inner = Statement::If(If::new(
+            global("b"),
+            Block(vec![call("body")]),
+            Block(vec![]),
+        ));
+        let outer = Statement::If(If::new(global("a"), Block(vec![inner]), Block(vec![])));
+        let mut block = Block(vec![outer]);
+        canonicalize_branches(&mut block);
+        let Statement::If(node) = &block.0[0] else {
+            panic!()
+        };
+        assert_eq!(node.condition.to_string(), "a and b");
+        assert_eq!(node.then_block.lock().0.len(), 1);
+        // an else arm on either level blocks the merge
+        let inner = Statement::If(If::new(
+            global("b"),
+            Block(vec![call("body")]),
+            Block(vec![call("other")]),
+        ));
+        let mut block = Block(vec![Statement::If(If::new(
+            global("a"),
+            Block(vec![inner]),
+            Block(vec![]),
+        ))]);
+        canonicalize_branches(&mut block);
+        let Statement::If(node) = &block.0[0] else {
+            panic!()
+        };
+        assert_eq!(node.condition.to_string(), "a");
     }
 
     fn task_wait() -> Statement {
@@ -712,6 +851,93 @@ mod tests {
     }
 
     #[test]
+    fn reroll_census_gate_matches_unconditional_legacy_collection() {
+        use crate::Traverse;
+        type OriginView = Option<(Vec<crate::node_origins::Input>, bool, bool, Option<&'static str>, bool)>;
+        fn origins(block: &Block, out: &mut Vec<OriginView>) {
+            let mut record = |origin: Option<&crate::node_origins::Origin>| {
+                out.push(origin.and_then(|origin| origin.0.as_ref()).map(|data| (
+                    data.inputs.iter().map(|input| (**input).clone()).collect(), data.inlined,
+                    data.cloned, data.synthesized, data.incomplete,
+                )));
+            };
+            for statement in &block.0 {
+                record(crate::node_origins::statement(statement));
+                statement.traverse_rvalues_ref(&mut |value| record(crate::node_origins::value(value)));
+            }
+            for statement in &block.0 {
+                match statement {
+                    Statement::If(branch) => {
+                        origins(&branch.then_block.lock(), out);
+                        origins(&branch.else_block.lock(), out);
+                    }
+                    Statement::NumericFor(node) => origins(&node.block.lock(), out),
+                    _ => {}
+                }
+            }
+        }
+        for mode in 0..9 {
+            for offset in [0, 1, 8, 32] {
+                let players = RcLocal::new(Local::new(Some("players".into())));
+                let first = RcLocal::new(Local::new(Some("v5".into())));
+                let second = RcLocal::new(Local::new(Some("v6".into())));
+                let other = RcLocal::new(Local::new(Some("others".into())));
+                let locals = [&players, &first, &second, &other];
+                first.0.lock().add_source_binding(crate::SourceBinding {
+                    origin: crate::BindingOrigin::DebugLocal { prototype: 0, register: 0, start_pc: 0, end_pc: 10 },
+                    name: "element".into(),
+                });
+                let mut source = Block((0..offset).map(|_| call("prefix")).collect());
+                source.0.extend([
+                    indexed_declaration(&first, &players, if mode == 1 { 2.0 } else { 1.0 }),
+                    return_local_if_truthy(&first),
+                    indexed_declaration(&second, if mode == 5 { &other } else { &players },
+                        if mode == 2 { 3.0 } else { 2.0 }),
+                    return_local_if_truthy(&second),
+                ]);
+                if mode == 3 { source[offset].as_assign_mut().unwrap().prefix = false; }
+                if mode == 4 { source[offset + 2].as_assign_mut().unwrap().parallel = true; }
+                if mode == 6 { source.push(Return::new(vec![first.clone().into()]).into()); }
+                if mode == 7 {
+                    source.push(Call::new(global("capture"), vec![Closure {
+                        node_origin: Default::default(), upvalues: vec![Upvalue::Ref(first.clone())],
+                        function: ByAddress(Arc::new(Mutex::new(Function::default()))),
+                    }.into()]).into());
+                }
+                if mode == 8 {
+                    source[offset] = call("no_index");
+                    source[offset + 2] = call("no_index");
+                }
+                for (index, statement) in source.iter_mut().enumerate() {
+                    if let Some(origin) = crate::node_origins::statement_mut(statement) {
+                        *origin = crate::node_origins::Origin::input(crate::node_origins::Input {
+                            function: "reroll-gate-oracle".into(), block: 0, statement: index, value: None,
+                        });
+                    }
+                }
+                let mut expected = crate::simplify_gotos::deep_clone_block(&source);
+                let mut actual = crate::simplify_gotos::deep_clone_block(&source);
+                let metadata: Vec<_> = locals.iter().map(|local| local.0.lock().clone()).collect();
+                let start = crate::current_local_id();
+                super::reroll_two_index_blocks_impl::<false>(&mut expected, 0, &[]);
+                let minted = crate::current_local_id() - start;
+                let expected_text = expected.to_string();
+                let expected_metadata: Vec<_> = locals.iter().map(|local| local.0.lock().clone()).collect();
+                for (local, saved) in locals.iter().zip(&metadata) { *local.0.lock() = saved.clone(); }
+                let start = crate::current_local_id();
+                super::reroll_two_index_blocks(&mut actual, 0, &[]);
+                assert_eq!(crate::current_local_id() - start, minted);
+                assert_eq!(actual.to_string(), expected_text, "mode={mode}, offset={offset}");
+                assert_eq!(locals.iter().map(|local| local.0.lock().clone()).collect::<Vec<_>>(), expected_metadata);
+                let mut actual_origins = Vec::new(); let mut expected_origins = Vec::new();
+                origins(&actual, &mut actual_origins); origins(&expected, &mut expected_origins);
+                assert_eq!(actual_origins, expected_origins);
+                assert_eq!(minted, u64::from(mode == 0), "positive fixture must exercise the unchanged candidate path");
+            }
+        }
+    }
+
+    #[test]
     fn index_copy_reroll_refuses_loop_control_retargeting() {
         let players = RcLocal::new(Local::new(Some("players".into())));
         let first = RcLocal::new(Local::new(Some("v5".into())));
@@ -773,6 +999,7 @@ mod tests {
             declare_local(
                 &found,
                 RValue::Closure(Closure {
+                    node_origin: Default::default(),
                     function: ByAddress(Arc::new(Mutex::new(Function::default()))),
                     upvalues: vec![Upvalue::Ref(parent.clone())],
                 }),

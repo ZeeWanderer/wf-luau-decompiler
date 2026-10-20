@@ -71,7 +71,7 @@ fn clean_nested_in_statement(statement: &mut Statement) {
     //    closure boundary, so nested-in-nested closures are handled by the
     //    recursive `cleanup_redundant_returns` call inside `clean_function_body`.
     let mut functions = Vec::new();
-    for rvalue in crate::deinline::stmt_rvalues_mut(statement) {
+    crate::deinline::visit_stmt_rvalues_mut(statement, &mut |rvalue| {
         rvalue.post_traverse_rvalues(&mut |nested| -> Option<()> {
             if let RValue::Closure(closure) = nested {
                 functions.push(closure.function.clone());
@@ -81,7 +81,8 @@ fn clean_nested_in_statement(statement: &mut Statement) {
         if let RValue::Closure(closure) = rvalue {
             functions.push(closure.function.clone());
         }
-    }
+        true
+    });
     for function in functions {
         clean_function_body(&mut function.lock().body);
     }
@@ -114,16 +115,66 @@ fn clean_function_body(body: &mut Block) {
 }
 
 fn strip_trailing_void_return(body: &mut Block) {
+    strip_tail(body, true);
+}
+
+/// Drop a value-less return that ends a block in tail position: the function
+/// body, and every arm of an `if` that is itself in tail position, where the
+/// return skips nothing either. A then-arm keeps its only statement so no
+/// empty arm is left behind (`if c then return end` is a real guard shape).
+fn strip_tail(block: &mut Block, may_empty: bool) {
     // Skip trailing `Empty` placeholders (they render to nothing) to find the
-    // real last statement; if it is a value-less return, drop it.
-    if let Some(pos) = body
-        .0
-        .iter()
-        .rposition(|s| !matches!(s, Statement::Empty(_)))
-        && matches!(&body.0[pos], Statement::Return(r) if r.values.is_empty())
-    {
-        body.0.remove(pos);
+    // real last statement.
+    let Some(pos) = block.0.iter().rposition(|s| !matches!(s, Statement::Empty(_))) else {
+        return;
+    };
+    let real = block.0.iter().filter(|s| !matches!(s, Statement::Empty(_))).count();
+    if matches!(&block.0[pos], Statement::Return(r) if r.values.is_empty()) {
+        if !may_empty && real == 1 {
+            return;
+        }
+        block.0.remove(pos);
     }
+    merge_tail_guards(block);
+    if let Some(pos) = block.0.iter().rposition(|s| !matches!(s, Statement::Empty(_)))
+        && let Statement::If(r#if) = &block.0[pos]
+    {
+        strip_if_arms(r#if);
+    }
+}
+
+/// In tail position, `if c then A return end` followed only by an `if` is
+/// that `if` as the guard's `elseif`: the return merely skipped it
+/// (`if c then A elseif d then B end`). A value return stays a guard, and so
+/// does a guard with no other statement.
+fn merge_tail_guards(block: &mut Block) {
+    loop {
+        let real: Vec<usize> = (0..block.0.len())
+            .filter(|&i| !matches!(block.0[i], Statement::Empty(_)))
+            .collect();
+        let [.., guard_at, tail_at] = real[..] else { return };
+        if !matches!(block.0[tail_at], Statement::If(_)) {
+            return;
+        }
+        let Statement::If(guard) = &block.0[guard_at] else { return };
+        if !guard.else_block.lock().0.is_empty() {
+            return;
+        }
+        let then = guard.then_block.lock().0.clone();
+        let mut body = then.iter().filter(|s| !matches!(s, Statement::Empty(_)));
+        let (Some(_), Some(Statement::Return(r))) = (body.next(), body.last()) else { return };
+        if !r.values.is_empty() {
+            return;
+        }
+        let condition = guard.condition.clone();
+        let tail = block.0.remove(tail_at);
+        block.0[guard_at] = crate::If::new(condition, Block(then), Block(vec![tail])).into();
+    }
+}
+
+fn strip_if_arms(r#if: &crate::If) {
+    strip_tail(&mut r#if.then_block.lock(), false);
+    strip_tail(&mut r#if.else_block.lock(), true);
 }
 
 #[cfg(test)]
@@ -162,6 +213,7 @@ mod tests {
 
     fn closure(function: &Arc<Mutex<Function>>) -> RValue {
         RValue::Closure(Closure {
+            node_origin: Default::default(),
             function: ByAddress(function.clone()),
             upvalues: vec![],
         })
@@ -185,6 +237,76 @@ mod tests {
         cleanup_redundant_returns(&mut block);
 
         assert_eq!(f.lock().body.to_string(), "return \"x\"");
+    }
+
+    #[test]
+    fn strips_void_returns_ending_tail_if_arms() {
+        // `if c then a() return elseif d then return else b() return end`
+        // at the function tail: no arm return skips anything.
+        let inner = If::new(
+            global("d"),
+            Block(vec![void_return()]),
+            Block(vec![call("b"), void_return()]),
+        );
+        let outer = If::new(
+            global("c"),
+            Block(vec![call("a"), void_return()]),
+            Block(vec![inner.into()]),
+        );
+        let f = function(vec![outer.into()]);
+        let mut block = Block(vec![Call::new(global("use"), vec![closure(&f)]).into()]);
+
+        cleanup_redundant_returns(&mut block);
+
+        // A then-arm keeps its only `return`: dropping it would leave an
+        // empty arm (`if d then return end` is a real guard).
+        assert_eq!(
+            f.lock().body.to_string(),
+            "if c then\n\ta()\nelseif d then\n\treturn\nelse\n\tb()\nend"
+        );
+    }
+
+    #[test]
+    fn tail_guards_before_a_final_if_become_an_elseif_chain() {
+        // `if a then x() return end if b then y() return end if c then z() end`
+        let guard = |name: &str, action: &str| {
+            If::new(global(name), Block(vec![call(action), void_return()]), Block::default()).into()
+        };
+        let last = If::new(global("c"), Block(vec![call("z")]), Block::default());
+        let f = function(vec![guard("a", "x"), guard("b", "y"), last.into()]);
+        let mut block = Block(vec![Call::new(global("use"), vec![closure(&f)]).into()]);
+
+        cleanup_redundant_returns(&mut block);
+
+        assert_eq!(
+            f.lock().body.to_string(),
+            "if a then\n\tx()\nelseif b then\n\ty()\nelseif c then\n\tz()\nend"
+        );
+    }
+
+    #[test]
+    fn keeps_guards_that_return_a_value_or_do_nothing_else() {
+        let value_guard = If::new(global("a"), Block(vec![call("x"), Return::new(vec![string("v")]).into()]), Block::default());
+        let bare_guard = If::new(global("b"), Block(vec![void_return()]), Block::default());
+        let last = If::new(global("c"), Block(vec![call("z")]), Block::default());
+        let f = function(vec![value_guard.into(), bare_guard.into(), last.into()]);
+        let mut block = Block(vec![Call::new(global("use"), vec![closure(&f)]).into()]);
+        let before = f.lock().body.to_string();
+
+        cleanup_redundant_returns(&mut block);
+
+        assert_eq!(f.lock().body.to_string(), before);
+    }
+
+    #[test]
+    fn keeps_void_returns_in_arms_followed_by_code() {
+        let r#if = If::new(global("c"), Block(vec![call("a"), void_return()]), Block::default());
+        let f = function(vec![r#if.into(), call("b")]);
+        let mut block = Block(vec![Call::new(global("use"), vec![closure(&f)]).into()]);
+
+        cleanup_redundant_returns(&mut block);
+
+        assert_eq!(f.lock().body.to_string(), "if c then\n\ta()\n\treturn\nend\n\nb()");
     }
 
     #[test]
@@ -385,13 +507,14 @@ mod tests {
     fn cleans_closure_nested_in_indexed_lhs() {
         let inner = function(vec![Return::new(vec![string("done")]).into(), call("dead")]);
         let mut block = Block(vec![Statement::Assign(Assign {
+            node_origin: Default::default(),
             left: vec![LValue::Index(Index::new(
                 global("targets"),
                 closure(&inner),
             ))],
             right: vec![string("value")],
             prefix: false,
-            parallel: false,
+            parallel: false, compound: false,
         })]);
 
         cleanup_redundant_returns(&mut block);

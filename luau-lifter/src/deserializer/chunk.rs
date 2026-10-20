@@ -1,25 +1,24 @@
-use super::{Dialect, function::Function, list::parse_list, parse_string};
-use nom::character::complete::char;
-use nom::multi::many_till;
-use nom::number::complete::le_u8;
+use super::{function::Function, list::parse_list, parse_string};
 use nom::{IResult, bytes::complete::take};
+use nom::number::complete::le_u8;
 use nom_leb128::leb128_usize;
 
 #[derive(Debug)]
-pub struct Chunk {
+pub struct Chunk<'a> {
     pub version: u8,
-    pub string_table: Vec<Vec<u8>>,
+    // String bytes stay in the caller's bytecode until lifting finishes. AST
+    // literals and public reports still take ownership of the bytes they need.
+    pub string_table: Vec<&'a [u8]>,
     pub functions: Vec<Function>,
     pub main: usize,
+    /// Types version 3: names of the host userdata types referenced by tagged
+    /// type tags (`LBC_TYPE_TAGGED_USERDATA_BASE + index`), keyed by that
+    /// zero-based index.
+    pub userdata_type_names: Vec<(u8, &'a [u8])>,
 }
 
-impl Chunk {
-    pub(crate) fn parse(
-        input: &[u8],
-        encode_key: u8,
-        version: u8,
-        dialect: Dialect,
-    ) -> IResult<&[u8], Self> {
+impl<'a> Chunk<'a> {
+    pub(crate) fn parse(input: &'a [u8], encode_key: u8, version: u8, dialect: super::Dialect) -> IResult<&'a [u8], Self> {
         let (input, types_version) = if version >= 4 {
             le_u8(input)?
         } else {
@@ -32,14 +31,31 @@ impl Chunk {
             )));
         }
         let (input, string_table) = parse_list(input, parse_string)?;
-        let input = if types_version == 3 {
-            many_till(leb128_usize, char('\0'))(input)?.0
+        let (input, userdata_type_names) = if types_version == 3 {
+            let mut names = Vec::new();
+            let mut input = input;
+            loop {
+                let (rest, index) = le_u8(input)?;
+                input = rest;
+                if index == 0 {
+                    break;
+                }
+                let (rest, string_index) = leb128_usize(input)?;
+                input = rest;
+                if let Some(name) = string_index
+                    .checked_sub(1)
+                    .and_then(|string_index| string_table.get(string_index))
+                {
+                    names.push((index - 1, *name));
+                }
+            }
+            (input, names)
         } else {
-            input
+            (input, Vec::new())
         };
         let (input, functions) = parse_list(input, |i| {
             if version < 12 {
-                return Function::parse(i, encode_key, version, dialect);
+                return Function::parse_with_dialect(i, encode_key, version, dialect);
             }
 
             // v12+ prefixes every prototype with its exact encoded size. Parse
@@ -53,7 +69,7 @@ impl Chunk {
                 )));
             }
             let (rest, proto) = take(proto_size)(input)?;
-            let (unconsumed, function) = Function::parse(proto, encode_key, version, dialect)?;
+            let (unconsumed, function) = Function::parse_with_dialect(proto, encode_key, version, dialect)?;
             // A declared size smaller than the known proto body is rejected by
             // Function::parse above. Any remaining bytes are unknown extension
             // fields and are intentionally skipped at the proto boundary.
@@ -69,6 +85,7 @@ impl Chunk {
                 string_table,
                 functions,
                 main,
+                userdata_type_names,
             },
         ))
     }

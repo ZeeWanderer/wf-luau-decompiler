@@ -1,0 +1,66 @@
+{
+ "provenance": {
+  "lifter_commit": "d31366187777b49430fd1164e00e7aece3df6beb",
+  "compiler_commit": "c2ec0d4e5ca50796ba174a7565298f59aa572268",
+  "normalization": "VM table-template defaults are numeric zero; explicit nil is applied after all template entries.",
+  "migration": "Replayed the original baseline lifter with corrected normalization; thresholds are not regenerated from current decompiler output.",
+  "reviewed_count_changes": {
+   "ReplicatedStorage/Part_Icles/Emit": "Historical EmitBeam loses eleven VM-default zero fields; the corrected oracle detects them. Current EmitBeam preserves them. Current main still differs for its entry vector.create snapshot; no global reads are erased. The snapshot requires the standard constructor at chunk entry.",
+   "ReplicatedStorage/Shared/Information/Abilities": "Historical output adds an implicit zero for the private Abilities field before its explicit store. The same difference is present in current output."
+  }
+ },
+ "summary": {
+  "inputs": 7,
+  "protos": 177,
+  "exact": 117,
+  "equiv": 31,
+  "differ": 29,
+  "missing": 0,
+  "extra": 0,
+  "equiv_ratio": 0.83616
+ },
+ "files": [
+  {
+   "file": "ReplicatedStorage/Cmdr/Server commands/Admin/teleportServer",
+   "status": "ok",
+   "nonequiv": 0,
+   "protos": 2
+  },
+  {
+   "file": "ReplicatedStorage/FusionPackage/Components/Base/Container",
+   "status": "ok",
+   "nonequiv": 2,
+   "protos": 7
+  },
+  {
+   "file": "ReplicatedStorage/Part_Icles/Emit",
+   "status": "ok",
+   "nonequiv": 3,
+   "protos": 7
+  },
+  {
+   "file": "ReplicatedStorage/Shared/Information/Abilities",
+   "status": "ok",
+   "nonequiv": 2,
+   "protos": 8
+  },
+  {
+   "file": "ReplicatedStorage/Shared/TimeManager/MeshEmitter/init",
+   "status": "ok",
+   "nonequiv": 10,
+   "protos": 32
+  },
+  {
+   "file": "StarterPlayer/StarterCharacterScripts/Animate.client",
+   "status": "ok",
+   "nonequiv": 2,
+   "protos": 33
+  },
+  {
+   "file": "StarterPlayer/StarterPlayerScripts/PlayerModule/ControlModule/ClickToMoveController",
+   "status": "ok",
+   "nonequiv": 10,
+   "protos": 88
+  }
+ ]
+}

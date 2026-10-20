@@ -1,5 +1,5 @@
 use ast::{LocalRw, RcLocal};
-use indexmap::IndexSet;
+use ast::FxIndexSet as IndexSet;
 use petgraph::{
     prelude::DiGraph,
     stable_graph::NodeIndex,
@@ -12,48 +12,73 @@ use crate::function::Function;
 // https://github.com/fkie-cad/dewolf/blob/7afe5b46e79a7b56e9904e63f29d54bd8f7302d9/decompiler/pipeline/ssa/phi_dependency_graph.py
 #[derive(Debug)]
 pub struct ParamDependencyGraph {
-    // TODO: does this need to be a stable graph?
     pub graph: DiGraph<RcLocal, ()>,
     pub local_to_node: FxHashMap<RcLocal, NodeIndex>,
 }
 
 impl ParamDependencyGraph {
-    pub fn new(function: &mut Function, node: NodeIndex) -> Self {
+    pub fn new(function: &Function, node: NodeIndex) -> Self {
+        Self::with_param_names(function, node, RcLocal::clone)
+    }
+
+    /// Nodes are keyed by `name(param)`: the pass building this graph may
+    /// already have renamed a param (to the captured cell its value merges
+    /// into), and its own lookups use that name.
+    pub fn with_param_names(
+        function: &Function,
+        node: NodeIndex,
+        name: impl Fn(&RcLocal) -> RcLocal,
+    ) -> Self {
         let mut this = Self {
             graph: DiGraph::new(),
             local_to_node: FxHashMap::default(),
         };
+        let resolve = |local: &RcLocal| name(local);
+        let mut own_params = FxHashMap::default();
 
         let edges = function.edges_to_block(node);
         for (edge_index, edge) in edges.enumerate() {
             if edge_index == 0 {
                 for (param, _) in &edge.1.arguments {
-                    this.add_node(param.clone());
+                    let key = resolve(param);
+                    own_params.insert(param.clone(), key.clone());
+                    this.add_node(key);
                 }
             }
             // TODO: support non-local block arguments
             for (param, arg) in &edge.1.arguments {
-                for read in arg.values_read() {
+                let param = own_params.get(param).cloned().unwrap_or_else(|| resolve(param));
+                arg.visit_local_reads(&mut |read| {
+                    let read = own_params.get(read).unwrap_or(read);
                     if let Some(&defining_param_node) = this.local_to_node.get(read) {
-                        let param_node = this.local_to_node[param];
+                        let param_node = this.local_to_node[&param];
                         if param_node != defining_param_node {
                             this.graph.add_edge(param_node, defining_param_node, ());
                         }
                     }
-                }
+                    true
+                });
             }
         }
 
         this
     }
 
+    /// `DiGraph` fills the hole with its last node, so the local that pointed
+    /// at the last index now points at `node`.
     pub fn remove_node(&mut self, node: NodeIndex) -> Option<RcLocal> {
-        if let Some(local) = self.graph.remove_node(node) {
+        let local = self.graph.remove_node(node)?;
+        if self.local_to_node.get(&local) == Some(&node) {
             self.local_to_node.remove(&local);
-            Some(local)
-        } else {
-            None
         }
+        let last = NodeIndex::new(self.graph.node_count());
+        if let Some(moved) = self.graph.node_weight(node)
+            && let Some(index) = self.local_to_node.get_mut(moved)
+            && *index == last
+        {
+            *index = node;
+        }
+        Some(local)
     }
 
     pub fn add_node(&mut self, local: RcLocal) -> NodeIndex {
@@ -65,7 +90,7 @@ impl ParamDependencyGraph {
     // This function computes a directed feedback vertex (directed fvs) set of a given graph.
     // Since this problem is NP-hard, we only compute an approximate solution.
     pub fn compute_directed_fvs(&self) -> IndexSet<NodeIndex> {
-        let mut directed_fvs = IndexSet::new();
+        let mut directed_fvs = IndexSet::default();
         let mut dfs_post_order = DfsPostOrder::empty(&self.graph);
         dfs_post_order.stack.extend(self.graph.node_indices());
         let mut topological_order = dfs_post_order.iter(&self.graph).collect::<Vec<_>>();

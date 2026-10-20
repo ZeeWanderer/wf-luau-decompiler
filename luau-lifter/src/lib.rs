@@ -1,15 +1,28 @@
 mod deserializer;
 mod instruction;
 mod lifter;
+mod metadata_index;
 mod op_code;
+mod source_recovery;
+mod value_provenance;
+mod capture_effects;
+mod bytecode_validate;
+mod builtins;
+mod reconstruction_candidates;
+pub mod profile;
+pub mod stats;
 pub mod upvalue_analysis;
+pub mod warframe;
+
+pub use deserializer::Dialect as BytecodeDialect;
+pub use warframe::{try_decompile_warframe_bytecode_with_options, try_decompile_warframe_bytecode_with_symbols};
 
 use ast::{
-    Traverse,
+    LocalRw, Traverse,
     flatten_guards::flatten_guards,
     local_declarations::LocalDeclarer,
-    name_locals::{NameLocalOptions, name_locals_with_options},
-    replace_locals::replace_locals,
+    name_locals::{NameLocalOptions, name_locals_with_evidence},
+    link_upvalues::link_upvalues,
     simplify_gotos::{hoist_locals_for_gotos, simplify_gotos},
 };
 
@@ -18,104 +31,45 @@ use cfg::{
     function::Function,
     ssa::{
         self,
-        structuring::{structure_conditionals, structure_jumps},
+        structuring::{structure_conditionals_with_changes, structure_jumps},
     },
 };
-use indexmap::IndexMap;
+use ast::FxIndexMap as IndexMap;
 
 use lifter::Lifter;
 
 //use cfg_ir::{dot, function::Function, ssa};
 use parking_lot::Mutex;
-use petgraph::algo::dominators::simple_fast;
 
 use rustc_hash::{FxHashMap, FxHashSet};
 use triomphe::Arc;
 
 use std::{collections::BTreeMap, sync::Once};
 
-pub use deserializer::Dialect as BytecodeDialect;
 use deserializer::bytecode::Bytecode;
 
 pub const DONT_REUSE_VAR: u32 = 1 << 0;
 pub const NO_SYNTH_HELPERS: u32 = 1 << 1;
 pub const ASSUME_NO_NAN: u32 = 1 << 2;
+/// Preserve the strict no-synthetic-dispatcher policy across public option
+/// transports (batch headers, web/worker flags, and cached artifacts).
+pub const STRICT_NO_SYNTHETIC_CONTROL: u32 = 1 << 3;
+/// Detailed SSA/storage lineage in artifact APIs; no effect on emitted source.
+pub const EMIT_BINDING_PROVENANCE: u32 = 1 << 4;
+/// Opt-in arithmetic loop synthesis; does not establish original source structure.
+pub const SYNTHESIZE_ARITHMETIC_LOOPS: u32 = 1 << 5;
+pub const COMPACT_ANNOTATIONS: u32 = 1 << 6;
+/// `--style compact`: scalar selects as if-expressions instead of statements.
+pub const COMPACT_STYLE: u32 = 1 << 7;
+/// Write folded library constants through Roblox's standard libraries.
+pub const ASSUME_STANDARD_LIBRARIES: u32 = 1 << 8;
 
-// ---- TEMPORARY PROFILING (env-gated, remove before ship) ----
 #[doc(hidden)]
-pub mod prof {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    use std::time::Instant;
-
-    pub static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    pub fn on() -> bool {
-        *ENABLED.get_or_init(|| std::env::var("MEDAL_PROF").is_ok())
-    }
-
-    macro_rules! counters {
-        ($($name:ident),* $(,)?) => {
-            $(pub static $name: AtomicU64 = AtomicU64::new(0);)*
-            pub fn dump() {
-                eprintln!("---- MEDAL_PROF (us) ----");
-                $(eprintln!("{:<28} {:>10}", stringify!($name), $name.load(Ordering::Relaxed));)*
-            }
-        };
-    }
-    counters!(
-        DESER_LIFT,
-        PAR_LOOP_WALL,
-        F_SSA_CONSTRUCT,
-        F_SIMPLE_FAST,
-        F_STRUCTURE_JUMPS,
-        F_SSA_INLINE,
-        F_STRUCTURE_CONDS,
-        F_REMOVE_PARAMS,
-        F_APPLY_MAP,
-        F_DESTRUCT,
-        F_RESTRUCTURE,
-        F_SIMPLIFY_GOTOS,
-        F_FLATTEN_GUARDS,
-        F_DECLARE_LOCALS,
-        F_HOIST,
-        S_LINK_UPVALUES,
-        S_DEINLINE,
-        S_CLEANUP_RETURNS,
-        S_MATERIALIZE,
-        S_REHOIST_CONSTANTS,
-        S_NAME_LOCALS,
-        S_RECOVER_METHODS,
-        S_INLINE_TEMPS_1,
-        S_COND_EXPRS,
-        S_REBUILD_TABLES,
-        S_MATERIALIZE_CALL_RECEIVERS,
-        S_COPY_CLEANUP,
-        S_REBALANCE_EXPRS,
-        S_CLEANUP_FINAL,
-        S_ELIMINATE_NIL,
-        S_RECOVER_CONN,
-        S_EXPR_DEINLINE,
-        S_NORMALIZE_CONDS,
-        S_GUARD_CONTINUE,
-        S_FORMAT,
-    );
-
-    pub struct Timer(Option<(Instant, &'static AtomicU64)>);
-    impl Timer {
-        pub fn new(c: &'static AtomicU64) -> Self {
-            Timer(on().then(|| (Instant::now(), c)))
-        }
-    }
-    impl Drop for Timer {
-        fn drop(&mut self) {
-            if let Some((s, c)) = self.0.take() {
-                c.fetch_add(s.elapsed().as_micros() as u64, Ordering::Relaxed);
-            }
-        }
-    }
-}
+pub use ast::prof;
 macro_rules! ptime {
     ($c:ident) => {
         let _t = crate::prof::Timer::new(&crate::prof::$c);
+        let _profile_span = ast::telemetry::Span::new(stringify!($c));
     };
 }
 // ---- END TEMPORARY PROFILING ----
@@ -125,17 +79,54 @@ pub struct DecompileOptions {
     pub dont_reuse_var: bool,
     pub no_synth_helpers: bool,
     pub assume_no_nan: bool,
+    pub control_flow_policy: ControlFlowOutputPolicy,
+    /// Opt-in detailed lineage, produced only by artifact/analysis APIs.
+    pub emit_binding_provenance: bool,
+    /// Experimental equivalent loop presentation; disabled by default.
+    pub synthesize_arithmetic_loops: bool,
+    /// Short source labels; full emitter annotation text stays in provenance.
+    pub compact_annotations: bool,
+    /// Opt-in presentation: write a scalar select as `if c then a else b`
+    /// instead of the default branch statements (ROADMAP V2 §1).
+    pub compact_style: bool,
+    /// Opt-in: write folded constants as `math.pi`, `math.huge` and
+    /// `Vector3.new(...)`. The exact default does not look anything up in the
+    /// environment, which another script may replace at run time.
+    pub assume_standard_libraries: bool,
+}
+
+/// Controls whether the certified CFG dispatcher is an acceptable output
+/// representation when source-shaped structuring cannot prove a graph safe.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ControlFlowOutputPolicy {
+    /// Permit the semantics-preserving state-machine fallback.
+    #[default]
+    AllowCertifiedDispatcher,
+    /// Fail closed instead of returning synthetic control-flow scaffolding.
+    StrictNoSyntheticControl,
 }
 
 impl DecompileOptions {
     pub fn from_flag_bits(bits: u32) -> Option<Self> {
-        if bits & !(DONT_REUSE_VAR | NO_SYNTH_HELPERS | ASSUME_NO_NAN) != 0 {
+        if bits & !(DONT_REUSE_VAR | NO_SYNTH_HELPERS | ASSUME_NO_NAN | STRICT_NO_SYNTHETIC_CONTROL | EMIT_BINDING_PROVENANCE | SYNTHESIZE_ARITHMETIC_LOOPS | COMPACT_ANNOTATIONS | COMPACT_STYLE | ASSUME_STANDARD_LIBRARIES)
+            != 0
+        {
             return None;
         }
         Some(Self {
             dont_reuse_var: bits & DONT_REUSE_VAR != 0,
             no_synth_helpers: bits & NO_SYNTH_HELPERS != 0,
             assume_no_nan: bits & ASSUME_NO_NAN != 0,
+            emit_binding_provenance: bits & EMIT_BINDING_PROVENANCE != 0,
+            synthesize_arithmetic_loops: bits & SYNTHESIZE_ARITHMETIC_LOOPS != 0,
+            compact_annotations: bits & COMPACT_ANNOTATIONS != 0,
+            compact_style: bits & COMPACT_STYLE != 0,
+            assume_standard_libraries: bits & ASSUME_STANDARD_LIBRARIES != 0,
+            control_flow_policy: if bits & STRICT_NO_SYNTHETIC_CONTROL != 0 {
+                ControlFlowOutputPolicy::StrictNoSyntheticControl
+            } else {
+                ControlFlowOutputPolicy::AllowCertifiedDispatcher
+            },
         })
     }
 
@@ -143,6 +134,14 @@ impl DecompileOptions {
         u32::from(self.dont_reuse_var) * DONT_REUSE_VAR
             | u32::from(self.no_synth_helpers) * NO_SYNTH_HELPERS
             | u32::from(self.assume_no_nan) * ASSUME_NO_NAN
+            | u32::from(self.emit_binding_provenance) * EMIT_BINDING_PROVENANCE
+            | u32::from(self.synthesize_arithmetic_loops) * SYNTHESIZE_ARITHMETIC_LOOPS
+            | u32::from(self.compact_annotations) * COMPACT_ANNOTATIONS
+            | u32::from(self.compact_style) * COMPACT_STYLE
+            | u32::from(self.assume_standard_libraries) * ASSUME_STANDARD_LIBRARIES
+            | u32::from(
+                self.control_flow_policy == ControlFlowOutputPolicy::StrictNoSyntheticControl,
+            ) * STRICT_NO_SYNTHETIC_CONTROL
     }
 
     pub fn union(self, other: Self) -> Self {
@@ -150,8 +149,394 @@ impl DecompileOptions {
             dont_reuse_var: self.dont_reuse_var || other.dont_reuse_var,
             no_synth_helpers: self.no_synth_helpers || other.no_synth_helpers,
             assume_no_nan: self.assume_no_nan || other.assume_no_nan,
+            emit_binding_provenance: self.emit_binding_provenance || other.emit_binding_provenance,
+            synthesize_arithmetic_loops: self.synthesize_arithmetic_loops || other.synthesize_arithmetic_loops,
+            compact_annotations: self.compact_annotations || other.compact_annotations,
+            compact_style: self.compact_style || other.compact_style,
+            assume_standard_libraries: self.assume_standard_libraries || other.assume_standard_libraries,
+            control_flow_policy: if self.control_flow_policy
+                == ControlFlowOutputPolicy::StrictNoSyntheticControl
+                || other.control_flow_policy == ControlFlowOutputPolicy::StrictNoSyntheticControl
+            {
+                ControlFlowOutputPolicy::StrictNoSyntheticControl
+            } else {
+                ControlFlowOutputPolicy::AllowCertifiedDispatcher
+            },
         }
     }
+}
+
+/// The globals the chunk assigns (SETGLOBAL) and whether it names getfenv or
+/// setfenv: what decides if a library fetch can run script code.
+fn chunk_globals(chunk: &deserializer::chunk::Chunk) -> ast::ChunkGlobals {
+    use op_code::OpCode::{LOP_GETGLOBAL, LOP_GETIMPORT, LOP_SETGLOBAL};
+    let mut written = FxHashSet::default();
+    let mut unspellable = false;
+    for function in &chunk.functions {
+        let name = |constant: u32| match function.constants.get(constant as usize) {
+            Some(deserializer::constant::Constant::String(index)) => {
+                index.checked_sub(1).and_then(|index| chunk.string_table.get(index)).copied()
+            }
+            _ => None,
+        };
+        for instruction in &function.instructions {
+            let global = match *instruction {
+                instruction::Instruction::BC { op_code: op_code @ (LOP_GETGLOBAL | LOP_SETGLOBAL), aux, .. } => {
+                    name(aux).map(|global| (op_code == LOP_SETGLOBAL, global))
+                }
+                // The import path's first name is the global.
+                instruction::Instruction::AD { op_code: LOP_GETIMPORT, aux, .. } => {
+                    name((aux >> 20) & 1023).map(|global| (false, global))
+                }
+                _ => None,
+            };
+            let Some((assigned, global)) = global else { continue };
+            unspellable |= !std::str::from_utf8(global).is_ok_and(ast::valid_source_name);
+            if assigned {
+                written.insert(global.to_vec());
+            }
+        }
+    }
+    ast::ChunkGlobals {
+        dynamic_environment: chunk.string_table.iter().any(|string| *string == b"getfenv" || *string == b"setfenv"),
+        written,
+        unspellable,
+    }
+}
+
+/// Whether some function's code names getfenv or setfenv, as a global or a
+/// key (`_G.setfenv`): a constant, unlike a local's debug name.
+fn code_names_environment_function(chunk: &deserializer::chunk::Chunk) -> bool {
+    chunk.functions.iter().flat_map(|function| &function.constants).any(|constant| match *constant {
+        deserializer::constant::Constant::String(index) => index
+            .checked_sub(1)
+            .and_then(|index| chunk.string_table.get(index))
+            .is_some_and(|name| *name == b"getfenv" || *name == b"setfenv"),
+        _ => false,
+    })
+}
+
+/// The import path a FASTCALL at `pc` calls when it falls back: the
+/// GETIMPORT that loads the function its CALL (`skip` past it) calls.
+fn fallback_import(instructions: &[instruction::Instruction], pc: usize, skip: usize) -> Option<u32> {
+    use crate::{instruction::Instruction, op_code::OpCode};
+    let call = pc + 1 + skip;
+    let Some(&Instruction::BC { op_code: OpCode::LOP_CALL | OpCode::LOP_CALLFB, a: base, .. }) = instructions.get(call)
+    else {
+        return None;
+    };
+    let mut at = pc + 1;
+    let mut import = None;
+    while at < call {
+        let instruction = instructions.get(at)?;
+        if let &Instruction::AD { op_code: OpCode::LOP_GETIMPORT, a, aux, .. } = instruction
+            && a == base
+        {
+            import = Some(aux);
+        }
+        let (Instruction::BC { op_code, .. } | Instruction::AD { op_code, .. } | Instruction::E { op_code, .. }) =
+            *instruction;
+        at += if op_code.has_aux() { 2 } else { 1 };
+    }
+    import
+}
+
+/// The names an import id (GETIMPORT's AUX) reads, outermost first: the
+/// first `count` of the array.
+fn import_names<'a>(aux: u32, string: &impl Fn(u32) -> Option<&'a [u8]>) -> Option<([&'a [u8]; 3], usize)> {
+    let ids = [(aux >> 20) & 1023, (aux >> 10) & 1023, aux & 1023];
+    let count = ((aux >> 30) as usize).min(3);
+    let mut names = [&[][..]; 3];
+    for (name, &id) in names.iter_mut().zip(&ids[..count]) {
+        *name = string(id)?;
+    }
+    Some((names, count))
+}
+
+/// The function a register holds for a generic loop to be prepared over.
+#[derive(Clone, Copy)]
+enum Generator {
+    Unknown,
+    /// GETIMPORT: the import word.
+    Import(u32),
+    /// GETGLOBAL: the constant naming the global.
+    Global(u32),
+}
+
+/// The pcs a jump, a loop or a fast call's skip can land on: where facts
+/// gathered in straight-line code stop holding.
+fn jump_targets(instructions: &[instruction::Instruction]) -> Vec<bool> {
+    use crate::{instruction::Instruction, op_code::OpCode::*};
+    let mut targets = vec![false; instructions.len()];
+    let mut mark = |pc: usize, offset: i64| {
+        if let Ok(target) = usize::try_from(pc as i64 + 1 + offset)
+            && let Some(slot) = targets.get_mut(target)
+        {
+            *slot = true;
+        }
+    };
+    for (pc, instruction) in instructions.iter().enumerate() {
+        match *instruction {
+            Instruction::AD {
+                op_code:
+                    LOP_JUMP | LOP_JUMPBACK | LOP_JUMPIF | LOP_JUMPIFNOT | LOP_JUMPIFEQ | LOP_JUMPIFLE | LOP_JUMPIFLT
+                    | LOP_JUMPIFNOTEQ | LOP_JUMPIFNOTLE | LOP_JUMPIFNOTLT | LOP_FORNPREP | LOP_FORNLOOP | LOP_FORGLOOP
+                    | LOP_FORGPREP_INEXT | LOP_FORGPREP_NEXT | LOP_FORGPREP | LOP_JUMPXEQKNIL | LOP_JUMPXEQKB
+                    | LOP_JUMPXEQKN | LOP_JUMPXEQKS | LOP_CMPPROTO,
+                d,
+                ..
+            } => mark(pc, d.into()),
+            Instruction::E { op_code: LOP_JUMPX, e } => mark(pc, e.into()),
+            Instruction::BC {
+                op_code:
+                    LOP_LOADB | LOP_FASTCALL | LOP_FASTCALL1 | LOP_FASTCALL2 | LOP_FASTCALL2K | LOP_FASTCALL3 | LOP_FASTPCALL,
+                c,
+                ..
+            } if c != 0 => mark(pc, c.into()),
+            _ => {}
+        }
+    }
+    targets
+}
+
+/// Updates `generators` for the registers `instruction` writes. A loaded
+/// import or global survives the CALL in its own register, whose results are
+/// the loop's generator triple (`pairs(t)` calls `pairs`); every other write
+/// forgets what the register held. Writes this cannot bound forget all.
+fn track_generators(generators: &mut [Generator; 256], instruction: &instruction::Instruction) {
+    use crate::{instruction::Instruction, op_code::OpCode::*};
+    let mut forget = |from: usize, to: usize| {
+        for generator in generators.iter_mut().take(to).skip(from) {
+            *generator = Generator::Unknown;
+        }
+    };
+    match *instruction {
+        Instruction::AD { op_code: LOP_GETIMPORT, a, aux, .. } => generators[usize::from(a)] = Generator::Import(aux),
+        Instruction::BC { op_code: LOP_GETGLOBAL, a, aux, .. } => generators[usize::from(a)] = Generator::Global(aux),
+        // Results land in A..A+C-2, all registers from A for a multiple return.
+        Instruction::BC { op_code: LOP_CALL, a, c, .. } => {
+            let a = usize::from(a);
+            forget(a + 1, if c == 0 { 256 } else { a + usize::from(c) - 1 });
+        }
+        Instruction::BC { op_code: LOP_GETVARARGS, a, b, .. } => {
+            let a = usize::from(a);
+            forget(a, if b == 0 { 256 } else { a + usize::from(b) - 1 });
+        }
+        Instruction::BC { op_code: LOP_NAMECALL | LOP_NAMECALLUDATA, a, .. } => forget(usize::from(a), usize::from(a) + 2),
+        Instruction::AD { op_code: LOP_FORNPREP | LOP_FORNLOOP | LOP_FORGPREP | LOP_FORGPREP_INEXT | LOP_FORGPREP_NEXT, a, .. } => {
+            forget(usize::from(a), usize::from(a) + 3)
+        }
+        Instruction::AD { op_code: LOP_FORGLOOP, a, .. } => forget(usize::from(a) + 2, 256),
+        // Writes nothing: stores, jumps, returns, captures, fast-call guards
+        // (their results land through the CALL that follows) and markers.
+        Instruction::BC {
+            op_code:
+                LOP_NOP | LOP_BREAK | LOP_SETGLOBAL | LOP_SETUPVAL | LOP_CLOSEUPVALS | LOP_SETTABLE | LOP_SETTABLEKS
+                | LOP_SETTABLEN | LOP_SETUDATAKS | LOP_RETURN | LOP_SETLIST | LOP_CAPTURE | LOP_PREPVARARGS | LOP_FASTCALL
+                | LOP_FASTCALL1 | LOP_FASTCALL2 | LOP_FASTCALL2K | LOP_FASTCALL3 | LOP_FASTPCALL,
+            ..
+        }
+        | Instruction::AD {
+            op_code:
+                LOP_JUMP | LOP_JUMPBACK | LOP_JUMPIF | LOP_JUMPIFNOT | LOP_JUMPIFEQ | LOP_JUMPIFLE | LOP_JUMPIFLT
+                | LOP_JUMPIFNOTEQ | LOP_JUMPIFNOTLE | LOP_JUMPIFNOTLT | LOP_JUMPXEQKNIL | LOP_JUMPXEQKB | LOP_JUMPXEQKN
+                | LOP_JUMPXEQKS,
+            ..
+        }
+        | Instruction::E { .. } => {}
+        // Calls and members whose writes are not bounded here.
+        Instruction::BC { op_code: LOP_CALLFB | LOP_NATIVECALL | LOP_NEWCLASSMEMBER, .. }
+        | Instruction::AD { op_code: LOP_CMPPROTO, .. } => forget(0, 256),
+        // Every other instruction writes its A register only.
+        Instruction::BC { a, .. } | Instruction::AD { a, .. } => forget(usize::from(a), usize::from(a) + 1),
+    }
+}
+
+/// Whether import `names` spell the dotted `path`.
+fn names_path(names: &[&[u8]], path: &str) -> bool {
+    path.split('.').map(str::as_bytes).eq(names.iter().copied())
+}
+
+/// Import `names` as the dotted path source writes.
+fn dotted(names: &[&[u8]]) -> String {
+    names.iter().map(|name| String::from_utf8_lossy(name)).collect::<Vec<_>>().join(".")
+}
+
+/// Libraries whose folded constants compile back unchanged from their library
+/// spelling: the chunk never writes the global and never names getfenv or
+/// setfenv, exactly the conditions under which the compiler folds them.
+/// Per prototype, the upvalue slots its code never reads, writes or passes
+/// on (GETUPVAL, SETUPVAL, CAPTURE UPVAL): captures of a constant whose
+/// every read Luau folded, which only `-O1` and above do
+/// ([`ast::folded_captures`]). Most chunks have none.
+fn folded_capture_slots(chunk: &deserializer::chunk::Chunk) -> ast::folded_captures::FoldedSlots {
+    use instruction::Instruction::BC;
+    use op_code::OpCode::{LOP_CAPTURE, LOP_GETUPVAL, LOP_SETUPVAL};
+    let mut folded = ast::folded_captures::FoldedSlots::default();
+    for (index, function) in chunk.functions.iter().enumerate() {
+        if function.num_upvalues == 0 {
+            continue;
+        }
+        let mut touched = [0u64; 4];
+        for instruction in &function.instructions {
+            if let BC { op_code: LOP_GETUPVAL | LOP_SETUPVAL, b: slot, .. } | BC { op_code: LOP_CAPTURE, a: 2, b: slot, .. } =
+                *instruction
+            {
+                touched[usize::from(slot) / 64] |= 1 << (slot % 64);
+            }
+        }
+        let slots = (0..function.num_upvalues).filter(|&slot| touched[usize::from(slot) / 64] & (1 << (slot % 64)) == 0).collect::<Vec<_>>();
+        if !slots.is_empty() {
+            folded.insert(index, slots);
+        }
+    }
+    folded
+}
+
+/// Whether some NEWCLOSURE literal of the chunk may print as one Luau
+/// shares, which `fresh_closures` keeps new; most chunks have none, and the
+/// walk is skipped. The chunk must be compiled at `-O1` or above (some
+/// capture folded: `optimized`, or an instruction only `-O1` emits:
+/// [`emitted_from_o1`]), and some NEWCLOSURE must capture nothing by
+/// reference and only values that may print as a constant, a top-level
+/// local or a literal ([`capture_may_print_shared`]). A literal capturing a
+/// parameter or a computed value never prints shared.
+fn may_print_shared_fresh_closures(chunk: &deserializer::chunk::Chunk, optimized: bool) -> bool {
+    use instruction::Instruction::AD;
+    use op_code::OpCode::{LOP_DUPCLOSURE, LOP_NEWCLOSURE};
+    let functions = &chunk.functions;
+    if !optimized && !functions.iter().any(|function| function.instructions.iter().any(emitted_from_o1)) {
+        return false;
+    }
+    // The closure instructions making each prototype: (function, pc).
+    let mut creators = vec![Vec::new(); functions.len()];
+    let mut fresh = Vec::new();
+    for (index, function) in functions.iter().enumerate() {
+        for (pc, instruction) in function.instructions.iter().enumerate() {
+            let child = match *instruction {
+                AD { op_code: LOP_NEWCLOSURE, d, .. } => function.functions.get(d as usize).copied(),
+                AD { op_code: LOP_DUPCLOSURE, d, .. } => match function.constants.get(d as usize) {
+                    Some(&deserializer::constant::Constant::Closure(child)) => Some(child),
+                    _ => None,
+                },
+                _ => None,
+            };
+            let Some(child) = child.filter(|&child| child < functions.len()) else { continue };
+            creators[child].push((index, pc));
+            if matches!(instruction, AD { op_code: LOP_NEWCLOSURE, .. }) && functions[child].num_upvalues > 0 {
+                fresh.push((index, pc, functions[child].num_upvalues));
+            }
+        }
+    }
+    fresh.iter().any(|&(function, pc, upvalues)| {
+        (0..upvalues).all(|upvalue| capture_may_print_shared(chunk, &creators, function, pc, upvalue, 0))
+    })
+}
+
+/// An instruction Luau emits only from `-O1` on (or under `@native` /
+/// `--!native`, which optimize too): a shared closure (DUPCLOSURE), an
+/// import (`canImport`), a builtin call (`analyzeBuiltins`), and the
+/// constant-operand arithmetic and comparisons that need constant analysis.
+/// At `-O0` every constant is loaded into a register first (`LOADK`; even
+/// `LOADN` appears there, as a `for` loop's implicit step). A chunk without
+/// DUPCLOSURE is still `-O1` code when its closures happen to capture
+/// values that are never shared.
+fn emitted_from_o1(instruction: &instruction::Instruction) -> bool {
+    use instruction::Instruction::{AD, BC, E};
+    use op_code::OpCode::*;
+    let (BC { op_code, .. } | AD { op_code, .. } | E { op_code, .. }) = *instruction;
+    matches!(
+        op_code,
+        LOP_DUPCLOSURE
+            | LOP_GETIMPORT
+            | LOP_FASTCALL
+            | LOP_FASTCALL1
+            | LOP_FASTCALL2
+            | LOP_FASTCALL2K
+            | LOP_FASTCALL3
+            | LOP_FASTPCALL
+            | LOP_ADDK
+            | LOP_SUBK
+            | LOP_MULK
+            | LOP_DIVK
+            | LOP_MODK
+            | LOP_POWK
+            | LOP_IDIVK
+            | LOP_SUBRK
+            | LOP_DIVRK
+            | LOP_ANDK
+            | LOP_ORK
+            | LOP_JUMPXEQKNIL
+            | LOP_JUMPXEQKB
+            | LOP_JUMPXEQKN
+            | LOP_JUMPXEQKS
+    )
+}
+
+/// Whether the `upvalue`th capture of the closure made at `pc` of `function`
+/// may print as a local Luau shares a literal over. By value: in the main
+/// function any register (a top-level local); elsewhere one whose last write
+/// before the closure, in code order, loads a constant, moves a register,
+/// reads an upvalue or makes a closure, or a register no instruction wrote
+/// that is no parameter. Through an upvalue: as some instruction making
+/// `function` captured it. By reference: never (the local is written).
+fn capture_may_print_shared(
+    chunk: &deserializer::chunk::Chunk,
+    creators: &[Vec<(usize, usize)>],
+    function: usize,
+    pc: usize,
+    upvalue: u8,
+    depth: usize,
+) -> bool {
+    use instruction::Instruction::{AD, BC};
+    use op_code::OpCode::*;
+    let code = &chunk.functions[function];
+    let Some(&BC { op_code: LOP_CAPTURE, a: kind, b: source, .. }) = code.instructions.get(pc + 1 + upvalue as usize) else {
+        return true;
+    };
+    match kind {
+        0 if function == chunk.main => true,
+        0 => {
+            for instruction in code.instructions[..pc].iter().rev() {
+                let (op_code, a) = match *instruction {
+                    BC { op_code, a, .. } | AD { op_code, a, .. } => (op_code, a),
+                    _ => continue,
+                };
+                // Instructions whose A operand is the one register they write;
+                // another writer only makes the answer more permissive.
+                let maybe = match op_code {
+                    LOP_LOADNIL | LOP_LOADB | LOP_LOADN | LOP_LOADK | LOP_LOADKX | LOP_MOVE | LOP_GETUPVAL
+                    | LOP_NEWCLOSURE | LOP_DUPCLOSURE => true,
+                    LOP_GETGLOBAL | LOP_GETIMPORT | LOP_GETTABLE | LOP_GETTABLEKS | LOP_GETTABLEN | LOP_GETUDATAKS
+                    | LOP_NAMECALL | LOP_NAMECALLUDATA | LOP_CALL | LOP_ADD | LOP_SUB | LOP_MUL | LOP_DIV | LOP_MOD
+                    | LOP_POW | LOP_IDIV | LOP_ADDK | LOP_SUBK | LOP_MULK | LOP_DIVK | LOP_MODK | LOP_POWK | LOP_IDIVK
+                    | LOP_SUBRK | LOP_DIVRK | LOP_AND | LOP_OR | LOP_ANDK | LOP_ORK | LOP_CONCAT | LOP_NOT | LOP_MINUS
+                    | LOP_LENGTH | LOP_NEWTABLE | LOP_DUPTABLE | LOP_GETVARARGS => false,
+                    _ => continue,
+                };
+                if a == source {
+                    return maybe;
+                }
+            }
+            source >= code.num_parameters
+        }
+        2 => {
+            depth >= 8
+                || creators[function].is_empty()
+                || creators[function]
+                    .iter()
+                    .any(|&(parent, made)| capture_may_print_shared(chunk, creators, parent, made, source, depth + 1))
+        }
+        _ => false,
+    }
+}
+
+fn pristine_libraries(globals: &ast::ChunkGlobals) -> ast::library_constants::Libraries {
+    if globals.dynamic_environment {
+        return Default::default();
+    }
+    let written = |name: &[u8]| globals.written.contains(name);
+    ast::library_constants::Libraries { math: !written(b"math"), vector3: !written(b"Vector3") }
 }
 
 // NOTE: the `#[global_allocator]` (mimalloc by default, dhat under the
@@ -173,6 +558,36 @@ impl DecompileOptions {
 pub fn install_quiet_panic_hook() {
     static QUIET_HOOK: Once = Once::new();
     QUIET_HOOK.call_once(|| std::panic::set_hook(Box::new(|_| {})));
+}
+
+/// The stack of every thread that decompiles (reserved address space; pages
+/// are committed only as they are used). Each `elseif` nests the next `if` in
+/// the previous `else`, and the passes recurse once per level: a 1 MiB main
+/// thread overflowed at about 250 arms and a 2 MiB worker at about 500, where
+/// Luau compiles chains of a thousand. A stack overflow aborts the process past
+/// any `catch_unwind`: a whole `decompile-folder` run, or the web-server.
+pub const DECOMPILE_STACK_BYTES: usize = 256 << 20;
+
+/// Build rayon's global pool (`threads == 0`: one thread per logical CPU)
+/// with [`DECOMPILE_STACK_BYTES`] stacks. Call it before the first parallel
+/// call; it fails when the pool already exists.
+pub fn configure_thread_pool(threads: usize) -> Result<(), rayon::ThreadPoolBuildError> {
+    let mut builder = rayon::ThreadPoolBuilder::new().stack_size(DECOMPILE_STACK_BYTES);
+    if threads != 0 {
+        builder = builder.num_threads(threads);
+    }
+    builder.build_global()
+}
+
+/// Run `work` on a thread with a [`DECOMPILE_STACK_BYTES`] stack and return
+/// its result (a panic in `work` resumes in the caller).
+pub fn with_decompile_stack<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    let thread = std::thread::Builder::new()
+        .name("decompile".into())
+        .stack_size(DECOMPILE_STACK_BYTES)
+        .spawn(work)
+        .expect("spawn the decompile thread");
+    thread.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
 }
 
 pub fn decompile_bytecode(bytecode: &[u8], encode_key: u8) -> String {
@@ -238,81 +653,60 @@ pub fn try_decompile_bytecode_with_options(
     script_name: Option<&str>,
     options: DecompileOptions,
 ) -> Result<String, String> {
-    try_decompile_bytecode_with_dialect(
-        bytecode,
-        encode_key,
-        script_name,
-        options,
-        BytecodeDialect::Luau,
-    )
+    try_decompile_bytecode_internal(bytecode, encode_key, script_name, options, false)
+        .map(|artifact| artifact.source)
+        .map_err(|error| error.message)
 }
 
-pub fn try_decompile_warframe_bytecode_with_options(
-    bytecode: &[u8],
-    script_name: Option<&str>,
-    options: DecompileOptions,
-) -> Result<String, String> {
-    try_decompile_bytecode_with_dialect(
-        bytecode,
-        1,
-        script_name,
-        options,
-        BytecodeDialect::Warframe,
-    )
-}
-
-pub fn try_decompile_warframe_bytecode_with_symbols(
-    bytecode: &[u8],
-    script_name: Option<&str>,
-    options: DecompileOptions,
-    symbols: &BTreeMap<u32, String>,
-) -> Result<String, String> {
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        try_decompile_bytecode_internal(
-            bytecode,
-            1,
-            script_name,
-            options,
-            false,
-            BytecodeDialect::Warframe,
-            symbols,
-        )
-    }));
-    match caught {
-        Ok(result) => result.map(|artifact| artifact.source),
-        Err(payload) => Err(format!("panicked: {}", panic_payload_message(&payload))),
-    }
-}
-
-fn try_decompile_bytecode_with_dialect(
-    bytecode: &[u8],
-    encode_key: u8,
-    script_name: Option<&str>,
-    options: DecompileOptions,
-    dialect: BytecodeDialect,
-) -> Result<String, String> {
-    let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        try_decompile_bytecode_internal(
-            bytecode,
-            encode_key,
-            script_name,
-            options,
-            false,
-            dialect,
-            &BTreeMap::new(),
-        )
-    }));
-    match caught {
-        Ok(result) => result.map(|artifact| artifact.source),
-        Err(payload) => Err(format!("panicked: {}", panic_payload_message(&payload))),
-    }
-}
-
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct DecompileArtifact {
     pub source: String,
     pub upvalue_analysis: Option<upvalue_analysis::ScriptUpvalueAnalysis>,
 }
+
+/// Machine-readable evidence for a decompilation rejection. Keeping this
+/// independent of CFG internals lets batch/web callers publish actionable
+/// per-function diagnostics without changing successful source output.
+#[derive(Clone, Debug, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DecompileDiagnostic {
+    pub stage: String,
+    pub code: String,
+    pub function: String,
+    pub message: String,
+}
+
+/// A decompilation failure with optional per-function evidence. Existing
+/// string-returning APIs render this via `Display`; diagnostic callers can
+/// consume the structured vector directly.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DecompileFailure {
+    pub message: String,
+    pub diagnostics: Vec<DecompileDiagnostic>,
+}
+
+impl DecompileFailure {
+    fn message(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            diagnostics: Vec::new(),
+        }
+    }
+}
+
+impl std::fmt::Display for DecompileFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)?;
+        if !self.diagnostics.is_empty() {
+            // Preserve the legacy prefix while appending a parseable JSON
+            // envelope for folder manifests and other machine consumers.
+            let json = serde_json::to_string(&self.diagnostics).map_err(|_| std::fmt::Error)?;
+            write!(f, " | diagnostics={json}")?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DecompileFailure {}
 
 pub fn try_decompile_bytecode_artifact(
     bytecode: &[u8],
@@ -333,15 +727,18 @@ pub fn try_decompile_bytecode_artifact_with_options(
     script_name: Option<&str>,
     options: DecompileOptions,
 ) -> Result<DecompileArtifact, String> {
-    try_decompile_bytecode_internal(
-        bytecode,
-        encode_key,
-        script_name,
-        options,
-        true,
-        BytecodeDialect::Luau,
-        &BTreeMap::new(),
-    )
+    try_decompile_bytecode_internal(bytecode, encode_key, script_name, options, true)
+        .map_err(|error| error.message)
+}
+
+/// Diagnostic variant preserving typed per-function failure evidence.
+pub fn try_decompile_bytecode_artifact_with_diagnostics(
+    bytecode: &[u8],
+    encode_key: u8,
+    script_name: Option<&str>,
+    options: DecompileOptions,
+) -> Result<DecompileArtifact, DecompileFailure> {
+    try_decompile_bytecode_internal(bytecode, encode_key, script_name, options, true)
 }
 
 fn try_decompile_bytecode_internal(
@@ -350,40 +747,137 @@ fn try_decompile_bytecode_internal(
     script_name: Option<&str>,
     options: DecompileOptions,
     emit_upvalue_analysis: bool,
-    dialect: BytecodeDialect,
-    symbols: &BTreeMap<u32, String>,
-) -> Result<DecompileArtifact, String> {
+) -> Result<DecompileArtifact, DecompileFailure> {
+    try_decompile_with_parser(bytecode, script_name, options, emit_upvalue_analysis, &|| {
+        deserializer::deserialize(bytecode, encode_key)
+    })
+}
+
+fn try_decompile_with_parser<'a>(
+    bytecode: &[u8],
+    script_name: Option<&str>,
+    options: DecompileOptions,
+    emit_upvalue_analysis: bool,
+    parse: &impl Fn() -> Result<Bytecode<'a>, String>,
+) -> Result<DecompileArtifact, DecompileFailure> {
+    // All fallible APIs share the same recovery boundary, including parsing,
+    // lifting and final formatting. Worker builds must use panic=unwind too.
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let mut sharing = Default::default();
+        let mut options = options;
+        loop {
+            // Returning from an attempt drops its AST, analyses and thread-local
+            // scopes before the next one starts. Recursive retries kept all of
+            // that state alive until the final attempt finished.
+            match decompile_bytecode_internal(bytecode, parse, script_name, options, emit_upvalue_analysis, sharing)? {
+                DecompileAttempt::Complete(artifact) => return Ok(artifact),
+                DecompileAttempt::Retry(next) => sharing = next,
+                DecompileAttempt::RetryCompact => options.compact_style = true,
+            }
+        }
+    }))
+    .unwrap_or_else(|payload| Err(DecompileFailure::message(format!(
+        "panicked: {}", panic_payload_message(payload.as_ref())
+    ))))
+}
+
+enum DecompileAttempt {
+    Complete(DecompileArtifact),
+    Retry(ast::coalesce_locals::Sharing),
+    /// Locals sharing all the storage they may still need more than Luau
+    /// allows: write branches as `if` expressions, which declare none.
+    RetryCompact,
+}
+
+/// `sharing`: which locals share storage before the passes that fold them
+/// (see `coalesce_generated_locals_in_function`); freer only when an attempt
+/// leaves a function over Luau's local limit.
+fn decompile_bytecode_internal<'a>(
+    bytecode: &[u8],
+    parse: &impl Fn() -> Result<Bytecode<'a>, String>,
+    script_name: Option<&str>,
+    options: DecompileOptions,
+    emit_upvalue_analysis: bool,
+    sharing: ast::coalesce_locals::Sharing,
+) -> Result<DecompileAttempt, DecompileFailure> {
     // Reset the per-thread local-id sequence so this decompilation's `RcLocal`
     // ids (and thus the FxHash-iteration order that depends on them, and the
     // generated local names) are independent of any earlier work this thread
     // did. Without this, parallel `decompile-folder` runs are nondeterministic
     // even though each file is processed on a single thread. See ast::RcLocal.
-    ast::reset_local_ids();
-    let deser_timer = prof::Timer::new(&prof::DESER_LIFT);
-    let mut chunk = deserializer::deserialize_with_dialect(bytecode, encode_key, dialect)
-        .map_err(|e| format!("deserialize: {e}"))?;
-    if let Bytecode::Chunk(chunk) = &mut chunk {
-        use deserializer::constant::Constant;
-        for function in &mut chunk.functions {
-            for constant in &mut function.constants {
-                if let Constant::Atom(hash) = constant {
-                    if let Some(name) = symbols.get(hash) {
-                        chunk.string_table.push(name.as_bytes().to_vec());
-                        *constant = Constant::String(chunk.string_table.len());
-                    }
-                }
-            }
-        }
+    if options.compact_annotations && !(emit_upvalue_analysis && options.emit_binding_provenance) {
+        return Err(DecompileFailure::message("compact annotations require an artifact API with binding provenance"));
     }
+    ast::reset_local_ids();
+    let stats_scope = ast::reconstruction_stats::enter(stats::enabled());
+    let _total_timer = prof::Timer::new(&prof::TOTAL);
+    let call_origins = ast::call_origins::enter(emit_upvalue_analysis && options.emit_binding_provenance);
+    let profile_context = profile::context(script_name, bytecode);
+    let _profile_context = ast::telemetry::enter(profile_context.clone());
+    let _profile_file = ast::telemetry::Span::new("DECOMPILE");
+    ast::telemetry::count("input_bytes", bytecode.len() as u64);
+    let profile_deser = ast::telemetry::Span::new("DESER_LIFT");
+    let deser_timer = prof::Timer::new(&prof::DESER_LIFT);
+    let chunk = parse()
+        .map_err(|e| DecompileFailure::message(format!("deserialize: {e}")))?;
     match chunk {
-        Bytecode::Error(msg) => Ok(DecompileArtifact {
-            source: msg,
+        Bytecode::Error(msg) => Ok(DecompileAttempt::Complete(DecompileArtifact {
+            source: compile_error_source(&msg),
             upvalue_analysis: None,
-        }),
+        })),
         Bytecode::Chunk(chunk) => {
-            validate_prototype_graph(&chunk.functions, chunk.main)?;
+            validate_prototype_graph(&chunk.functions, chunk.main)
+                .map_err(DecompileFailure::message)?;
+            validate_source_spellings(&chunk).map_err(DecompileFailure::message)?;
+            bytecode_validate::validate(&chunk).map_err(DecompileFailure::message)?;
+            if std::env::var_os("MEDAL_DUMP_TYPES").is_some() {
+                debug_dump_types(&chunk);
+            }
             let raw_upvalue_analysis =
                 emit_upvalue_analysis.then(|| upvalue_analysis::RawUpvalueAnalysis::build(&chunk));
+            let setup_timer = prof::Timer::new(&prof::SETUP);
+            // Which prototypes Luau inlined somewhere, read off line info.
+            let mut inlined_prototypes = vec![false; chunk.functions.len()];
+            // The inlined copies of each helper in each function, read off
+            // line info (`ast::deinline::evidence`): none without it.
+            let mut inlined_copies = None;
+            let _reconstruction_search = if chunk.functions.len() <= 4096
+                && chunk.functions.iter().map(|p| p.instructions.len()).sum::<usize>() <= ast::reconstruction_search::PC_LIMIT {
+                if chunk.functions.len() == 1 {
+                    ast::reconstruction_search::enter_single_prototype(chunk.functions[0].instructions.len())
+                } else {
+                    let lines: Vec<Vec<Option<u32>>> = chunk.functions.iter().map(upvalue_analysis::decode_source_lines).collect();
+                    inlined_prototypes = reconstruction_candidates::inlined_prototypes(&chunk.functions, &lines);
+                    inlined_copies = {
+                        let _span = ast::telemetry::Span::new("DESER_INLINED_COPIES");
+                        reconstruction_candidates::inlined_copies(&chunk.functions, &lines, chunk.main)
+                    };
+                    if ast::env_flag!("MEDAL_TRACE_COPIES") && let Some(copies) = &inlined_copies {
+                        let mut rows: Vec<_> = copies.copies.iter().collect();
+                        rows.sort();
+                        for ((caller, helper), count) in rows {
+                            eprintln!("COPIES caller=p{caller} helper=p{helper} copies={count}");
+                        }
+                    }
+                    ast::reconstruction_search::enter(lines)
+                }
+            } else { ast::reconstruction_search::enter_truncated() };
+            let _inlined_copies = ast::deinline::evidence::enter(inlined_copies);
+            let capture_effects = capture_effects::CaptureEffects::build(&chunk);
+            let globals = std::sync::Arc::new(chunk_globals(&chunk));
+            // A global no identifier spells is written `getfenv(1)["name"]`,
+            // which needs the standard `getfenv` reading the environment the
+            // global is read from: code naming getfenv or setfenv may
+            // replace either.
+            if globals.unspellable && code_names_environment_function(&chunk) {
+                return Err(DecompileFailure::message(
+                    "a global name no identifier spells, in a chunk that names getfenv or setfenv",
+                ));
+            }
+            drop(setup_timer);
+            ast::telemetry::count("capture_readonly_slots", capture_effects.readonly.iter()
+                .flatten().filter(|&&readonly| readonly).count() as u64);
+            ast::telemetry::count("capture_readonly_refused", u64::from(capture_effects.refusal.is_some()));
             let mut lifted = Vec::new();
             let root_function_id = emit_upvalue_analysis.then(|| format!("root:p{}", chunk.main));
             let root_function = Arc::<Mutex<ast::Function>>::default();
@@ -393,13 +887,37 @@ fn try_decompile_bytecode_internal(
                 root.bytecode_function_id = Some(root_function_id.clone());
             }
             let mut stack = vec![(root_function, chunk.main, root_function_id)];
+            let mut loaded_constants = ast::closure_identity::LoadedConstants::default();
             while let Some((ast_func, func_id, static_function_id)) = stack.pop() {
-                let (function, upvalues, child_functions) = Lifter::lift(
+                ast::reconstruction_search::register_function(Arc::as_ptr(&ast_func) as usize, func_id);
+                let typed_locals = {
+                    let proto = &chunk.functions[func_id];
+                    let (annotations, hints) = parameter_types_from_bytecode(
+                        proto.type_info.as_ref(),
+                        usize::from(proto.num_parameters),
+                        &chunk.userdata_type_names,
+                    );
+                    let mut ast_func = ast_func.lock();
+                    ast_func.parameter_annotations = annotations;
+                    ast_func.parameter_name_hints = hints;
+                    typed_local_hints_from_bytecode(
+                        proto.type_info.as_ref(),
+                        &chunk.userdata_type_names,
+                    )
+                };
+                let lifted_start = ast::current_local_id();
+                let (mut function, upvalues, child_functions) = Lifter::lift(
                     &chunk.functions,
                     &chunk.string_table,
+                    chunk.version,
                     func_id,
                     static_function_id,
+                    &typed_locals,
+                    emit_upvalue_analysis && options.emit_binding_provenance,
                 );
+                function.lifted_ids = lifted_start..ast::current_local_id();
+                function.globals = globals.clone();
+                function.may_hold_closures = !child_functions.is_empty();
                 lifted.push((ast_func, function, upvalues));
                 // The whole-program decompile order determines the monotonic
                 // local-id assignment and thus the generated local names, so it
@@ -408,6 +926,10 @@ fn try_decompile_bytecode_internal(
                 // so PC order breaks any `func_index` ties — the same proto can be
                 // instantiated by several closure sites) for a fully reproducible
                 // order independent of heap addresses.
+                loaded_constants.record_prototype(child_functions.iter().map(|(function, _, _)| &function.0));
+                for (child, func_index, _) in &child_functions {
+                    child.0.lock().inlined_by_compiler = inlined_prototypes[*func_index];
+                }
                 let mut children = child_functions
                     .into_iter()
                     .map(|(a, f, function_id)| (a.0, f, function_id))
@@ -416,7 +938,7 @@ fn try_decompile_bytecode_internal(
                 stack.extend(children);
             }
 
-            let (main, ..) = lifted.first().unwrap().clone();
+            let main = Arc::clone(&lifted.first().unwrap().0);
             // Lifting (above) minted ids in `[0, id_base)`. Give each function a
             // disjoint, stride-spaced id range keyed by its position in the
             // deterministic lift order, so the ids it mints are independent of
@@ -428,10 +950,12 @@ fn try_decompile_bytecode_internal(
             // byte-identical to the serial path — so no post-merge renumber is
             // needed; the strided bases alone make the whole pipeline deterministic.
             drop(deser_timer);
+            drop(profile_deser);
             let id_base = ast::current_local_id();
             let func_count = lifted.len() as u64;
             const ID_STRIDE: u64 = 1 << 40;
             let par_timer = prof::Timer::new(&prof::PAR_LOOP_WALL);
+            let profile_parallel = ast::telemetry::Span::new("PAR_LOOP_WALL");
             // Decompile every function in parallel. Each function is independent
             // (its only cross-function coupling was the shared monotonic id
             // counter, now made per-function and scheduling-independent via the
@@ -459,6 +983,11 @@ fn try_decompile_bytecode_internal(
                     // serial tail into a rayon region without an equivalent re-base.
                     ast::set_local_id_base(id_base + func_idx as u64 * ID_STRIDE);
                     let function_id = function.id;
+                    let readonly_upvalues = capture_effects.readonly.get(function_id)
+                        .map(Vec::as_slice).unwrap_or(&[]);
+                    let written_slots = capture_effects.refusal.is_none().then_some(capture_effects.written.as_slice());
+                    let _profile_context = ast::telemetry::enter(profile_context.as_ref().map(|c| c.prototype(function_id)));
+                    let _profile_function = ast::telemetry::Span::new("FUNCTION");
                     let mut args = std::panic::AssertUnwindSafe(Some((
                         ast_function.clone(),
                         function,
@@ -472,13 +1001,23 @@ fn try_decompile_bytecode_internal(
                     // set_hook/take_hook corrupts the hook. catch_unwind alone
                     // isolates the per-function panic.
                     let result = panic::catch_unwind(move || {
+                        let _function_timer = prof::Timer::new(&prof::F_TOTAL);
                         let (ast_function, function, upvalues_in) = args.take().unwrap();
-                        decompile_function(ast_function, function, upvalues_in)
+                        decompile_function(
+                            ast_function,
+                            function,
+                            upvalues_in,
+                            options.control_flow_policy,
+                            readonly_upvalues,
+                            written_slots,
+                            sharing,
+                        )
                     });
 
                     match result {
                         Ok(r) => r,
                         Err(e) => {
+                            ast::telemetry::count("panicked_functions", 1);
                             let panic_information = match e.downcast::<String>() {
                                 Ok(v) => *v,
                                 Err(e) => match e.downcast::<&str>() {
@@ -510,13 +1049,33 @@ fn try_decompile_bytecode_internal(
                             // dropping its code.
                             body.body.extend(unsupported_structuring_sentinel().0);
                             drop(body);
-                            (ByAddress(ast_function), Vec::new())
+                            (
+                                ByAddress(ast_function),
+                                Vec::new(),
+                                Some(DecompileDiagnostic {
+                                    stage: "function".to_string(),
+                                    code: "panic".to_string(),
+                                    function: format!("p{function_id}"),
+                                    message: panic_information,
+                                }),
+                                None,
+                            )
                         }
                     }
                 })
                 .collect::<Vec<_>>();
             drop(par_timer);
-            let mut upvalues = decompiled.into_iter().collect::<FxHashMap<_, _>>();
+            drop(profile_parallel);
+            let mut function_diagnostics = Vec::new();
+            let mut function_traces = Vec::new();
+            let mut upvalues = FxHashMap::default();
+            for (function, values, diagnostic, trace) in decompiled {
+                if let Some(trace) = trace { function_traces.push(trace); }
+                if let Some(diagnostic) = diagnostic {
+                    function_diagnostics.push(diagnostic);
+                }
+                upvalues.insert(function, values);
+            }
 
             // The rayon driver thread participated in the pool, so its thread-local
             // id counter is now left at some function's (scheduling-dependent)
@@ -530,64 +1089,154 @@ fn try_decompile_bytecode_internal(
 
             let main = ByAddress(main);
             upvalues.remove(&main);
-            let mut body = Arc::try_unwrap(main.0).unwrap().into_inner().body;
+            let main_function = Arc::try_unwrap(main.0).unwrap().into_inner();
+            let mut body = main_function.body;
+            let mut chunk_orphans = main_function.orphans;
+            // Whether a nested function kept an orphan aside for the
+            // de-inliner, or left a function-name fold to it.
+            let (nested_orphans, named_store_folds) = upvalues.keys().fold((false, false), |(orphans, folds), function| {
+                let function = function.0.lock();
+                (orphans || !function.orphans.is_empty(), folds || function.named_store_fold)
+            });
+            let folded_slots = folded_capture_slots(&chunk);
+            let fresh_copies;
             let mut linked_upvalue_bindings = BTreeMap::new();
             {
                 ptime!(S_LINK_UPVALUES);
                 link_upvalues(&mut body, &mut upvalues);
+                // Copies of one shared closure constant its cache makes anew
+                // on every run, then literals whose captured constant Luau
+                // folded, read it again.
+                fresh_copies = loaded_constants.mark_uncached_copies(&body);
+                ast::folded_captures::read_folded_captures(&mut body, &folded_slots, &upvalues);
                 if emit_upvalue_analysis {
                     collect_linked_upvalue_bindings(&mut body, &mut linked_upvalue_bindings);
                 }
             }
+            // Keyed by every function body: kept, it would make each body look
+            // shared to the passes that copy a shared one before changing it.
+            drop(upvalues);
+            // Opt-in, read-only stage snapshots for output-quality investigation.
+            // Formatting has no emission observer here and never assigns names.
+            let dump_stages = std::env::var("MEDAL_DUMP_AST_STAGES").ok();
+            let dump_stage = |stage: &str, body: &ast::Block| {
+                if dump_stages.as_deref().is_some_and(|selection|
+                    selection == "all" || selection.split(',').any(|selected| selected.trim() == stage))
+                {
+                    eprintln!("---- AST-STAGE {stage} {} ----\n{body}\n---- END AST-STAGE {stage} ----",
+                        script_name.unwrap_or("?"));
+                }
+            };
+            dump_stage("linked", &body);
             // Reverse continuation cloning introduced while structuring inlined
             // early returns.  This is the structured cross-jumping half of P1:
             // exact common tails are shared before the statement de-inliner tries
             // to recover helper calls from the now-compact regions.
-            ast::factor_common_tails::factor_common_tails(&mut body);
+            if std::env::var_os("MEDAL_DUMP_PRE_DEINLINE").is_some() {
+                eprintln!(
+                    "---- PRE-DEINLINE {} ----
+{body}
+---- END PRE-DEINLINE ----",
+                    script_name.unwrap_or("?")
+                );
+            }
+            {
+                let _t = crate::prof::Timer::new(&crate::prof::S_FACTOR_INITIAL);
+                let span = ast::telemetry::Span::ast("S_FACTOR_INITIAL", &body, true);
+                let changed = ast::factor_common_tails::factor_common_tails(&mut body);
+                ast::telemetry::count("changed_calls", u64::from(changed));
+                span.finish_ast(&body, true);
+            }
             loop {
-                ptime!(S_DEINLINE);
-                ast::deinline::deinline(&mut body);
+                ast::telemetry::count("deinline_factor_iterations", 1);
+                {
+                    let _t = crate::prof::Timer::new(&crate::prof::S_DEINLINE);
+                    let span = ast::telemetry::Span::ast("S_DEINLINE", &body, true);
+                    ast::deinline::deinline_orphans_in(&mut body, &mut chunk_orphans, nested_orphans);
+                    span.finish_ast(&body, true);
+                }
                 // Replacing an inlined region by a call can make formerly
                 // different branch tails identical. Cross-jump those fresh
                 // tails, then let de-inline consume any newly exposed site.
-                if !ast::factor_common_tails::factor_common_tails(&mut body) {
+                let changed = {
+                    let _t = crate::prof::Timer::new(&crate::prof::S_FACTOR_FIXEDPOINT);
+                    let span = ast::telemetry::Span::ast("S_FACTOR_FIXEDPOINT", &body, true);
+                    let changed = ast::factor_common_tails::factor_common_tails(&mut body);
+                    ast::telemetry::count("changed_calls", u64::from(changed));
+                    span.finish_ast(&body, true);
+                    changed
+                };
+                if !changed {
                     break;
                 }
             }
+            {
+                // The function-name folds the SSA inliner left for the
+                // de-inliner: `M.F = F` -> `function M.F` where no call of
+                // `F` was rebuilt.
+                let _span = ast::telemetry::Span::new("S_FOLD_FUNCTION_NAMES");
+                if named_store_folds {
+                    ast::fold_function_names::fold_function_names(&mut body);
+                }
+            }
+            dump_stage("statement_deinline", &body);
             // Tier-B fallback for terminal continuations that cannot be hoisted
             // through every structured branch. It has its own bounded fixed point;
             // running de-inline again was measured byte-identical on the corpus.
             if !options.no_synth_helpers {
+                ptime!(S_SYNTH_HELPERS);
                 ast::synthesize_terminal_helpers::synthesize_terminal_helpers(&mut body);
             }
             {
                 ptime!(S_CLEANUP_RETURNS);
                 ast::cleanup_returns::cleanup_redundant_returns(&mut body);
+                ast::flatten_guards::flatten_terminal_tail_guards(&mut body);
             }
             // Restore the per-iteration snapshot of a by-value (`Upvalue::Copy`)
             // capture that out-of-SSA coalescing merged onto a mutated (loop)
             // variable (C6). Runs before `name_locals` so the `local snap = L` it
             // mints gets named, and before `inline_temps`/`copy_cleanup` (which then
             // protect it as a captured local).
+            //
+            // First, inlined copies of one shared closure constant that
+            // de-inline left behind become one binding wherever their identity
+            // can be compared (`closure_identity`). The closures recorded while
+            // lifting tell when no copies exist, which skips the walk.
             {
                 ptime!(S_MATERIALIZE);
+                loaded_constants.share(&mut body);
                 ast::materialize_value_captures::materialize_value_captures(&mut body);
             }
+            {
+                ptime!(S_ARITH_DEINLINE);
+                let span = ast::telemetry::Span::ast("S_ARITHMETIC_DEINLINE_EARLY", &body, true);
+                ast::expr_deinline::arithmetic_deinline_early(&mut body);
+                span.finish_ast(&body, true);
+            }
+            dump_stage("arithmetic_deinline", &body);
             {
                 ptime!(S_REHOIST_CONSTANTS);
                 ast::rehoist_constants::rehoist_constants(&mut body);
             }
-            {
+            if options.synthesize_arithmetic_loops {
+                ptime!(S_REROLL_ARITHMETIC);
+                ast::reroll_arithmetic::reroll_arithmetic(&mut body);
+            }
+            // `x, y = f()` before naming sees the call's results land in `x, y`.
+            ast::fold_tuple_copies::fold_tuple_copies(&mut body);
+            let legacy_naming = {
                 ptime!(S_NAME_LOCALS);
-                name_locals_with_options(
+                name_locals_with_evidence(
                     &mut body,
                     true,
                     script_name,
                     NameLocalOptions {
                         dont_reuse_var: options.dont_reuse_var,
                     },
-                );
-            }
+                    emit_upvalue_analysis,
+                )
+            };
+            dump_stage("named", &body);
             // §2.8: recover OOP colon-method definitions. Runs after name_locals
             // (so first params are named `p`/`pN`) and before inline_temps (whose
             // receiver-deref shapes — `p:sibling()`, `p._field`, `p.field = ..` —
@@ -601,9 +1250,24 @@ fn try_decompile_bytecode_internal(
                 ptime!(S_INLINE_TEMPS_1);
                 ast::inline_temps::inline_single_use_temps(&mut body);
             }
+            dump_stage("inline_temps", &body);
+            // V2 keeps branch assignments/returns as statements. Select/phi
+            // binding analysis happens before SSA destruction; emission does
+            // not need to fold those regions into IfExpression initializers.
             {
                 ptime!(S_COND_EXPRS);
-                ast::conditional_expressions::reconstruct_conditional_expressions(&mut body);
+                if options.compact_style {
+                    ast::conditional_expressions::reconstruct_conditional_expressions(&mut body);
+                } else {
+                    ast::conditional_expressions::reconstruct_short_circuit_expressions(&mut body);
+                }
+            }
+            // Expression helpers whose sites are already whole: rebuilt here,
+            // the copies Luau made of their arguments fold into the call below
+            // like any other argument temp. The later run takes the rest.
+            {
+                ptime!(S_EXPR_DEINLINE);
+                ast::expr_deinline::expr_deinline(&mut body);
             }
             // Rebuild declarative table trees from the leaves upward. Inlining a
             // child table can make a parent's formerly-separated field writes
@@ -613,6 +1277,7 @@ fn try_decompile_bytecode_internal(
                 ptime!(S_REBUILD_TABLES);
                 ast::inline_temps::rebuild_ui_expression_trees(&mut body);
             }
+            dump_stage("ui_rebuild", &body);
             // Calls make property-assignment receivers hard to scan and can
             // already exist before the UI inliner. Restore the single-value
             // receiver temp after all UI-tree collapsing is complete.
@@ -630,38 +1295,30 @@ fn try_decompile_bytecode_internal(
                 ptime!(S_COPY_CLEANUP);
                 ast::copy_cleanup::copy_cleanup(&mut body);
             }
+            dump_stage("copy_cleanup", &body);
             // Eliminate redundant `x = nil` stores left by SSA phi-node
             // materialization (a predeclared `local x` then explicit `x = nil` on
             // every path it stays nil). A forward "definitely-nil" dataflow deletes
-            // a `x = nil` only when x is provably already nil there. Runs AFTER
-            // `reconstruct_conditional_expressions` (214) — which needs the
-            // predecl+phi diamond to recover `if c then A else nil` ternaries — and
-            // after the write-count-gated `inline_single_use_temps`/`copy_cleanup`
+            // a `x = nil` only when x is provably already nil there. Runs after
+            // the write-count-gated `inline_single_use_temps`/`copy_cleanup`
             // (whose decisions a write-count change here must not perturb). BEFORE
             // `recover_guard_continue` (which must stay last).
             {
                 ptime!(S_ELIMINATE_NIL);
                 ast::eliminate_nil::eliminate_redundant_nil(&mut body);
             }
-            // C13: re-target a dropped connection write `local _ = sig:Connect(
-            // function() ... cell:Disconnect() ... end)` back to the captured `cell`
-            // the SSA orphaned (the parent never models the closure's by-ref write).
-            {
-                ptime!(S_RECOVER_CONN);
-                ast::recover_dropped_connection::recover_dropped_connection(&mut body);
-            }
             // Expression-level de-inline (proposal §7): recover small pure scalar
             // helpers that `-O2` inlined as a sub-expression of a caller's
-            // condition/RValue. MUST run after reconstruct_conditional_expressions
-            // (IfExpression/and/or now exist) and BEFORE normalize_conditions: the
+            // condition/RValue. Runs before normalize_conditions: the
             // latter De-Morgans a `not (helper-body)` call-site copy into a
             // disjunction that no longer matches the conjunctive helper body. Run
-            // here and both sides are the same freshly-reconstructed tree; the
+            // here while both sides retain their reconstructed expression trees; the
             // emitted `not helperName(args)` is then preserved by normalize.
             {
                 ptime!(S_EXPR_DEINLINE);
                 ast::expr_deinline::expr_deinline(&mut body);
             }
+            dump_stage("expression_deinline", &body);
             // Balance only after expression de-inline has had the original
             // scalar tree available for helper matching. Expanding a long
             // conditional before this point would hide recoverable helpers such
@@ -676,6 +1333,7 @@ fn try_decompile_bytecode_internal(
                 ptime!(S_CLEANUP_FINAL);
                 ast::cleanup_final::cleanup_final(&mut body, script_name);
             }
+            dump_stage("cleanup_final", &body);
             // Normalize boolean/condition shapes (proposal §10): collapse
             // reconstructed `if c then a else b` ternaries into and/or/not and
             // De-Morgan `not (...)` conditions. NaN-safe by default (relational
@@ -683,14 +1341,16 @@ fn try_decompile_bytecode_internal(
             // generic reducer, so it is safe before recover_guard_continue.
             {
                 ptime!(S_NORMALIZE_CONDS);
+                ast::terminal_returns::reconstruct_terminal_returns(&mut body);
+                dump_stage("terminal_returns", &body);
                 ast::canonicalize_branches::canonicalize_branches(&mut body);
-                ast::normalize_conditions::normalize_conditions_with_options(
+                ast::normalize_conditions::normalize_for_statement_output(
                     &mut body,
                     options.assume_no_nan,
                 );
             }
-            // MUST remain the last condition-changing AST transform. Do not
-            // insert any reduce/reduce_condition/normalize pass after it: the
+            // MUST remain the last pass that reduces/complements conditions.
+            // Later select lowering only wraps values in literal `not`; the
             // manufactured `not (a < b)` would be turned into the NaN-unsafe
             // `a >= b` if any later pass reduced it.
             {
@@ -705,47 +1365,320 @@ fn try_decompile_bytecode_internal(
             {
                 ptime!(S_CLEANUP_RETURNS);
                 ast::cleanup_returns::cleanup_redundant_returns(&mut body);
+                ast::flatten_guards::flatten_terminal_tail_guards(&mut body);
             }
+            dump_stage("final_guards", &body);
             // Luau has no `goto` or labels.  The structurer uses them only as an
             // internal edge representation, so allowing either AST node to reach
             // formatting would produce source that Luau cannot parse.  Keep this
             // as a hard chunk-level invariant (including every nested closure): a
             // future unsupported CFG shape must be reported as a decompile error,
             // never silently returned as invalid Luau.
-            if ast::simplify_gotos::function_tree_has_goto_or_label(&body)
-                || ast::simplify_gotos::function_tree_has_unlowered_control(&body)
-            {
-                return Err(
-                    "control-flow structuring failed: residual goto/label would be invalid Luau"
-                        .to_string(),
-                );
+            if ast::simplify_gotos::function_tree_has_residual_control(&body) {
+                if function_diagnostics.is_empty() {
+                    function_diagnostics.push(DecompileDiagnostic {
+                        stage: "final_invariant".to_string(),
+                        code: "residual_control_flow".to_string(),
+                        function: format!("root:p{}", chunk.main),
+                        message: "final AST still contains an internal goto/label or loop marker"
+                            .to_string(),
+                    });
+                }
+                return Err(DecompileFailure {
+                    message:
+                        "control-flow structuring failed: residual goto/label would be invalid Luau"
+                            .to_string(),
+                    diagnostics: function_diagnostics,
+                });
             }
-            let (out, source_occurrences) = {
+            // The final naming graph must not keep RcLocal references alive
+            // during earlier cleanup (some passes inspect reference counts).
+            let mut local_producers = Vec::new();
+            // Lower remaining scalar selects at their evaluation point. Only
+            // literal `not` break guards are introduced; comparisons are never
+            // complemented. No expression cleanup may erase these snapshots.
+            let conditional_lowering = if chunk.version == 9 && !options.compact_style {
+                ptime!(S_LOWER_SELECTS);
+                let report = ast::lower_conditionals::lower_existing_conditionals(&mut body);
+                if options.emit_binding_provenance {
+                    local_producers.push(ast::local_producers::Pass {
+                        pass: "conditional_lowering", rewrite_model: report.model,
+                        introduced_locals: report.introduced_locals, ledger: report.introduced_bindings.clone(),
+                    });
+                }
+                ast::telemetry::count("select_input", report.input_selects as u64);
+                ast::telemetry::count("select_lowered", report.lowered_selects as u64);
+                ast::telemetry::count("select_locals", report.introduced_locals as u64);
+                ast::telemetry::count("select_refused_statements", report.refused_statements.values().sum::<usize>() as u64);
+                ast::telemetry::count("select_budget_exhausted", u64::from(report.budget_exhausted));
+                emit_upvalue_analysis.then(|| serde_json::to_value(report).expect("finite select report"))
+            } else { None };
+            let late_timer = prof::Timer::new(&prof::S_LATE);
+            // Repeating decimals as the fractions the compiler folded. Every
+            // pass before this one sees the raw literals, as the de-inliner's
+            // constant-folded argument recovery (E2) will need.
+            {
+                let _span = ast::telemetry::Span::new("S_SPELL_CONSTANTS");
+                let numbers = chunk.functions.iter().flat_map(|function| &function.constants).filter_map(|constant| match constant {
+                    deserializer::constant::Constant::Number(number) => Some(*number),
+                    _ => None,
+                });
+                ast::spell_constants::Fractions::of_constants(numbers).spell(&mut body);
+            }
+            if options.assume_standard_libraries {
+                ast::library_constants::spell_library_constants(&mut body, pristine_libraries(&globals));
+            }
+            if chunk.functions.iter().any(|function| function.constants.iter().any(|constant| {
+                matches!(constant, deserializer::constant::Constant::Vector(..)
+                    | deserializer::constant::Constant::VectorD(..))
+            })) {
+                if let Some(pass) = ast::materialize_vectors::materialize_vectors(&mut body)
+                    .map_err(DecompileFailure::message)?
+                {
+                    if options.emit_binding_provenance { local_producers.push(pass); }
+                }
+            }
+            if options.compact_style {
+                let _span = ast::telemetry::Span::new("S_COMPACT_CONDITIONALS");
+                ast::compact_conditionals::compact_conditionals(&mut body);
+            }
+            // A closure the bytecode makes anew stays new where the output
+            // would share it (`fresh_closures`).
+            if fresh_copies > 0 || may_print_shared_fresh_closures(&chunk, !folded_slots.is_empty()) {
+                let _span = ast::telemetry::Span::new("S_FRESH_CLOSURES");
+                ast::fresh_closures::keep_fresh_closures(&mut body);
+            }
+            ast::forward_declarations::bare_forward_declarations(&mut body);
+            ast::compound_bases::fold_compound_bases(&mut body);
+            ast::fold_import_callees::fold_import_callees(&mut body);
+            ast::untruncate_arguments::untruncate_arguments(&mut body);
+            // List stores come from SETLIST alone (an AUX word reading as one
+            // only costs the walk).
+            if chunk.functions.iter().any(|function| function.instructions.iter().any(|instruction| {
+                matches!(instruction, instruction::Instruction::BC { op_code: op_code::OpCode::LOP_SETLIST, .. })
+            })) {
+                let _span = ast::telemetry::Span::new("S_RESERVE_LIST_SLOTS");
+                ast::rebuild_table_literals::reserve_unfolded_list_slots(&mut body)
+                    .map_err(DecompileFailure::message)?;
+            }
+            drop(late_timer);
+            // Temporaries left apart for the folding passes may, where some
+            // did not fold, push a huge function past the local or register
+            // limit, as may source locals of `do` blocks the output flattens:
+            // decompile again sharing more storage up front, and last with
+            // branches written as `if` expressions. A source Luau refuses is
+            // no output.
+            let over_limit = if ast::coalesce_locals::declared_locals_exceed_limit(&body) {
+                Some("more locals at once than Luau allows (200)")
+            } else if ast::register_pressure::registers_exceed_limit(&body) {
+                Some("more registers than Luau allows (255)")
+            } else {
+                None
+            };
+            if let Some(limit) = over_limit {
+                if let Some(next) = sharing.next() {
+                    ast::telemetry::count("eager_coalescing_retries", 1);
+                    return Ok(DecompileAttempt::Retry(next));
+                }
+                if !options.compact_style {
+                    ast::telemetry::count("compact_style_retries", 1);
+                    return Ok(DecompileAttempt::RetryCompact);
+                }
+                return Err(DecompileFailure::message(format!(
+                    "the output needs {limit}, even with locals sharing storage"
+                )));
+            }
+            // `--!native` compiled the module natively; the hot comment leads
+            // the source. A function's `@native` travels on its own node.
+            if chunk.functions[chunk.main].flags & deserializer::function::LPF_NATIVE_MODULE != 0 {
+                body.0.insert(0, ast::Comment::hot("native").into());
+            }
+            // No expression/condition mutation is permitted after this point.
+            let name_inference = {
+                ptime!(S_REFINE_NAMES);
+                ast::refine_names::refine_final_names(&body, ast::refine_names::Options {
+                    dont_reuse_var: options.dont_reuse_var,
+                    emit_report: emit_upvalue_analysis,
+                    ..Default::default()
+                })
+            };
+            let (out, source_occurrences, emission_map) = {
                 ptime!(S_FORMAT);
                 if emit_upvalue_analysis {
-                    ast::formatter::format_with_source_map(&body, Default::default())
-                        .map_err(|_| "formatting failed".to_string())?
+                    ast::formatter::format_with_emission_map_options(&body, Default::default(), options.emit_binding_provenance, options.compact_annotations)
+                        .map_err(|_| DecompileFailure::message("formatting failed"))?
                 } else {
-                    (body.to_string(), Vec::new())
+                    (body.to_string(), Vec::new(), Default::default())
                 }
             };
-            if prof::on() {
-                prof::dump();
+            if stats::enabled() {
+                stats::record(script_name, stats_scope.finish(&body));
             }
             let upvalue_analysis = raw_upvalue_analysis.map(|raw| {
-                upvalue_analysis::reconcile_bindings(
+                let mut analysis = upvalue_analysis::reconcile_bindings(
                     raw,
                     &linked_upvalue_bindings,
                     &out,
                     &source_occurrences,
-                )
+                );
+                analysis.source_recovery = Some(source_recovery::audit(&chunk, &mut body, &analysis.functions));
+                analysis.name_inference = Some(source_recovery::naming_report(name_inference, legacy_naming));
+                analysis.capture_effects = Some(capture_effects.report());
+                analysis.conditional_lowering = conditional_lowering;
+                if options.emit_binding_provenance {
+                    analysis.binding_provenance = Some(source_recovery::provenance_report(function_traces, &mut body, emission_map, local_producers, call_origins.take_report()));
+                }
+                analysis
             });
-            Ok(DecompileArtifact {
+            Ok(DecompileAttempt::Complete(DecompileArtifact {
                 source: out,
                 upvalue_analysis,
-            })
+            }))
         }
     }
+}
+
+/// A script Roblox could not compile is stored as a zero version byte and the
+/// compiler's message, which is not Luau. Written as comments, one per line:
+/// a lone `\r` ends a Luau comment as `\n` does, so both split lines.
+fn compile_error_source(message: &str) -> String {
+    let message = message.replace("\r\n", "\n");
+    let message = message.trim_end_matches(['\n', '\r']);
+    if message.is_empty() {
+        return "-- Roblox could not compile this script".to_string();
+    }
+    let mut source = String::from("-- Roblox could not compile this script:");
+    for line in message.split(['\n', '\r']) {
+        source.push_str(if line.is_empty() { "\n--" } else { "\n-- " });
+        source.push_str(line);
+    }
+    source
+}
+
+/// Rejects, before lifting, what no source spells, instead of printing
+/// another program: CMPPROTO, a NAMECALL method no identifier names, a NaN
+/// constant with a payload neither `0 / 0` nor `-(0 / 0)` makes, a FASTCALL
+/// whose fallback call names another function than its builtin, a loop
+/// prepared for `next` or `ipairs` over another generator. Only the first
+/// comes from a compiler; the others from patched bytecode.
+fn validate_source_spellings(chunk: &deserializer::chunk::Chunk) -> Result<(), String> {
+    use crate::{instruction::Instruction, op_code::OpCode};
+    use deserializer::constant::Constant;
+    let spelled_nan = |value: f64| !value.is_nan() || value.to_bits() << 1 == 0x7ff8_0000_0000_0000 << 1;
+    let spelled_component = |value: f32| !value.is_nan() || value.to_bits() << 1 == 0x7fc0_0000 << 1;
+    for (prototype, function) in chunk.functions.iter().enumerate() {
+        let string = |constant: u32| match function.constants.get(constant as usize) {
+            Some(Constant::String(index)) => index.checked_sub(1).and_then(|index| chunk.string_table.get(index)).copied(),
+            _ => None,
+        };
+        // The function each register was last loaded with in straight-line
+        // code: the generator a generic loop is prepared over.
+        let mut generators = [Generator::Unknown; 256];
+        let targets = jump_targets(&function.instructions);
+        let mut pc = 0;
+        while let Some(instruction) = function.instructions.get(pc) {
+            let (Instruction::BC { op_code, .. } | Instruction::AD { op_code, .. } | Instruction::E { op_code, .. }) =
+                *instruction;
+            let at = pc;
+            pc += if op_code.has_aux() { 2 } else { 1 };
+            let pc = at;
+            if targets[pc] {
+                generators = [Generator::Unknown; 256];
+            }
+            match *instruction {
+                // With the standard environment a loop prepared for `next` or
+                // `ipairs` iterates the table itself, whatever the generator;
+                // otherwise it calls the generator. Source names one function
+                // for both.
+                Instruction::AD { op_code: op_code @ (OpCode::LOP_FORGPREP_NEXT | OpCode::LOP_FORGPREP_INEXT), a, .. } => {
+                    let paths: &[&str] =
+                        if op_code == OpCode::LOP_FORGPREP_NEXT { &["next", "pairs"] } else { &["ipairs"] };
+                    let names = match generators[usize::from(a)] {
+                        Generator::Import(aux) => import_names(aux, &string),
+                        // Past constant 1023 an import cannot encode its name,
+                        // so the compiler loads the builtin as a global.
+                        Generator::Global(constant) => string(constant).map(|name| ([name, &[][..], &[][..]], 1)),
+                        Generator::Unknown => None,
+                    };
+                    if let Some((names, count)) = names
+                        && !paths.iter().any(|path| names_path(&names[..count], path))
+                    {
+                        return Err(format!(
+                            "a loop prepared for {} iterates through another function ({}) at prototype {prototype}, pc {pc}",
+                            paths[0],
+                            dotted(&names[..count])
+                        ));
+                    }
+                }
+                // Runtime prototype identity cannot be reconstructed as a
+                // truthiness test. Reject before lifting, even in permissive
+                // mode, instead of silently changing which branch executes.
+                Instruction::AD { op_code: OpCode::LOP_CMPPROTO, .. } => return Err(format!(
+                    "unsupported runtime opcode CMPPROTO at prototype {prototype}, pc {pc}: runtime prototype identity has no faithful source predicate"
+                )),
+                // `object:name(...)` is the only syntax for NAMECALL; no other
+                // call keeps its dispatch (a userdata's `__namecall`), its one
+                // read of the object, or its frame. NAMECALLUDATA keeps a
+                // userdata atom in the high half of its key.
+                Instruction::BC { op_code: op_code @ (OpCode::LOP_NAMECALL | OpCode::LOP_NAMECALLUDATA), aux, .. } => {
+                    let key = if op_code == OpCode::LOP_NAMECALLUDATA { aux & 0xFFFF } else { aux };
+                    if !string(key).is_some_and(|name| std::str::from_utf8(name).is_ok_and(ast::valid_source_name)) {
+                        return Err(format!(
+                            "a method name no identifier spells (NAMECALL) at prototype {prototype}, pc {pc}"
+                        ));
+                    }
+                }
+                // With the standard environment a FASTCALL runs the builtin of
+                // its id, otherwise the call after it: source names one function
+                // for both, the builtin's.
+                Instruction::BC {
+                    op_code:
+                        op_code @ (OpCode::LOP_FASTCALL
+                        | OpCode::LOP_FASTCALL1
+                        | OpCode::LOP_FASTCALL2
+                        | OpCode::LOP_FASTCALL2K
+                        | OpCode::LOP_FASTCALL3
+                        | OpCode::LOP_FASTPCALL),
+                    a,
+                    c,
+                    ..
+                } => {
+                    let paths = if op_code == OpCode::LOP_FASTPCALL {
+                        [&["pcall"][..], &["xpcall"][..]].get(usize::from(a)).copied()
+                    } else {
+                        builtins::builtin_paths(a)
+                    };
+                    // A builtin named by compile options (the vector constructor)
+                    // still needs a name source spells.
+                    if let Some((names, count)) = fallback_import(&function.instructions, pc, usize::from(c))
+                        .and_then(|aux| import_names(aux, &string))
+                        && let names = &names[..count]
+                        && !paths.map_or_else(
+                            || names.iter().all(|name| std::str::from_utf8(name).is_ok_and(ast::valid_source_name)),
+                            |paths| paths.iter().any(|path| names_path(names, path)),
+                        )
+                    {
+                        return Err(format!(
+                            "a builtin call names another function ({}) at prototype {prototype}, pc {pc}",
+                            dotted(names)
+                        ));
+                    }
+                }
+                _ => {}
+            }
+            track_generators(&mut generators, instruction);
+        }
+        let spelled = function.constants.iter().all(|constant| match *constant {
+            Constant::Number(value) => spelled_nan(value),
+            Constant::VectorD(x, y, z, _) => [x, y, z].into_iter().all(spelled_nan),
+            Constant::Vector(x, y, z, _) => [x, y, z].into_iter().all(spelled_component),
+            _ => true,
+        });
+        if !spelled {
+            return Err(format!("a NaN constant whose payload no source spelling makes, in prototype {prototype}"));
+        }
+    }
+    Ok(())
 }
 
 fn validate_prototype_graph(
@@ -789,11 +1722,15 @@ fn validate_prototype_graph(
             })?;
             let child = match op_code {
                 crate::op_code::OpCode::LOP_NEWCLOSURE => {
-                    *function.functions.get(index).ok_or_else(|| {
+                    function.functions.get(index).ok_or_else(|| {
                         format!(
                             "malformed prototype graph: prototype {parent} NEWCLOSURE references out-of-range child-table index {index}"
                         )
-                    })?
+                    })?;
+                    // Every serialized child was already range-checked and
+                    // added above. NEWCLOSURE validates the table slot but
+                    // cannot add another graph edge; DUPCLOSURE still can.
+                    continue;
                 }
                 crate::op_code::OpCode::LOP_DUPCLOSURE => {
                     match function.constants.get(index) {
@@ -897,9 +1834,7 @@ pub fn decompile_batch_with_options(
     options: DecompileOptions,
 ) -> Vec<Result<String, String>> {
     use rayon::prelude::*;
-    items
-        .par_iter()
-        .map(|item| {
+    let decompile = |item: &BatchInput<'_>| {
             // `try_decompile_bytecode_with_script_name` already catches per-function
             // panics internally; the outer guard here recovers the rarer panics in
             // lifting or the serial tail so one bad script can't poison the batch.
@@ -916,10 +1851,62 @@ pub fn decompile_batch_with_options(
             }));
             match caught {
                 Ok(result) => result,
-                Err(payload) => Err(format!("panicked: {}", panic_payload_message(&payload))),
+                Err(payload) => Err(format!("panicked: {}", panic_payload_message(payload.as_ref()))),
             }
+        };
+    // A diagnostic run must execute each requested item so traces/counters keep
+    // their input cardinality. Ordinary batches can share immutable results for
+    // identical complete contexts without waiting inside nested Rayon work.
+    if items.len() < 2 || requires_fresh_decompilation() {
+        return items.par_iter().map(decompile).collect();
+    }
+    let (representatives, slots, mut remaining) = batch_layout(items);
+    let mut results = representatives.par_iter().map(|&index| Some(decompile(&items[index])))
+        .collect::<Vec<_>>();
+    slots.into_iter().map(|slot| {
+        remaining[slot] -= 1;
+        if remaining[slot] == 0 { results[slot].take().unwrap() }
+        else { results[slot].as_ref().unwrap().clone() }
+    }).collect()
+}
+
+/// Diagnostic side effects need one full execution per input. Kept shared with
+/// the folder cache, whose artifact key already includes the semantic switch.
+#[doc(hidden)]
+pub fn requires_fresh_decompilation() -> bool {
+    // Bare Wasm has no process environment; enumerating it panics. Worker Env
+    // bindings are separate and are not mapped into std::env diagnostics.
+    #[cfg(all(target_arch = "wasm32", target_os = "unknown"))]
+    { false }
+    #[cfg(not(all(target_arch = "wasm32", target_os = "unknown")))]
+    {
+        std::env::vars_os().any(|(name, _)| {
+            let name = name.to_string_lossy().to_ascii_uppercase();
+            (name.starts_with("MEDAL_") && name != "MEDAL_NO_SHARED_TAIL")
+                || name == "DEINLINE_ANCHOR_TRACE"
         })
-        .collect()
+    }
+}
+
+fn batch_layout(items: &[BatchInput<'_>]) -> (Vec<usize>, Vec<usize>, Vec<usize>) {
+    // Options, executable and semantic environment are constant for this call.
+    // Borrow exact bytecode; hash collisions still require byte equality.
+    let mut contexts = FxHashMap::default();
+    let mut representatives = Vec::new();
+    let mut slots = Vec::with_capacity(items.len());
+    let mut remaining = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let context = (item.bytecode, item.encode_key,
+            item.script_name.and_then(ast::name_locals::script_module_hint));
+        let slot = *contexts.entry(context).or_insert_with(|| {
+            representatives.push(index);
+            remaining.push(0);
+            remaining.len() - 1
+        });
+        remaining[slot] += 1;
+        slots.push(slot);
+    }
+    (representatives, slots, remaining)
 }
 
 /// Extract a human-readable message from a caught-panic payload (mirrors the
@@ -957,66 +1944,322 @@ fn unsupported_structuring_sentinel() -> ast::Block {
     ])
 }
 
-fn decompile_function(
-    ast_function: Arc<Mutex<ast::Function>>,
-    mut function: Function,
-    upvalues_in: Vec<ast::RcLocal>,
-) -> (ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>) {
-    let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) = {
-        ptime!(F_SSA_CONSTRUCT);
-        cfg::ssa::construct(&mut function, &upvalues_in)
-    };
-    let upvalue_to_group = upvalue_in_groups
-        .into_iter()
-        .chain(
-            upvalue_passed_groups
-                .into_iter()
-                .map(|m| (ast::RcLocal::default(), m)),
+fn fallback_has_synthetic_control(fallback: &restructure::CertifiedFallback) -> bool {
+    fallback.synthetic_locals.iter().any(|synthetic| {
+        matches!(
+            synthetic.role,
+            restructure::SyntheticRole::ProgramCounter
+                | restructure::SyntheticRole::DispatchSignal
+                | restructure::SyntheticRole::DispatchExit
         )
-        .flat_map(|(i, g)| g.into_iter().map(move |u| (u, i.clone())))
-        .collect::<IndexMap<_, _>>();
-    // TODO: do we even need this?
-    let local_to_group = local_groups
-        .into_iter()
-        .enumerate()
-        .flat_map(|(i, g)| g.into_iter().map(move |l| (l, i)))
-        .collect::<FxHashMap<_, _>>();
-    // TODO: REFACTOR: some way to write a macro that states
-    // if cfg::ssa::inline results in change then structure_jumps, structure_compound_conditionals,
-    // structure_for_loops and remove_unnecessary_params must run again.
-    // if structure_compound_conditionals results in change then dominators and post dominators
-    // must be recalculated.
-    // etc.
-    // the macro could also maybe generate an optimal ordering?
-    let mut changed = true;
-    while changed {
-        changed = false;
+    })
+}
 
-        let dominators = {
-            ptime!(F_SIMPLE_FAST);
-            simple_fast(function.graph(), function.entry().unwrap())
-        };
-        {
-            ptime!(F_STRUCTURE_JUMPS);
-            changed |= structure_jumps(&mut function, &dominators);
+/// Select the only state-machine fallback through one policy-aware boundary.
+/// Both initial proof rejection and residual-control recovery pass through
+/// this boundary, so neither can bypass strict no-synthetic-control mode.
+fn certified_fallback_for_policy(
+    function: Function,
+    locals_to_ignore: &FxHashSet<ast::RcLocal>,
+    policy: ControlFlowOutputPolicy,
+) -> Option<ast::Block> {
+    let fallback =
+        restructure::lift_certified_fallback_with_ignored_locals(function, locals_to_ignore)?;
+    if policy == ControlFlowOutputPolicy::StrictNoSyntheticControl
+        && fallback_has_synthetic_control(&fallback)
+    {
+        return None;
+    }
+    Some(fallback.block)
+}
+
+/// Diagnostic: dump every block and edge of a lifted CFG to stderr.
+/// Enabled with `MEDAL_DUMP_CFG=1`; never used by production output.
+fn debug_dump_cfg(function: &Function, stage: &str) {
+    use petgraph::visit::EdgeRef;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "==== CFG dump [{stage}] id={} name={:?} entry={:?}
+",
+        function.id,
+        function.name,
+        function.entry()
+    ));
+    let mut nodes = function.graph().node_indices().collect::<Vec<_>>();
+    nodes.sort();
+    for node in nodes {
+        out.push_str(&format!("-- block {}
+", node.index()));
+        if let Some(block) = function.block(node) {
+            for statement in block.iter() {
+                out.push_str(&format!("   {statement}
+"));
+            }
         }
+        for edge in function.graph().edges(node) {
+            out.push_str(&format!(
+                "   -> {} [{:?}] args={:?}
+",
+                edge.target().index(),
+                edge.weight().branch_type,
+                edge.weight()
+                    .arguments
+                    .iter()
+                    .map(|(p, a)| format!("{p} <- {a}"))
+                    .collect::<Vec<_>>()
+            ));
+        }
+    }
+    eprint!("{out}");
+}
+
+/// Render one bytecode parameter type as a source annotation and a naming
+/// hint.
+///
+/// Only exactly recoverable types are annotated: primitives, `Vector3` (the
+/// Roblox host vector type), `buffer`, `thread` and the tagged host userdata
+/// types whose names the chunk carries (`CFrame`, `Color3`, ...).  `table`,
+/// `function` and untagged `userdata` lose their source spelling (`{T}`,
+/// `(a) -> b`, `Player`) in bytecode, so they are not annotated; `function`
+/// and the tagged types still contribute a naming hint.
+fn parameter_type_from_bytecode(
+    tag: u8,
+    userdata_type_names: &[(u8, &[u8])],
+) -> (Option<String>, Option<String>) {
+    use deserializer::function::*;
+    let optional = tag & LBC_TYPE_OPTIONAL_BIT != 0;
+    let base = tag & !LBC_TYPE_OPTIONAL_BIT;
+    let with_optional = |name: &str| {
+        if optional {
+            format!("{name}?")
+        } else {
+            name.to_string()
+        }
+    };
+    match base {
+        LBC_TYPE_NIL => (Some("nil".to_string()), None),
+        LBC_TYPE_BOOLEAN => (Some(with_optional("boolean")), Some("flag".to_string())),
+        LBC_TYPE_NUMBER => (Some(with_optional("number")), None),
+        LBC_TYPE_STRING => (Some(with_optional("string")), None),
+        LBC_TYPE_VECTOR => (Some(with_optional("Vector3")), Some("vector".to_string())),
+        // `buf`, not `buffer`: the `buffer` library global is almost always in
+        // scope wherever a buffer value is, and would force a `buffer2` suffix.
+        LBC_TYPE_BUFFER => (Some(with_optional("buffer")), Some("buf".to_string())),
+        LBC_TYPE_THREAD => (Some(with_optional("thread")), Some("thread".to_string())),
+        LBC_TYPE_FUNCTION => (None, Some("callback".to_string())),
+        LBC_TYPE_TAGGED_USERDATA_BASE..LBC_TYPE_TAGGED_USERDATA_END => {
+            let index = base - LBC_TYPE_TAGGED_USERDATA_BASE;
+            let Some(name) = userdata_type_names
+                .iter()
+                .find(|(candidate, _)| *candidate == index)
+                .map(|(_, name)| String::from_utf8_lossy(name))
+            else {
+                return (None, None);
+            };
+            let Some(hint) = userdata_type_hint(&name) else {
+                return (None, None);
+            };
+            (Some(with_optional(&name)), Some(hint))
+        }
+        _ => (None, None),
+    }
+}
+
+fn userdata_type_hint(name: &str) -> Option<String> {
+    // These built-in hints avoid a trailing digit before the namer's numeric
+    // disambiguation suffix (`point2`, rather than `vector22`).
+    Some(match name {
+        "CFrame" => "cframe".to_string(),
+        "Color3" => "color".to_string(),
+        "Vector2" => "point".to_string(),
+        "UDim2" | "UDim" => "udim".to_string(),
+        "RaycastResult" => "raycastResult".to_string(),
+        "NumberRange" => "range".to_string(),
+        other => {
+            let mut chars = other.chars();
+            chars.next()?.to_lowercase().collect::<String>() + chars.as_str()
+        }
+    })
+}
+
+/// Typed locals need only a role hint. In particular, primitive annotations
+/// such as `number?` and `string` must not be allocated just to discard them.
+fn type_hint_from_bytecode(tag: u8, userdata_type_names: &[(u8, &[u8])]) -> Option<String> {
+    use deserializer::function::*;
+    match tag & !LBC_TYPE_OPTIONAL_BIT {
+        LBC_TYPE_BOOLEAN => Some("flag".to_string()),
+        LBC_TYPE_VECTOR => Some("vector".to_string()),
+        LBC_TYPE_BUFFER => Some("buf".to_string()),
+        LBC_TYPE_THREAD => Some("thread".to_string()),
+        LBC_TYPE_FUNCTION => Some("callback".to_string()),
+        base @ LBC_TYPE_TAGGED_USERDATA_BASE..LBC_TYPE_TAGGED_USERDATA_END => {
+            let index = base - LBC_TYPE_TAGGED_USERDATA_BASE;
+            let (_, name) = userdata_type_names.iter().find(|(candidate, _)| *candidate == index)?;
+            userdata_type_hint(&String::from_utf8_lossy(name))
+        }
+        _ => None,
+    }
+}
+
+/// Per-parameter annotations and naming hints for one prototype, aligned
+/// with its parameter registers (`self` included).  Both vectors are empty
+/// when the prototype carries no signature or the signature does not match
+/// the parameter count.
+pub(crate) fn parameter_types_from_bytecode(
+    type_info: Option<&deserializer::function::FunctionTypeInfo>,
+    parameter_count: usize,
+    userdata_type_names: &[(u8, &[u8])],
+) -> (Vec<Option<String>>, Vec<Option<String>>) {
+    let Some(info) = type_info else {
+        return (Vec::new(), Vec::new());
+    };
+    if info.parameter_types.len() != parameter_count {
+        return (Vec::new(), Vec::new());
+    }
+    info.parameter_types
+        .iter()
+        .map(|&tag| parameter_type_from_bytecode(tag, userdata_type_names))
+        .unzip()
+}
+
+/// Naming hints for the prototype's typed local registers (`local v: Vector3`,
+/// or a local the compiler inferred from a builtin such as `Vector3.new` /
+/// `buffer.create` / `coroutine.create`).  Tags without a naming hint
+/// (`number`, `string`, `table`, `any`) are dropped.  The register/PC ranges
+/// are the compiler's own scope records, so the lifter can attribute each
+/// hint to the exact definitions of that source local.
+pub(crate) fn typed_local_hints_from_bytecode(
+    type_info: Option<&deserializer::function::FunctionTypeInfo>,
+    userdata_type_names: &[(u8, &[u8])],
+) -> Vec<lifter::TypedLocalHint> {
+    let Some(info) = type_info else {
+        return Vec::new();
+    };
+    info.local_types
+        .iter()
+        .filter(|local| local.end_pc > local.start_pc)
+        .filter_map(|local| {
+            type_hint_from_bytecode(local.type_tag, userdata_type_names).map(|name| lifter::TypedLocalHint {
+                register: local.register,
+                start_pc: local.start_pc,
+                end_pc: local.end_pc,
+                name,
+            })
+        })
+        .collect()
+}
+
+/// Diagnostic: dump the compiler-recorded type information of every
+/// prototype (`MEDAL_DUMP_TYPES=1`).  One line per prototype:
+/// `TYPES proto=<id> params=<n> sig=[tags] upvals=[tags] locals=<count>`,
+/// followed by one `TYPES-LOCAL` line per typed local, then a
+/// `TYPES-USERDATA` line listing the tagged userdata names of the chunk.
+fn debug_dump_types(chunk: &deserializer::chunk::Chunk) {
+    let mut out = String::new();
+    for (id, function) in chunk.functions.iter().enumerate() {
+        let Some(info) = function.type_info.as_ref() else {
+            out.push_str(&format!(
+                "TYPES proto={id} params={} sig=none\n",
+                function.num_parameters
+            ));
+            continue;
+        };
+        out.push_str(&format!(
+            "TYPES proto={id} params={} sig={:?} upvals={:?} locals={}\n",
+            function.num_parameters,
+            info.parameter_types,
+            info.upvalue_types,
+            info.local_types.len()
+        ));
+        for local in &info.local_types {
+            out.push_str(&format!(
+                "TYPES-LOCAL proto={id} tag={} reg={} pc={}..{}\n",
+                local.type_tag, local.register, local.start_pc, local.end_pc
+            ));
+        }
+    }
+    out.push_str(&format!(
+        "TYPES-USERDATA {:?}\n",
+        chunk
+            .userdata_type_names
+            .iter()
+            .map(|(index, name)| format!("{index}={}", String::from_utf8_lossy(name)))
+            .collect::<Vec<_>>()
+    ));
+    eprint!("{out}");
+}
+
+/// A valid terminal block cannot gain CFG edges during SSA expression inlining.
+/// Keep malformed/prestructured control on the ordinary cleanup path: a
+/// trailing If can mutate its condition before legacy edge validation fails.
+fn terminal_cleanup_block(function: &Function) -> Option<petgraph::stable_graph::NodeIndex> {
+    if function.graph().node_count() != 1 || function.graph().edge_count() != 0 { return None; }
+    let node = function.entry().as_ref().copied()?;
+    let block = function.block(node)?;
+    ast::telemetry::count("ssa_cleanup_terminal_eligible", 1);
+    block.iter().enumerate().all(|(index, statement)| matches!(statement,
+        ast::Statement::Assign(_) | ast::Statement::Call(_) | ast::Statement::MethodCall(_)
+        | ast::Statement::SetList(_) | ast::Statement::Comment(_) | ast::Statement::Empty(_))
+        || (index + 1 == block.len() && matches!(statement, ast::Statement::Return(_))))
+        .then_some(node)
+}
+
+/// False is the original round/budget schedule, retained as an independent
+/// test oracle. Specialization skips only topology/phi passes proved inert;
+/// the SSA inliner still executes at its original point exactly once.
+fn cleanup_ssa<const SPECIALIZE: bool>(
+    function: &mut Function,
+    local_to_group: &FxHashMap<ast::RcLocal, usize>,
+    cells: &mut CellGroups,
+    incoming_upvalue_ids: &FxHashSet<u64>,
+    mut rounds_left: usize,
+) -> bool {
+    let mut changed = true;
+    let mut dominator_cache = None;
+    while changed {
+        if rounds_left == 0 {
+            return false;
+        }
+        rounds_left -= 1;
+        changed = false;
+        if SPECIALIZE && terminal_cleanup_block(function).is_some() {
+            ast::telemetry::count("ssa_cleanup_terminal_admitted", 1);
+            #[cfg(test)]
+            SSA_CLEANUP_TERMINAL_ADMISSIONS.with(|count| count.set(count.get() + 1));
+            ast::telemetry::count("ssa_cleanup_terminal_statements",
+                function.blocks().next().unwrap().1.len() as u64);
+            ptime!(F_SSA_INLINE);
+            ssa::inline::inline_with_readonly_captures(function, local_to_group,
+                cells.upvalue_to_group, cells.readonly_ids, Some(incoming_upvalue_ids));
+            return true;
+        }
+
+        let dominators = dominator_cache.get_or_insert_with(|| {
+            ptime!(F_SIMPLE_FAST);
+            cfg::dominators::Dominators::new(function.graph(), function.entry().unwrap())
+        });
+        let topology_changed = {
+            ptime!(F_STRUCTURE_JUMPS);
+            structure_jumps(function, dominators)
+        };
+        changed |= topology_changed;
 
         {
             ptime!(F_SSA_INLINE);
-            ssa::inline::inline(&mut function, &local_to_group, &upvalue_to_group);
+            ssa::inline::inline_with_readonly_captures(function, local_to_group,
+                cells.upvalue_to_group, cells.readonly_ids, Some(incoming_upvalue_ids));
         }
 
         let sc = {
             ptime!(F_STRUCTURE_CONDS);
-            structure_conditionals(&mut function)
+            structure_conditionals_with_changes(function, &|local| cells.protected.contains(local))
         };
-        if sc
+        if topology_changed || sc.topology_changed { dominator_cache = None; }
+        if sc.changed
         // || {
         //     let post_dominators = post_dominators(function.graph_mut());
         //     structure_for_loops(&mut function, &dominators, &post_dominators)
         // }
-        // we can't structure method calls like this because of __namecall
-        // || structure_method_calls(&mut function)
         {
             changed = true;
         }
@@ -1025,20 +2268,239 @@ fn decompile_function(
         let rp = {
             ptime!(F_REMOVE_PARAMS);
             ssa::construct::remove_unnecessary_params(
-                &mut function,
+                function,
                 &mut local_map,
-                Some(&upvalue_to_group),
+                Some(cells.upvalue_to_group),
+                Some(local_to_group),
             )
         };
         if rp {
             changed = true;
+            cells.adopt_replacements(&local_map);
         }
         {
             ptime!(F_APPLY_MAP);
-            ssa::construct::apply_local_map(&mut function, local_map);
+            ssa::construct::apply_local_map(function, local_map);
         }
     }
+    true
+}
+
+/// The captured cells of a function as SSA cleanup sees them.
+struct CellGroups<'a> {
+    /// Each version of a cell, by its group root.
+    upvalue_to_group: &'a mut IndexMap<ast::RcLocal, ast::RcLocal>,
+    /// Versions no source-like allocation may reuse.
+    protected: &'a mut FxHashSet<ast::RcLocal>,
+    /// Versions of immutable incoming cells: nothing can change them.
+    readonly_ids: &'a FxHashSet<u64>,
+}
+
+impl CellGroups<'_> {
+    /// A captured cell's version replaced by a value of its register from
+    /// outside the cell (the trivial phi `enabled = phi(flag, enabled)`
+    /// becomes `flag`): that value now is the cell, so it joins the cell's
+    /// group and protection. Otherwise later rounds treat it as a plain
+    /// value, and the inliner folds a copy into it (`a = b`), making `a` and
+    /// `b` one variable.
+    fn adopt_replacements(&mut self, local_map: &FxHashMap<ast::RcLocal, ast::RcLocal>) {
+        let mut adopted = local_map.iter().filter_map(|(from, to)| {
+            let cell = self.upvalue_to_group.get(from)?;
+            let mut to = to;
+            while let Some(next) = local_map.get(to) {
+                to = next;
+            }
+            (!self.upvalue_to_group.contains_key(to)).then(|| (to.clone(), cell.clone()))
+        }).collect::<Vec<_>>();
+        if adopted.is_empty() {
+            return;
+        }
+        adopted.sort_by_key(|(local, _)| local.stable_id());
+        for (local, cell) in adopted {
+            self.protected.insert(local.clone());
+            self.upvalue_to_group.entry(local).or_insert(cell);
+        }
+    }
+}
+
+/// The roots of the cells this function passes (`passed_roots`) that no
+/// closure writes: every closure capturing one by reference leaves that
+/// upvalue unassigned, and so does each closure it hands the upvalue on to
+/// (`written_slots`, from `capture_effects`). Only this function's own
+/// definitions, which SSA sees, then change such a cell.
+fn unwritten_cells(
+    function: &Function,
+    upvalue_to_group: &IndexMap<ast::RcLocal, ast::RcLocal>,
+    mut passed_roots: FxHashSet<ast::RcLocal>,
+    written_slots: Option<&[Vec<bool>]>,
+) -> FxHashSet<ast::RcLocal> {
+    let Some(written_slots) = written_slots else { return FxHashSet::default() };
+    for (_, block) in function.blocks() {
+        for statement in block.iter() {
+            statement.traverse_rvalues_ref(&mut |value| {
+                let ast::RValue::Closure(closure) = value else { return };
+                let prototype = closure.function.0.lock().bytecode_proto_id;
+                for (slot, upvalue) in closure.upvalues.iter().enumerate() {
+                    let ast::Upvalue::Ref(local) = upvalue else { continue };
+                    let Some(cell) = upvalue_to_group.get(local) else { continue };
+                    let assigned = prototype
+                        .and_then(|prototype| written_slots.get(prototype)?.get(slot).copied())
+                        .unwrap_or(true);
+                    if assigned {
+                        passed_roots.remove(cell);
+                    }
+                }
+            });
+        }
+    }
+    passed_roots
+}
+
+#[cfg(test)]
+mod ssa_cleanup_tests;
+
+#[cfg(test)]
+thread_local! {
+    static SSA_CLEANUP_TERMINAL_ADMISSIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+
+fn decompile_function(
+    ast_function: Arc<Mutex<ast::Function>>,
+    mut function: Function,
+    upvalues_in: Vec<ast::RcLocal>,
+    control_flow_policy: ControlFlowOutputPolicy,
+    readonly_upvalues: &[bool],
+    // Per prototype and upvalue slot, whether closures assign it
+    // (`capture_effects`); `None` when that analysis refused.
+    written_slots: Option<&[Vec<bool>]>,
+    sharing: ast::coalesce_locals::Sharing,
+) -> (
+    ByAddress<Arc<Mutex<ast::Function>>>,
+    Vec<ast::RcLocal>,
+    Option<DecompileDiagnostic>,
+    Option<Box<cfg::provenance::FunctionTrace>>,
+) {
+    let function_identity = format!("p{}", function.id);
+    function.minted_ids = ast::current_local_id();
+    let (local_count, local_groups, upvalue_in_groups, upvalue_passed_groups) = {
+        ptime!(F_SSA_CONSTRUCT);
+        cfg::ssa::construct(&mut function, &upvalues_in)
+    };
+    if let Some(trace) = &mut function.provenance { trace.phase = "ssa_cleanup"; }
+    // Every SSA version belonging to an incoming or passed-upvalue group
+    // aliases a captured cell. Keep all of those identities protected
+    // from source-like iterator/result-local allocation; protecting only the
+    // original `upvalues_in` IDs misses versions introduced on a nested
+    // closure's incoming edge and can let a loop register shadow that cell.
+    // Passed groups are canonicalized to fresh dummy locals below, so allocate
+    // those roots once and include the exact same IDs in the protected set.
+    let passed_group_roots = upvalue_passed_groups
+        .iter()
+        .map(|_| ast::RcLocal::default())
+        .collect::<Vec<_>>();
+    // Only numeric IDs are retained: an effect certificate must not add AST
+    // owners or alter the reference-count based reconstruction decisions.
+    let readonly_roots = upvalues_in.iter().zip(readonly_upvalues)
+        .filter_map(|(local, &readonly)| readonly.then_some(local.stable_id()))
+        .collect::<FxHashSet<_>>();
+    let readonly_capture_ids = upvalue_in_groups.iter()
+        .filter(|(root, _)| readonly_roots.contains(&root.stable_id()))
+        .flat_map(|(root, group)| std::iter::once(root).chain(group.iter()))
+        .map(ast::RcLocal::stable_id).collect::<FxHashSet<_>>();
+    // Every other local, including a cell passed to a child closure, is a
+    // register of this function.
+    let incoming_upvalue_ids = upvalue_in_groups.iter()
+        .flat_map(|(root, group)| std::iter::once(root).chain(group.iter()))
+        .map(ast::RcLocal::stable_id).collect::<FxHashSet<_>>();
+    let mut protected_upvalue_locals = upvalue_in_groups
+        .iter()
+        .flat_map(|(root, group)| std::iter::once(root).chain(group.iter()))
+        .chain(upvalue_passed_groups.iter().flat_map(|group| group.iter()))
+        .chain(passed_group_roots.iter())
+        .cloned()
+        .collect::<FxHashSet<_>>();
+    let mut local_capture_bindings = upvalue_passed_groups
+        .iter()
+        .flat_map(|group| group.iter())
+        .chain(passed_group_roots.iter())
+        .cloned()
+        .collect::<FxHashSet<_>>();
+    let passed_roots = passed_group_roots.iter().cloned().collect::<FxHashSet<_>>();
+    let mut upvalue_to_group = upvalue_in_groups
+        .into_iter()
+        .chain(
+            upvalue_passed_groups
+                .into_iter()
+                .zip(passed_group_roots)
+                .map(|(group, root)| (root, group)),
+        )
+        .flat_map(|(i, g)| g.into_iter().map(move |u| (u, i.clone())))
+        .collect::<IndexMap<_, _>>();
+    // The SSA inliner still treats these as cells: this function writes
+    // them, and every version is one variable once destructed.
+    let unwritten_cells = unwritten_cells(&function, &upvalue_to_group, passed_roots, written_slots);
+    // TODO: do we even need this?
+    let local_to_group = local_groups
+        .into_iter()
+        .enumerate()
+        .flat_map(|(i, g)| g.into_iter().map(move |l| (l, i)))
+        .collect::<FxHashMap<_, _>>();
+    {
+        ptime!(F_PRESERVE);
+        cfg::source_bindings::preserve_conditional_results(&function, &protected_upvalue_locals);
+    }
+    // TODO: REFACTOR: some way to write a macro that states
+    // if cfg::ssa::inline results in change then structure_jumps, structure_compound_conditionals,
+    // structure_for_loops and remove_unnecessary_params must run again.
+    // if structure_compound_conditionals results in change then dominators and post dominators
+    // must be recalculated.
+    // etc.
+    // the macro could also maybe generate an optimal ordering?
+    if ast::env_flag!("MEDAL_DUMP_CFG") {
+        eprintln!("CFG parameters id={} {:?}; capture groups {:?}", function.id,
+            function.parameters.iter().map(ast::RcLocal::stable_id).collect::<Vec<_>>(),
+            upvalue_to_group.iter().map(|(local, group)| (local.stable_id(), group.stable_id())).collect::<Vec<_>>());
+        debug_dump_cfg(&function, "pre-inline");
+    }
+    // Each normal round consumes CFG nodes or phi transports. A size-derived
+    // budget also bounds an accidental rewrite cycle without imposing a small
+    // fixed limit on legitimate large functions.
+    let rounds_left = (function.graph().node_count()
+        + function.graph().edge_weights().map(|edge| edge.arguments.len()).sum::<usize>()
+        + 1).saturating_mul(4).max(64);
+    let mut cells = CellGroups {
+        upvalue_to_group: &mut upvalue_to_group,
+        protected: &mut protected_upvalue_locals,
+        readonly_ids: &readonly_capture_ids,
+    };
+    if !cleanup_ssa::<true>(&mut function, &local_to_group, &mut cells, &incoming_upvalue_ids, rounds_left)
+    {
+        ast_function.lock().body = unsupported_structuring_sentinel();
+        return (ByAddress(ast_function), upvalues_in, Some(DecompileDiagnostic {
+            stage: "ssa_cleanup".into(), code: "rewrite_budget_exhausted".into(),
+            function: function_identity, message: "CFG simplification exceeded its size-derived iteration budget".into(),
+        }), function.provenance.take());
+    }
+    // The orphans the SSA inliner kept aside go to the de-inliner.
+    ast_function.lock().orphans = std::mem::take(&mut function.orphans);
+    // Values that took a passed cell's place in cleanup are its versions too.
+    let adopted_captures = upvalue_to_group.iter()
+        .filter(|(local, cell)| local_capture_bindings.contains(*cell) && !local_capture_bindings.contains(*local))
+        .map(|(local, _)| local.clone())
+        .collect::<Vec<_>>();
+    local_capture_bindings.extend(adopted_captures);
     // cfg::dot::render_to(&function, &mut std::io::stdout()).unwrap();
+    if ast::env_flag!("MEDAL_DUMP_CFG") {
+        debug_dump_cfg(&function, "pre-destruct");
+    }
+    if function.provenance.is_some() {
+        cfg::provenance::record_selects(&mut function, "pre_destruct");
+        let bindings = cfg::provenance::binding_ids(&function);
+        let trace = function.provenance.as_mut().unwrap();
+        trace.pre_destruct_bindings = bindings;
+        trace.phase = "ssa_destruction";
+    }
     {
         ptime!(F_DESTRUCT);
         ssa::Destructor::new(
@@ -1047,26 +2509,29 @@ fn decompile_function(
             upvalues_in.iter().cloned().collect(),
             local_count,
         )
+        .with_register_groups(&local_to_group)
+        .with_unwritten_cells(&unwritten_cells)
         .destruct();
     }
+    // Freeze the trace before speculative structuring clones the CFG. This
+    // history contains IDs/strings only and must never keep locals alive.
+    if function.provenance.is_some() {
+        let bindings = cfg::provenance::binding_ids(&function);
+        function.provenance.as_mut().unwrap().post_destruct_bindings = bindings;
+    }
+    let trace = function.provenance.take();
+    // Destruction picks a member/root of each captured-cell group. None of
+    // these SSA identities belongs to an incoming upvalue group.
+    function.local_capture_bindings = local_capture_bindings;
+    if ast::env_flag!("MEDAL_DUMP_CFG") {
+        debug_dump_cfg(&function, "post-destruct");
+    }
     // The proof-driven pass is read-only: it never mutates CFG nodes or nested
-    // AST containers, so its speculative copy can stay shallow.  Keep the
+    // AST containers, so it can borrow the CFG for its proof. Keep the
     // original in an Option so the expensive recursive clone is created only
     // when source-like structuring actually rejects this function (or when a
     // later residual-control check needs a retry).
     let mut fallback_source = Some(function);
-    let source_like_function = fallback_source.as_ref().unwrap().clone();
-    // The legacy matcher does not lower edge arguments (SSA phi copies).  It
-    // must never receive such a graph: if source-like structuring rejects it,
-    // routing through the matcher would silently drop a value transfer and can
-    // produce plausible but incorrect Luau.  The state-machine fallback is the
-    // only path that materializes those parallel copies explicitly.
-    let has_edge_arguments = fallback_source
-        .as_ref()
-        .unwrap()
-        .graph()
-        .edge_weights()
-        .any(|edge| !edge.arguments.is_empty());
     // Source-like structuring may mint temporary export locals while proving
     // nested-loop live-outs.  If that speculative attempt is rejected, rewind
     // the per-function allocator before building the fallback so failed
@@ -1075,67 +2540,63 @@ fn decompile_function(
     let source_like_protected_locals = upvalues_in
         .iter()
         .chain(fallback_source.as_ref().unwrap().parameters.iter())
+        .chain(protected_upvalue_locals.iter())
         .cloned()
         .collect::<FxHashSet<_>>();
-    let params = std::mem::take(&mut fallback_source.as_mut().unwrap().parameters);
+    let params;
     let is_variadic = fallback_source.as_ref().unwrap().is_variadic;
     let mut fallback_function = None;
-    let (mut lifted, used_source_like) = {
+    let mut used_certified_dispatcher = false;
+    // A straight-line function is its own structure. Without a trace (whose
+    // node origins record clones) its statements move out of the CFG instead
+    // of being cloned; such a block can never need the control-flow fallback.
+    let terminal_block = if trace.is_none() {
+        restructure::take_terminal_single_block(fallback_source.as_mut().unwrap())
+    } else { None };
+    let took_terminal_block = terminal_block.is_some();
+    let (mut lifted, used_source_like, source_like_rejection) = {
         ptime!(F_RESTRUCTURE);
-        match restructure::lift_source_like_with_ignored_locals(
-            source_like_function,
-            &source_like_protected_locals,
-        ) {
-            Some(block) => (block, true),
-            None => {
+        let source_like_attempt = match terminal_block {
+            Some(block) => restructure::StructureAttempt::Structured(block),
+            None => restructure::lift_source_like_attempt_borrowed_with_ignored_locals(
+                fallback_source.as_ref().unwrap(),
+                &source_like_protected_locals,
+            ),
+        };
+        params = std::mem::take(&mut fallback_source.as_mut().unwrap().parameters);
+        match source_like_attempt {
+            restructure::StructureAttempt::Structured(block) => (block, true, None),
+            rejection => {
+                let rejection_description = match &rejection {
+                    restructure::StructureAttempt::Unsupported => (
+                        "source_like_unsupported".to_string(),
+                        "source-like structurer has no proven representation".to_string(),
+                    ),
+                    restructure::StructureAttempt::Unsafe(reason) => (
+                        format!("source_like_unsafe_{reason:?}"),
+                        format!("source-like proof rejected: {reason}"),
+                    ),
+                    restructure::StructureAttempt::Structured(_) => unreachable!(),
+                };
+                if ast::env_flag!("MEDAL_DEBUG_RESTRUCTURE") {
+                    let function = fallback_source.as_ref().unwrap();
+                    eprintln!(
+                        "source-like structuring rejected function id={} name={:?}: {:?}",
+                        function.id, function.name, rejection
+                    );
+                }
                 ast::set_local_id_base(source_like_id_base);
-                // Preserve an untouched CFG before any mutating fallback or
-                // legacy matcher consumes the original.  This clone is paid
+                // Preserve an untouched CFG before a fallback consumes the
+                // original. This clone is paid
                 // only on the uncommon source-like rejection path.
                 let function = fallback_source.take().unwrap();
                 fallback_function = Some(function.deep_clone());
-                if has_edge_arguments {
-                    let locals_to_ignore = upvalues_in
-                        .iter()
-                        .chain(params.iter())
-                        .cloned()
-                        .collect();
-                    let block = restructure::lift_fallback_with_ignored_locals(
-                        function,
-                        &locals_to_ignore,
-                    )
-                    .unwrap_or_else(unsupported_structuring_sentinel);
-                    (block, false)
-                } else {
-                    // The legacy pattern matcher predates the fail-closed
-                    // source-like pass and contains a few internal assertions
-                    // for malformed/irreducible CFGs.  A panic here must not be
-                    // converted by the outer per-function guard into a
-                    // comment-only body: that would report success while
-                    // silently erasing the function.  Keep the pristine copy
-                    // for the certified fallback and turn any legacy panic into
-                    // the same explicit failure marker used by other rejected
-                    // shapes.
-                    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        restructure::lift(function)
-                    })) {
-                        Ok(block) => (block, false),
-                        Err(_) => {
-                            ast::set_local_id_base(source_like_id_base);
-                            let locals_to_ignore = upvalues_in
-                                .iter()
-                                .chain(params.iter())
-                                .cloned()
-                                .collect();
-                            let block = restructure::lift_fallback_with_ignored_locals(
-                                fallback_function.as_ref().unwrap().deep_clone(),
-                                &locals_to_ignore,
-                            )
-                            .unwrap_or_else(unsupported_structuring_sentinel);
-                            (block, false)
-                        }
-                    }
-                }
+                used_certified_dispatcher = true;
+                let locals_to_ignore = upvalues_in.iter().chain(params.iter()).cloned().collect();
+                let block =
+                    certified_fallback_for_policy(function, &locals_to_ignore, control_flow_policy)
+                        .unwrap_or_else(unsupported_structuring_sentinel);
+                (block, false, Some(rejection_description))
             }
         }
     };
@@ -1143,35 +2604,64 @@ fn decompile_function(
         ptime!(F_SIMPLIFY_GOTOS);
         simplify_gotos(&mut lifted);
     }
-    if ast::simplify_gotos::block_has_goto_or_label(&lifted)
-        || ast::simplify_gotos::block_has_unlowered_control(&lifted)
+    // Collapse cloned continuations before choosing lexical declarations.
+    // Otherwise their shared SSA identities force branch-private temporaries
+    // into a common ancestor, and late factoring leaves those declarations
+    // stranded outside the helper bodies the de-inliner should recognize.
     {
+        ptime!(F_FACTOR_TAILS);
+        ast::factor_common_tails::factor_function_tails(&mut lifted, &source_like_protected_locals);
+    }
+    let coalesce_timer = prof::Timer::new(&prof::F_COALESCE);
+    // Keep large source-like functions below Luau's 200-local source limit by
+    // coalescing only proven-disjoint generated temporaries.  This pass is
+    // deliberately after structuring/fallback selection and before
+    // `name_locals`, so it cannot affect CFG proofs or declaration naming.
+    // Exhaustion adapters were already placed from CFG edge ownership.
+    // Neither nil-seed history nor a ForOrigin alone would prove their
+    // ordering in a later AST rewrite.
+    ast::coalesce_locals::coalesce_generated_locals_in_function(
+        &mut lifted, &source_like_protected_locals, &params, &upvalues_in, sharing,
+    );
+    drop(coalesce_timer);
+    let checks_timer = prof::Timer::new(&prof::F_CHECKS);
+    let residual = ast::simplify_gotos::block_has_goto_or_label(&lifted)
+        || ast::simplify_gotos::block_has_unlowered_control(&lifted);
+    drop(checks_timer);
+    if residual {
         let locals_to_ignore = upvalues_in.iter().chain(params.iter()).cloned().collect();
         let source_like_end_id = ast::current_local_id();
         if used_source_like {
             ast::set_local_id_base(source_like_id_base);
         }
-        let fallback_function = fallback_function.or_else(|| {
-            fallback_source
-                .take()
-                .map(|function| function.deep_clone())
-        });
-        if let Some(fallback) = fallback_function.and_then(|function| {
-            restructure::lift_fallback_with_ignored_locals(function, &locals_to_ignore)
-        })
-        {
+        let fallback_function = fallback_function
+            .or_else(|| fallback_source.take().map(|function| function.deep_clone()));
+        if control_flow_policy == ControlFlowOutputPolicy::StrictNoSyntheticControl || took_terminal_block {
+            debug_assert!(!took_terminal_block, "a straight-line block has no residual control flow");
+            lifted = unsupported_structuring_sentinel();
+        } else if let Some(fallback) = fallback_function.and_then(|function| {
+            used_certified_dispatcher = true;
+            certified_fallback_for_policy(function, &locals_to_ignore, control_flow_policy)
+        }) {
             lifted = fallback;
         } else {
             // Never retain a partially structured block when the certified
-            // fallback declines the graph.  In particular, a legacy matcher can
-            // leave a comment-only artifact after an internal panic; replacing
-            // it with an unlowered marker makes the final invariant fail closed
-            // instead of silently changing the program.
+            // fallback declines the graph. An unlowered marker makes the final
+            // invariant fail closed instead of silently changing the program.
             lifted = unsupported_structuring_sentinel();
             // Keep the allocator above every id minted by either speculative
             // attempt so later cleanup passes cannot alias one of its locals.
             ast::set_local_id_base(source_like_end_id.max(ast::current_local_id()));
         }
+    }
+    if used_certified_dispatcher
+        && control_flow_policy == ControlFlowOutputPolicy::StrictNoSyntheticControl
+    {
+        // The strict policy is intentionally fail-closed even if a later AST
+        // pass happens to simplify the dispatcher into ordinary loops.  The
+        // caller asked for proof that no synthetic control was needed, and
+        // this function did not have that proof at the structuring boundary.
+        lifted = unsupported_structuring_sentinel();
     }
     {
         ptime!(F_FLATTEN_GUARDS);
@@ -1194,7 +2684,32 @@ fn decompile_function(
     // transitions cross synthetic loop iterations, so declarations live across
     // those transitions must already be known and can be hoisted outside exactly
     // that local dispatcher (without guessing parameters/upvalues).
-    ast::simplify_gotos::structure_irreducible_dispatchers(&mut block.lock());
+    // A dispatcher introduced for an inner region can expose a now-local
+    // direct-label set in its parent. Iterate to a fixed point so one pass
+    // does not leave a validly lowerable residual label behind.
+    while ast::simplify_gotos::structure_irreducible_dispatchers(&mut block.lock()) != 0 {}
+
+    // Capture a typed reason at the function boundary. The final chunk-level
+    // invariant still decides success/failure, but this preserves which
+    // function and which proof stage produced the residual control flow.
+    let diagnostic = {
+        let body = block.lock();
+        ast::simplify_gotos::function_tree_has_residual_control(&body)
+        .then(|| DecompileDiagnostic {
+            stage: "final_invariant".to_string(),
+            code: source_like_rejection
+                .as_ref()
+                .map(|(code, _)| code.clone())
+                .unwrap_or_else(|| "residual_control_flow".to_string()),
+            function: function_identity,
+            message: source_like_rejection
+                .map(|(_, message)| message)
+                .unwrap_or_else(|| {
+                    "structured AST still contains an internal goto/label or loop marker"
+                        .to_string()
+                }),
+        })
+    };
 
     {
         let mut ast_function = ast_function.lock();
@@ -1202,12 +2717,17 @@ fn decompile_function(
         ast_function.parameters = params;
         ast_function.is_variadic = is_variadic;
     }
-    (ByAddress(ast_function), upvalues_in)
+    (ByAddress(ast_function), upvalues_in, diagnostic, trace)
 }
 
 #[cfg(test)]
 mod option_tests {
-    use super::{ASSUME_NO_NAN, DONT_REUSE_VAR, DecompileOptions, NO_SYNTH_HELPERS};
+    use super::{
+        ASSUME_NO_NAN, ControlFlowOutputPolicy, DONT_REUSE_VAR, DecompileOptions, NO_SYNTH_HELPERS,
+        STRICT_NO_SYNTHETIC_CONTROL, certified_fallback_for_policy,
+    };
+    use cfg::function::Function;
+    use rustc_hash::FxHashSet;
 
     #[test]
     fn decompile_option_bits_round_trip() {
@@ -1215,6 +2735,7 @@ mod option_tests {
             dont_reuse_var: true,
             no_synth_helpers: true,
             assume_no_nan: true,
+            ..DecompileOptions::default()
         };
         assert_eq!(
             DecompileOptions::from_flag_bits(options.bits()),
@@ -1226,59 +2747,103 @@ mod option_tests {
         );
         assert!(DecompileOptions::from_flag_bits(1 << 31).is_none());
     }
-}
 
-#[cfg(test)]
-mod warframe_fixtures {
-    use super::{DecompileOptions, try_decompile_warframe_bytecode_with_options};
-
-    fn word(opcode: u8, a: u8, b: u8, c: u8) -> [u8; 4] {
-        (u32::from(opcode) | (u32::from(a) << 8) | (u32::from(b) << 16) | (u32::from(c) << 24))
-            .to_le_bytes()
+    #[test]
+    fn strict_control_policy_round_trips_through_flag_bits() {
+        let options = DecompileOptions {
+            control_flow_policy: ControlFlowOutputPolicy::StrictNoSyntheticControl,
+            ..DecompileOptions::default()
+        };
+        assert_eq!(
+            DecompileOptions::from_flag_bits(options.bits()),
+            Some(options)
+        );
+        assert_ne!(options.bits() & STRICT_NO_SYNTHETIC_CONTROL, 0);
+        assert_eq!(
+            DecompileOptions::from_flag_bits(STRICT_NO_SYNTHETIC_CONTROL)
+                .expect("strict flag is supported")
+                .control_flow_policy,
+            ControlFlowOutputPolicy::StrictNoSyntheticControl
+        );
     }
 
     #[test]
-    fn decompiles_atom_global_without_panicking() {
-        let mut bytecode = vec![
-            9, 3, // bytecode and type versions
-            0, // strings
-            0, // userdata remaps
-            1, // prototypes
-            1, 0, 0, 0, // stack, parameters, upvalues, vararg
-            0, 0, // flags, type information
-            3, // instruction words
-        ];
-        bytecode.extend(word(7, 0, 0, 0)); // GETGLOBAL R0
-        bytecode.extend(0u32.to_le_bytes()); // constant index
-        bytecode.extend(word(22, 0, 2, 0)); // RETURN R0
-        bytecode.extend([1, 1]); // one constant, tag 1
-        bytecode.extend(0x2fdd25fcu32.to_le_bytes());
-        bytecode.extend([0, 0, 0, 0, 0, 0]); // children through main prototype
+    fn loop_synthesis_requires_opt_in_and_survives_option_transport() {
+        assert!(!DecompileOptions::default().synthesize_arithmetic_loops);
+        let enabled = DecompileOptions {
+            synthesize_arithmetic_loops: true,
+            ..DecompileOptions::default()
+        };
+        assert_eq!(enabled.bits(), super::SYNTHESIZE_ARITHMETIC_LOOPS);
+        assert_eq!(DecompileOptions::from_flag_bits(enabled.bits()), Some(enabled));
+        assert_eq!(DecompileOptions::default().union(enabled), enabled);
+        assert_eq!(enabled.union(DecompileOptions::default()), enabled);
+    }
 
-        let source = try_decompile_warframe_bytecode_with_options(
-            &bytecode,
-            None,
-            DecompileOptions::default(),
-        )
-        .unwrap();
-        assert!(source.contains("__wf_atom_2fdd25fc"));
-        let named = super::try_decompile_warframe_bytecode_with_symbols(
-            &bytecode,
-            None,
-            DecompileOptions::default(),
-            &std::collections::BTreeMap::from([(0x2fdd25fc, "module".into())]),
-        )
-        .unwrap();
-        assert!(named.contains("return module"), "{named}");
-        assert!(!named.contains("__wf_atom_"));
-        let unrelated = super::try_decompile_warframe_bytecode_with_symbols(
-            &bytecode,
-            None,
-            DecompileOptions::default(),
-            &std::collections::BTreeMap::from([(0x12345678, "print".into())]),
-        )
-        .unwrap();
-        assert_eq!(unrelated, source);
+    #[test]
+    fn presentation_opt_ins_round_trip_and_union() {
+        let defaults = DecompileOptions::default();
+        assert!(!defaults.compact_style && !defaults.assume_standard_libraries);
+        for (enabled, bit) in [
+            (DecompileOptions { compact_style: true, ..defaults }, super::COMPACT_STYLE),
+            (DecompileOptions { assume_standard_libraries: true, ..defaults }, super::ASSUME_STANDARD_LIBRARIES),
+        ] {
+            assert_eq!(enabled.bits(), bit);
+            assert_eq!(DecompileOptions::from_flag_bits(bit), Some(enabled));
+            assert_eq!(defaults.union(enabled), enabled);
+        }
+    }
+
+    #[test]
+    fn provenance_opt_in_round_trips_and_unions() {
+        let enabled = DecompileOptions {
+            emit_binding_provenance: true,
+            ..DecompileOptions::default()
+        };
+        assert_eq!(DecompileOptions::from_flag_bits(enabled.bits()), Some(enabled));
+        assert_eq!(enabled.bits(), super::EMIT_BINDING_PROVENANCE);
+        assert_eq!(DecompileOptions::default().union(enabled), enabled);
+        assert_eq!(enabled.union(DecompileOptions::default()), enabled);
+    }
+
+    #[test]
+    fn compact_annotations_require_artifact_provenance_and_separate_cache_options() {
+        let compact = DecompileOptions { compact_annotations: true, ..Default::default() };
+        assert_eq!(DecompileOptions::from_flag_bits(compact.bits()), Some(compact));
+        assert_eq!(DecompileOptions::default().union(compact), compact);
+        assert!(super::try_decompile_bytecode_with_options(&[], 1, None, compact)
+            .unwrap_err().contains("compact annotations require"));
+        assert!(!DecompileOptions::default().compact_annotations);
+        assert_ne!(compact.bits(), 0);
+    }
+
+    #[test]
+    fn strict_policy_rejects_certified_dispatcher_after_fallback_selection() {
+        let mut function = Function::new(0);
+        let entry = function.new_block();
+        function.set_entry(entry);
+        function
+            .block_mut(entry)
+            .unwrap()
+            .push(ast::Return::new(Vec::new()).into());
+
+        let allow = certified_fallback_for_policy(
+            function.clone(),
+            &FxHashSet::default(),
+            ControlFlowOutputPolicy::AllowCertifiedDispatcher,
+        );
+        assert!(
+            allow.is_some(),
+            "diagnostic dispatcher mode should allow fallback"
+        );
+        assert!(
+            certified_fallback_for_policy(
+                function,
+                &FxHashSet::default(),
+                ControlFlowOutputPolicy::StrictNoSyntheticControl,
+            )
+            .is_none()
+        );
     }
 }
 
@@ -1286,14 +2851,141 @@ mod warframe_fixtures {
 mod v11_fixtures {
     //! Hand-crafted Luau v11 bytecode fixtures.
     //!
-    //! Roblox ships v9 and the open-source compiler targets v7, so no real v10/v11
-    //! blob exists to test against. These build minimal-but-valid v11 chunks by hand
+    //! These build minimal serialized chunks by hand
     //! to exercise: the per-proto feedback-vector read, the new aux-bearing opcodes
     //! (GETUDATAKS/SETUDATAKS/NAMECALLUDATA/NEWCLASSMEMBER/CALLFB) and the AD-form
     //! CMPPROTO. `encode_key = 1` makes the per-opcode `wrapping_mul` descramble an
     //! identity, so opcode bytes are literal ordinals.
 
     use super::try_decompile_bytecode_with_script_name as decompile;
+
+    #[test]
+    fn renders_parameter_types_from_bytecode() {
+        use crate::deserializer::function::*;
+        let names: Vec<(u8, &[u8])> = vec![(0u8, b"CFrame"), (1u8, b"Color3")];
+        let info = FunctionTypeInfo {
+            parameter_types: vec![
+                LBC_TYPE_TABLE,
+                LBC_TYPE_NUMBER,
+                LBC_TYPE_STRING | LBC_TYPE_OPTIONAL_BIT,
+                LBC_TYPE_VECTOR,
+                LBC_TYPE_FUNCTION,
+                LBC_TYPE_TAGGED_USERDATA_BASE,
+                LBC_TYPE_TAGGED_USERDATA_BASE + 1 | LBC_TYPE_OPTIONAL_BIT,
+                LBC_TYPE_USERDATA,
+                LBC_TYPE_ANY,
+            ],
+            upvalue_types: Vec::new(),
+            local_types: Vec::new(),
+        };
+        let (annotations, hints) = super::parameter_types_from_bytecode(Some(&info), 9, &names);
+        assert_eq!(
+            annotations,
+            vec![
+                None,
+                Some("number".to_string()),
+                Some("string?".to_string()),
+                Some("Vector3".to_string()),
+                None,
+                Some("CFrame".to_string()),
+                Some("Color3?".to_string()),
+                None,
+                None,
+            ]
+        );
+        assert_eq!(
+            hints,
+            vec![
+                None,
+                None,
+                None,
+                Some("vector".to_string()),
+                Some("callback".to_string()),
+                Some("cframe".to_string()),
+                Some("color".to_string()),
+                None,
+                None,
+            ]
+        );
+        // A signature that does not match the parameter count is ignored.
+        assert_eq!(
+            super::parameter_types_from_bytecode(Some(&info), 3, &names),
+            (Vec::new(), Vec::new())
+        );
+        assert_eq!(
+            super::parameter_types_from_bytecode(None, 3, &names),
+            (Vec::new(), Vec::new())
+        );
+    }
+
+    #[test]
+    fn hint_only_type_decoder_matches_annotations_for_every_tag_and_byte_name() {
+        use crate::deserializer::function::*;
+        // The old combined decoder is an independent oracle, including lossy
+        // byte-name decoding, Unicode lowercasing and first-duplicate wins.
+        fn old(tag: u8, names: &[(u8, &[u8])]) -> (Option<String>, Option<String>) {
+            let optional = tag & LBC_TYPE_OPTIONAL_BIT != 0;
+            let annotation = |name: &str| if optional { format!("{name}?") } else { name.to_string() };
+            match tag & !LBC_TYPE_OPTIONAL_BIT {
+                LBC_TYPE_NIL => (Some("nil".into()), None),
+                LBC_TYPE_BOOLEAN => (Some(annotation("boolean")), Some("flag".into())),
+                LBC_TYPE_NUMBER => (Some(annotation("number")), None),
+                LBC_TYPE_STRING => (Some(annotation("string")), None),
+                LBC_TYPE_VECTOR => (Some(annotation("Vector3")), Some("vector".into())),
+                LBC_TYPE_BUFFER => (Some(annotation("buffer")), Some("buf".into())),
+                LBC_TYPE_THREAD => (Some(annotation("thread")), Some("thread".into())),
+                LBC_TYPE_FUNCTION => (None, Some("callback".into())),
+                base @ LBC_TYPE_TAGGED_USERDATA_BASE..LBC_TYPE_TAGGED_USERDATA_END => {
+                    let Some(name) = names.iter().find(|(index, _)| *index == base - LBC_TYPE_TAGGED_USERDATA_BASE)
+                        .map(|(_, name)| String::from_utf8_lossy(name).into_owned()) else { return (None, None); };
+                    let hint = match name.as_str() {
+                        "CFrame" => "cframe".into(),
+                        "Color3" => "color".into(),
+                        "Vector2" => "point".into(),
+                        "UDim2" | "UDim" => "udim".into(),
+                        "RaycastResult" => "raycastResult".into(),
+                        "NumberRange" => "range".into(),
+                        other => {
+                            let mut chars = other.chars();
+                            let Some(first) = chars.next() else { return (None, None); };
+                            first.to_lowercase().collect::<String>() + chars.as_str()
+                        }
+                    };
+                    (Some(annotation(&name)), Some(hint))
+                }
+                _ => (None, None),
+            }
+        }
+        let spellings: &[&[u8]] = &[
+            b"CFrame", b"Color3", b"Vector2", b"UDim2", b"UDim", b"RaycastResult",
+            b"NumberRange", b"Widget42", b"", b"\xff\x80Name", b"\0Name",
+            "\u{130}tem".as_bytes(), "\u{c9}lan".as_bytes(),
+        ];
+        let all_names = (0..32).map(|index| (index, spellings[index as usize % spellings.len()]))
+            .collect::<Vec<_>>();
+        for names in [Vec::new(), all_names, vec![(0, b"".as_slice()), (0, b"CFrame".as_slice())],
+            vec![(0, b"CFrame".as_slice()), (0, b"".as_slice())]] {
+            for tag in 0..=u8::MAX {
+                let expected = old(tag, &names);
+                assert_eq!(super::parameter_type_from_bytecode(tag, &names), expected, "parameter tag {tag}");
+                assert_eq!(super::type_hint_from_bytecode(tag, &names), expected.1, "local tag {tag}");
+            }
+            let mut info = FunctionTypeInfo::default();
+            info.local_types = (0..=u8::MAX).map(|tag| TypedLocal {
+                type_tag: tag, register: tag, start_pc: usize::from(tag), end_pc: usize::from(tag) + 1,
+            }).collect();
+            info.local_types.extend([
+                TypedLocal { type_tag: LBC_TYPE_VECTOR, register: 1, start_pc: 8, end_pc: 8 },
+                TypedLocal { type_tag: LBC_TYPE_BOOLEAN, register: 2, start_pc: 9, end_pc: 3 },
+            ]);
+            let expected = info.local_types.iter().filter(|local| local.end_pc > local.start_pc)
+                .filter_map(|local| old(local.type_tag, &names).1.map(|name| crate::lifter::TypedLocalHint {
+                    register: local.register, start_pc: local.start_pc, end_pc: local.end_pc, name,
+                })).collect::<Vec<_>>();
+            assert_eq!(super::typed_local_hints_from_bytecode(Some(&info), &names), expected);
+        }
+        assert!(super::typed_local_hints_from_bytecode(None, &[]).is_empty());
+    }
 
     // --- opcode ordinals used below ---
     const LOADN: u8 = 4;
@@ -1359,6 +3051,7 @@ mod v11_fixtures {
         function_name: usize,
         /// v11 feedback slots: (slot_type, pc). slot_type 0 == LFT_CALLTARGET.
         feedback: Vec<(u8, u64)>,
+        cost: u64,
     }
 
     fn build_proto(p: &Proto, version: u8) -> Vec<u8> {
@@ -1393,7 +3086,7 @@ mod v11_fixtures {
             }
         }
         if version >= 12 && p.flags & 8 != 0 {
-            out.extend(leb128(0)); // inlinable cost
+            out.extend(leb128(p.cost));
         }
         out
     }
@@ -1414,6 +3107,9 @@ mod v11_fixtures {
         for s in strings {
             out.extend(leb128(s.len() as u64));
             out.extend(s.as_bytes());
+        }
+        if types_version == 3 {
+            out.push(0); // empty userdata type remapping table
         }
         out.extend(leb128(protos.len() as u64));
         for p in protos {
@@ -1444,6 +3140,173 @@ mod v11_fixtures {
         assert!(out.contains("return"), "got: {out:?}");
     }
 
+    /// A loop too long for 16-bit jump offsets reaches its exit and its body
+    /// through `JUMP +1; JUMPX target` trampolines right before FORNPREP and
+    /// FORNLOOP (Luau's long-jump expansion); the loop still pairs up.
+    #[test]
+    fn numeric_loop_through_jump_trampolines() {
+        let op = |op: crate::op_code::OpCode| op as u8;
+        let jumpx = |offset: i32| op(crate::op_code::OpCode::LOP_JUMPX) as u32 | ((offset as u32) << 8);
+        let (jump, fornprep, fornloop) = (
+            op(crate::op_code::OpCode::LOP_JUMP),
+            op(crate::op_code::OpCode::LOP_FORNPREP),
+            op(crate::op_code::OpCode::LOP_FORNLOOP),
+        );
+        let proto = Proto {
+            max_stack: 4,
+            words: vec![
+                ad(LOADN, 0, 2),     // 0: limit
+                ad(LOADN, 1, 1),     // 1: step
+                ad(LOADN, 2, 1),     // 2: counter
+                ad(jump, 0, 1),      // 3: over the trampoline
+                jumpx(5),            // 4: to the exit, 10
+                ad(fornprep, 0, -2), // 5: to the trampoline at 4
+                ad(LOADN, 3, 7),     // 6: body
+                ad(jump, 0, 1),      // 7: over the trampoline
+                jumpx(-3),           // 8: to the body, 6
+                ad(fornloop, 0, -2), // 9: to the trampoline at 8
+                abc(RETURN, 0, 1, 0), // 10
+            ],
+            ..Default::default()
+        };
+        let blob = build_chunk(6, 1, &[], &[proto], 0);
+        let output = decompile(&blob, 1, None).expect("a trampolined loop decompiles");
+        assert!(output.contains("for "), "got: {output}");
+    }
+
+    /// The same trampolines around a generic loop: FORGPREP reaches FORGLOOP
+    /// and FORGLOOP the body through them.
+    #[test]
+    fn generic_loop_through_jump_trampolines() {
+        use crate::op_code::OpCode;
+        let jumpx = |offset: i32| OpCode::LOP_JUMPX as u32 | ((offset as u32) << 8);
+        let (loadnil, jump) = (OpCode::LOP_LOADNIL as u8, OpCode::LOP_JUMP as u8);
+        let proto = Proto {
+            max_stack: 6,
+            words: vec![
+                abc(loadnil, 0, 0, 0),                       // 0: generator
+                abc(loadnil, 1, 0, 0),                       // 1: state
+                abc(loadnil, 2, 0, 0),                       // 2: control
+                ad(jump, 0, 1),                              // 3: over the trampoline
+                jumpx(4),                                    // 4: to FORGLOOP, 9
+                ad(OpCode::LOP_FORGPREP as u8, 0, -2),       // 5: to the trampoline at 4
+                ad(LOADN, 5, 7),                             // 6: body
+                ad(jump, 0, 1),                              // 7: over the trampoline
+                jumpx(-3),                                   // 8: to the body, 6
+                ad(OpCode::LOP_FORGLOOP as u8, 0, -2), 2,    // 9: to the trampoline at 8; two variables
+                abc(RETURN, 0, 1, 0),                        // 11
+            ],
+            ..Default::default()
+        };
+        let blob = build_chunk(6, 1, &[], &[proto], 0);
+        let output = decompile(&blob, 1, None).expect("a trampolined loop decompiles");
+        assert!(output.contains("for "), "got: {output}");
+    }
+
+    /// A global no identifier spells is written `getfenv(1)["name"]`, which
+    /// needs the standard `getfenv` over the environment the global is read
+    /// from: refused once code names getfenv or setfenv (a constant, as a
+    /// global or a key).
+    #[test]
+    fn unspellable_global_in_a_chunk_naming_getfenv_or_setfenv_is_refused() {
+        let setglobal = crate::op_code::OpCode::LOP_SETGLOBAL as u8;
+        let chunk = |words: Vec<u32>, strings: &[&str]| {
+            let constants = (1..=strings.len() as u64).map(const_string).collect();
+            build_chunk(6, 1, strings, &[Proto { max_stack: 1, words, constants, ..Default::default() }], 0)
+        };
+        let read = vec![abc(GETGLOBAL, 0, 0, 0), 0, abc(RETURN, 0, 2, 0)];
+        let output = decompile(&chunk(read.clone(), &["bad name"]), 1, None).unwrap();
+        assert!(output.contains(r#"getfenv(1)["bad name"]"#), "{output}");
+        let assign = vec![abc(GETGLOBAL, 0, 0, 0), 0, abc(setglobal, 0, 0, 0), 1, abc(RETURN, 0, 2, 0)];
+        assert!(decompile(&chunk(assign, &["bad name", "getfenv"]), 1, None).is_err());
+        assert!(decompile(&chunk(read, &["bad name", "setfenv"]), 1, None).is_err());
+    }
+
+    /// Only `object:name(...)` compiles to NAMECALL, and only `0 / 0` and
+    /// `-(0 / 0)` spell a NaN: bytecode patched past either is refused.
+    #[test]
+    fn unspelled_method_and_nan_payload_are_refused() {
+        const NAMECALL: u8 = 20;
+        let namecall = |method: &str| {
+            let words = vec![
+                abc(GETGLOBAL, 0, 0, 0), 0, abc(NAMECALL, 0, 0, 0), 1, abc(CALL, 0, 2, 1), abc(RETURN, 0, 1, 0),
+            ];
+            let constants = vec![const_string(1), const_string(2)];
+            build_chunk(6, 1, &["obj", method], &[Proto { max_stack: 3, words, constants, ..Default::default() }], 0)
+        };
+        assert!(decompile(&namecall("method"), 1, None).unwrap().contains("obj:method()"));
+        assert!(decompile(&namecall("bad name"), 1, None).unwrap_err().contains("method name"));
+        let number = |bits: u64| {
+            let mut constant = vec![2u8];
+            constant.extend(f64::from_bits(bits).to_le_bytes());
+            let words = vec![ad(LOADK, 0, 0), abc(RETURN, 0, 2, 0)];
+            build_chunk(6, 1, &[], &[Proto { max_stack: 1, words, constants: vec![constant], ..Default::default() }], 0)
+        };
+        for spelled in [0x7ff8_0000_0000_0000, 0xfff8_0000_0000_0000] {
+            assert!(decompile(&number(spelled), 1, None).unwrap().contains("(0 / 0)"));
+        }
+        assert!(decompile(&number(0x7ff8_0000_0000_1234), 1, None).unwrap_err().contains("NaN"));
+    }
+
+    /// A FASTCALL runs its builtin by id; only the call after it, run when
+    /// the environment is not the standard one, names it. A fallback naming
+    /// another function has no source spelling.
+    #[test]
+    fn fastcall_fallback_naming_another_function_is_refused() {
+        use crate::op_code::OpCode;
+        let (fastcall1, getimport, call, mov) = (
+            OpCode::LOP_FASTCALL1 as u8,
+            OpCode::LOP_GETIMPORT as u8,
+            OpCode::LOP_CALL as u8,
+            OpCode::LOP_MOVE as u8,
+        );
+        let chunk = |name: &str| {
+            let import = (1u32 << 30) | (0 << 20);
+            let mut import_constant = vec![4u8];
+            import_constant.extend(import.to_le_bytes());
+            let words = vec![
+                abc(fastcall1, 40, 0, 3), // LBF_TYPE on R0, CALL at pc 4
+                abc(mov, 2, 0, 0),
+                ad(getimport, 1, 1),
+                import,
+                abc(call, 1, 2, 2),
+                abc(RETURN, 1, 2, 0),
+            ];
+            let proto = Proto {
+                max_stack: 3, num_params: 1, words, constants: vec![const_string(1), import_constant],
+                ..Default::default()
+            };
+            build_chunk(6, 1, &[name], &[proto], 0)
+        };
+        assert!(decompile(&chunk("type"), 1, None).unwrap().contains("type("));
+        let error = decompile(&chunk("typ "), 1, None).unwrap_err();
+        assert!(error.contains("a builtin call names another function"), "{error}");
+        assert!(decompile(&chunk("typeof"), 1, None).is_err());
+    }
+
+    /// FORNPREP keeps limit and step in registers a source `for` has no name
+    /// for: crafted bytecode reading the limit register after the loop must
+    /// not become `for _ = 1, 3 do end; local v; return v`.
+    #[test]
+    fn numeric_for_hidden_limit_read_after_the_loop_is_refused() {
+        const FORNPREP: u8 = 56;
+        const FORNLOOP: u8 = 57;
+        let proto = Proto {
+            max_stack: 3,
+            words: vec![
+                ad(LOADN, 0, 3),
+                ad(LOADN, 1, 1),
+                ad(LOADN, 2, 1),
+                ad(FORNPREP, 0, 1),
+                ad(FORNLOOP, 0, -1),
+                abc(RETURN, 0, 2, 0),
+            ],
+            ..Default::default()
+        };
+        let blob = build_chunk(6, 1, &[], &[proto], 0);
+        assert!(decompile(&blob, 1, None).is_err());
+    }
+
     #[test]
     fn v12_proto_size_boundary_skips_extensions_and_cost() {
         // Append an unknown byte to the first declared proto and increase only
@@ -1456,11 +3319,14 @@ mod v11_fixtures {
         expected.push(1);
         expected.extend(leb128(0)); // strings
         expected.extend(leb128(2)); // protos
-        let mut first = build_proto(&{
-            let mut p = simple_return_proto(vec![]);
-            p.flags = 8;
-            p
-        }, 12);
+        let mut first = build_proto(
+            &{
+                let mut p = simple_return_proto(vec![]);
+                p.flags = 8;
+                p
+            },
+            12,
+        );
         first.push(0xa5); // unknown trailing per-proto field
         expected.extend(leb128(first.len() as u64));
         expected.extend(first);
@@ -1504,6 +3370,267 @@ mod v11_fixtures {
         assert!(out.contains("1e300"), "got: {out:?}");
         assert!(out.contains("1e-300"), "got: {out:?}");
         assert!(out.contains("16777217"), "got: {out:?}");
+    }
+
+    /// `return pcall(g, h.k)` as compiled with FASTPCALL (v14): the arguments
+    /// are evaluated first and the importable `pcall` is fetched last, in the
+    /// fallback between FASTPCALL and CALL.
+    fn fastpcall_proto(with_fastpcall: bool) -> Proto {
+        const GETTABLEKS: u8 = 15;
+        const FASTPCALL: u8 = crate::op_code::OpCode::LOP_FASTPCALL as u8;
+        let mut words = vec![
+            abc(GETGLOBAL, 1, 0, 0), 0,
+            abc(GETGLOBAL, 2, 0, 0), 1,
+            abc(GETTABLEKS, 2, 2, 0), 2,
+        ];
+        if with_fastpcall {
+            words.push(abc(FASTPCALL, 0, 2, 2));
+        }
+        words.extend([abc(GETGLOBAL, 0, 0, 0), 3, abc(CALL, 0, 3, 0), abc(RETURN, 0, 0, 0)]);
+        Proto {
+            max_stack: 3,
+            words,
+            constants: (1..=4).map(const_string).collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn v14_fastpcall_restores_source_callee_order() {
+        let strings = ["g", "h", "k", "pcall"];
+        let blob = build_chunk(14, 3, &strings, &[fastpcall_proto(true)], 0);
+        let out = decompile(&blob, 1, None).expect("v14 FASTPCALL chunk must decompile");
+        assert_eq!(out.trim(), "return pcall(g, h.k)");
+    }
+
+    #[test]
+    fn late_global_callee_without_fastpcall_stays_ordered() {
+        // The same instruction order without FASTPCALL is not an import
+        // fallback: fetching the callee global remains an ordering barrier.
+        let strings = ["g", "h", "k", "pcall"];
+        let blob = build_chunk(14, 3, &strings, &[fastpcall_proto(false)], 0);
+        let out = decompile(&blob, 1, None).expect("chunk must decompile");
+        assert_ne!(out.trim(), "return pcall(g, h.k)", "got: {out}");
+        assert!(out.contains("pcall("), "got: {out}");
+    }
+
+    #[test]
+    fn v15_is_rejected() {
+        super::install_quiet_panic_hook();
+        let blob = build_chunk(15, 3, &[], &[simple_return_proto(vec![])], 0);
+        let result = std::panic::catch_unwind(|| decompile(&blob, 1, None));
+        assert!(result.map_or(true, |out| out.is_err()));
+    }
+
+    // Frozen pre-U16 validator: retain duplicate adjacency construction,
+    // sorting and error order as an independent differential oracle.
+    fn validate_prototype_graph_reference(
+        functions: &[crate::deserializer::function::Function],
+        main: usize,
+    ) -> Result<(), String> {
+        if main >= functions.len() {
+            return Err(format!(
+                "malformed prototype graph: main prototype {main} is outside {} prototypes",
+                functions.len()
+            ));
+        }
+
+        // Build the graph from both the serialized child table and the closure
+        // constructors that actually instantiate prototypes. DUPCLOSURE edges live
+        // in Constant::Closure and are not represented by Function::functions.
+        let mut adjacency = vec![Vec::new(); functions.len()];
+        for (parent, function) in functions.iter().enumerate() {
+            for &child in &function.functions {
+                if child >= functions.len() {
+                    return Err(format!(
+                        "malformed prototype graph: prototype {parent} references out-of-range child {child}"
+                    ));
+                }
+                adjacency[parent].push(child);
+            }
+            for instruction in &function.instructions {
+                let crate::instruction::Instruction::AD { op_code, d, .. } = instruction else {
+                    continue;
+                };
+                if !matches!(
+                    op_code,
+                    crate::op_code::OpCode::LOP_NEWCLOSURE | crate::op_code::OpCode::LOP_DUPCLOSURE
+                ) {
+                    continue;
+                }
+                let index = usize::try_from(*d).map_err(|_| {
+                    format!(
+                        "malformed prototype graph: prototype {parent} has negative {op_code:?} index {d}"
+                    )
+                })?;
+                let child = match op_code {
+                    crate::op_code::OpCode::LOP_NEWCLOSURE => {
+                        *function.functions.get(index).ok_or_else(|| {
+                            format!(
+                                "malformed prototype graph: prototype {parent} NEWCLOSURE references out-of-range child-table index {index}"
+                            )
+                        })?
+                    }
+                    crate::op_code::OpCode::LOP_DUPCLOSURE => {
+                        match function.constants.get(index) {
+                            Some(crate::deserializer::constant::Constant::Closure(child)) => *child,
+                            Some(_) => {
+                                return Err(format!(
+                                    "malformed prototype graph: prototype {parent} DUPCLOSURE constant {index} is not a closure"
+                                ));
+                            }
+                            None => {
+                                return Err(format!(
+                                    "malformed prototype graph: prototype {parent} DUPCLOSURE references out-of-range constant {index}"
+                                ));
+                            }
+                        }
+                    }
+                    _ => continue,
+                };
+                if child >= functions.len() {
+                    return Err(format!(
+                        "malformed prototype graph: prototype {parent} closure constructor references out-of-range child {child}"
+                    ));
+                }
+                adjacency[parent].push(child);
+            }
+            adjacency[parent].sort_unstable();
+            adjacency[parent].dedup();
+        }
+
+        // Validate every prototype, including unreachable ones, so malformed chunks
+        // cannot become dangerous if a later pass changes traversal roots.
+        let mut state = vec![0u8; functions.len()];
+        for start in 0..functions.len() {
+            if state[start] != 0 {
+                continue;
+            }
+            state[start] = 1;
+            let mut stack = vec![(start, 0usize)];
+            while let Some((proto, next_child)) = stack.last_mut() {
+                let children = &adjacency[*proto];
+                if *next_child == children.len() {
+                    state[*proto] = 2;
+                    stack.pop();
+                    continue;
+                }
+                let parent = *proto;
+                let child = children[*next_child];
+                *next_child += 1;
+                match state[child] {
+                    0 => {
+                        state[child] = 1;
+                        stack.push((child, 0));
+                    }
+                    1 => {
+                        return Err(format!(
+                            "malformed prototype graph: cycle from prototype {parent} to ancestor {child}"
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn prototype_graph_functions(prototypes: &[Proto]) -> Vec<crate::deserializer::function::Function> {
+        let encoded = build_chunk(11, 1, &[], prototypes, 0);
+        let crate::deserializer::bytecode::Bytecode::Chunk(chunk) =
+            crate::deserializer::deserialize(&encoded, 1).unwrap() else { panic!() };
+        chunk.functions
+    }
+
+    #[test]
+    fn prototype_graph_duplicate_edges_preserve_exact_boundary_errors() {
+        let new = |index| ad(crate::op_code::OpCode::LOP_NEWCLOSURE as u8, 0, index);
+        let check = |prototypes: Vec<Proto>, main, expected: Option<&str>| {
+            let functions = prototype_graph_functions(&prototypes);
+            let actual = super::validate_prototype_graph(&functions, main);
+            assert_eq!(actual, validate_prototype_graph_reference(&functions, main));
+            match expected {
+                Some(message) => assert_eq!(actual.unwrap_err(), message),
+                None => assert_eq!(actual, Ok(())),
+            }
+        };
+        check(vec![], 0, Some("malformed prototype graph: main prototype 0 is outside 0 prototypes"));
+        check(vec![simple_return_proto(vec![])], 1,
+            Some("malformed prototype graph: main prototype 1 is outside 1 prototypes"));
+        check(vec![Proto { child_protos: vec![99], words: vec![new(-1)], ..Default::default() }], 0,
+            Some("malformed prototype graph: prototype 0 references out-of-range child 99"));
+        check(vec![Proto { child_protos: vec![1], words: vec![new(i16::MIN)], ..Default::default() }, simple_return_proto(vec![])], 0,
+            Some("malformed prototype graph: prototype 0 has negative LOP_NEWCLOSURE index -32768"));
+        check(vec![Proto { child_protos: vec![1], words: vec![new(1)], ..Default::default() }, simple_return_proto(vec![])], 0,
+            Some("malformed prototype graph: prototype 0 NEWCLOSURE references out-of-range child-table index 1"));
+        check(vec![Proto { words: vec![ad(DUPCLOSURE, 0, -1)], ..Default::default() }], 0,
+            Some("malformed prototype graph: prototype 0 has negative LOP_DUPCLOSURE index -1"));
+        check(vec![Proto { words: vec![ad(DUPCLOSURE, 0, i16::MAX)], ..Default::default() }], 0,
+            Some("malformed prototype graph: prototype 0 DUPCLOSURE references out-of-range constant 32767"));
+        check(vec![Proto { words: vec![ad(DUPCLOSURE, 0, 0)], constants: vec![vec![0]], ..Default::default() }], 0,
+            Some("malformed prototype graph: prototype 0 DUPCLOSURE constant 0 is not a closure"));
+        check(vec![Proto { words: vec![ad(DUPCLOSURE, 0, 0)], constants: vec![const_closure(7)], ..Default::default() }], 0,
+            Some("malformed prototype graph: prototype 0 closure constructor references out-of-range child 7"));
+        // Invalid instructions in later prototypes still precede cycle checking.
+        check(vec![Proto { child_protos: vec![0], ..simple_return_proto(vec![]) },
+            Proto { words: vec![new(-1)], ..Default::default() }], 0,
+            Some("malformed prototype graph: prototype 1 has negative LOP_NEWCLOSURE index -1"));
+        // Unreachable cycles remain invalid; child sorting determines which
+        // backedge is reported when several cycles are present.
+        check(vec![simple_return_proto(vec![]), Proto { child_protos: vec![1], ..simple_return_proto(vec![]) }], 0,
+            Some("malformed prototype graph: cycle from prototype 1 to ancestor 1"));
+        check(vec![Proto { child_protos: vec![2, 1, 2], words: vec![new(0), new(1), new(2)], ..Default::default() },
+            Proto { child_protos: vec![0], ..simple_return_proto(vec![]) },
+            Proto { child_protos: vec![0], ..simple_return_proto(vec![]) }], 0,
+            Some("malformed prototype graph: cycle from prototype 1 to ancestor 0"));
+        check(vec![Proto { words: vec![ad(DUPCLOSURE, 0, 0)], constants: vec![const_closure(1)], ..Default::default() },
+            Proto { words: vec![ad(DUPCLOSURE, 0, 0)], constants: vec![const_closure(0)], ..Default::default() }], 0,
+            Some("malformed prototype graph: cycle from prototype 1 to ancestor 0"));
+        // Maximum positive AD index, repeated instantiations, duplicate child
+        // table entries, and an unused closure constant preserve acceptance.
+        check(vec![Proto { child_protos: vec![1; i16::MAX as usize + 1],
+            words: vec![new(i16::MAX); 2048], constants: vec![const_closure(7)], ..Default::default() },
+            simple_return_proto(vec![])], 0, None);
+    }
+
+    #[test]
+    fn prototype_graph_duplicate_edges_match_reference_for_dags_and_cycles() {
+        for seed in 1..=256u64 {
+            let mut state = seed;
+            let mut random = |limit: usize| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((state >> 32) as usize) % limit
+            };
+            let count = 1 + random(24);
+            let acyclic = seed % 2 == 1;
+            let mut prototypes = Vec::new();
+            for parent in 0..count {
+                let first = if acyclic { parent + 1 } else { 0 };
+                let targets = count - first;
+                let child_protos = if targets == 0 { Vec::new() } else {
+                    (0..random(8)).map(|_| first + random(targets)).collect::<Vec<_>>()
+                };
+                let constants = if targets == 0 { Vec::new() } else {
+                    (0..random(4)).map(|_| const_closure((first + random(targets)) as u64)).collect::<Vec<_>>()
+                };
+                let mut words = Vec::new();
+                for _ in 0..random(20) {
+                    if !child_protos.is_empty() && random(2) == 0 {
+                        words.push(ad(crate::op_code::OpCode::LOP_NEWCLOSURE as u8, 0, random(child_protos.len()) as i16));
+                    } else if !constants.is_empty() {
+                        words.push(ad(DUPCLOSURE, 0, random(constants.len()) as i16));
+                    }
+                }
+                words.push(abc(RETURN, 0, 1, 0));
+                prototypes.push(Proto { words, constants, child_protos, ..Default::default() });
+            }
+            let functions = prototype_graph_functions(&prototypes);
+            for main in [0, count - 1, count, usize::MAX] {
+                let actual = super::validate_prototype_graph(&functions, main);
+                assert_eq!(actual, validate_prototype_graph_reference(&functions, main), "seed={seed}, main={main}");
+                if acyclic && main < count { assert_eq!(actual, Ok(()), "seed={seed}"); }
+            }
+        }
     }
 
     #[test]
@@ -1808,23 +3935,55 @@ mod v11_fixtures {
     }
 
     #[test]
-    fn v11_cmpproto_lowers_to_fallthrough_without_panic() {
-        // LOADN r0,1; CMPPROTO r0 (guard, ignored); return — must not panic.
-        let proto = Proto {
-            max_stack: 1,
-            words: vec![
-                ad(LOADN, 0, 1),
-                ad(CMPPROTO, 0, 0),
-                0, // aux: proto id
-                abc(RETURN, 0, 1, 0),
-            ],
-            ..Default::default()
-        };
-        let blob = build_chunk(11, 1, &[], &[proto], 0);
-        let out = decompile(&blob, 1, None).expect("CMPPROTO chunk must deserialize+lift");
-        // No assertion on content — CMPPROTO has no source form; it must simply
-        // lower to a fall-through and not panic / not desync.
-        let _ = out;
+    fn cmpproto_refuses_inaccurate_source_in_all_modes() {
+        // VM-backed counterexample: nil is not a Luau closure, so the real
+        // guard jumps to 222. The former truthiness lowering emitted 111.
+        for version in [11, 12, 13] {
+            for value in [abc(2, 0, 0, 0), abc(3, 0, 0, 0), ad(LOADN, 0, 1)] {
+                for offset in [0, 1, 3] {
+                    let proto = Proto {
+                        max_stack: 2,
+                        words: vec![value, ad(CMPPROTO, 0, offset), 0,
+                            ad(LOADN, 1, 111), ad(23, 0, 1),
+                            ad(LOADN, 1, 222), abc(RETURN, 1, 2, 0)],
+                        ..Default::default()
+                    };
+                    let blob = build_chunk(version, 3, &[], &[proto], 0);
+                    for allow_dispatcher in [false, true] {
+                        let error = super::try_decompile_bytecode_with_options(
+                            &blob, 1, None, super::DecompileOptions {
+                                control_flow_policy: if allow_dispatcher {
+                                    super::ControlFlowOutputPolicy::AllowCertifiedDispatcher
+                                } else {
+                                    super::ControlFlowOutputPolicy::StrictNoSyntheticControl
+                                },
+                                ..Default::default()
+                            },
+                        ).unwrap_err();
+                        assert!(error.contains("unsupported runtime opcode CMPPROTO"), "{error}");
+                        assert!(error.contains("prototype 0, pc 1"), "{error}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn v12_wide_cost_preserves_next_prototype() {
+        for cost in [0, 127, 128, 1u64 << 32, 1u64 << 63, u64::MAX] {
+            let proto = Proto {
+                max_stack: 1, flags: 8, cost,
+                words: vec![abc(RETURN, 0, 1, 0)],
+                ..Default::default()
+            };
+            let main = Proto {
+                max_stack: 1,
+                words: vec![ad(LOADN, 0, 43), abc(RETURN, 0, 2, 0)],
+                ..Default::default()
+            };
+            let blob = build_chunk(12, 3, &[], &[proto, main], 1);
+            assert_eq!(decompile(&blob, 1, None).unwrap().trim(), "return 43");
+        }
     }
 
     #[test]
@@ -1956,6 +4115,25 @@ mod v11_fixtures {
     fn batch_empty_is_empty() {
         assert!(super::decompile_batch(&[]).is_empty());
     }
+
+    #[test]
+    fn batch_dedup_uses_exact_bytes_decode_key_and_normalized_module_context() {
+        let good = build_chunk(11, 1, &[], &[simple_return_proto(vec![])], 0);
+        let items = [
+            super::BatchInput { bytecode: &good, encode_key: 1, script_name: Some("A/Widget/init.lua") },
+            super::BatchInput { bytecode: &good, encode_key: 1, script_name: Some("B/Widget.lua") },
+            super::BatchInput { bytecode: &good, encode_key: 1, script_name: Some("B/Gadget.lua") },
+            super::BatchInput { bytecode: &good, encode_key: 203, script_name: Some("B/Widget.lua") },
+            super::BatchInput { bytecode: &[99], encode_key: 1, script_name: Some("B/Widget.lua") },
+            super::BatchInput { bytecode: &[99], encode_key: 1, script_name: Some("C/Widget/init.lua") },
+        ];
+        let (representatives, slots, counts) = super::batch_layout(&items);
+        assert_eq!(representatives, [0, 2, 3, 4]);
+        assert_eq!(slots, [0, 0, 1, 2, 3, 3]);
+        assert_eq!(counts, [2, 1, 1, 2]);
+        let expected = items.iter().map(|item| decompile(item.bytecode, item.encode_key, item.script_name)).collect::<Vec<_>>();
+        assert_eq!(super::decompile_batch(&items), expected);
+    }
 }
 
 #[cfg(test)]
@@ -1970,6 +4148,23 @@ mod correctness_regressions {
     const NESTED_LOOP_UPVALUE_REBIND_SOURCE: &str =
         include_str!("../tests/fixtures/nested_loop_upvalue_rebind.luau");
     const NESTED_LOOP_UPVALUE_REBIND: &str = "CwMMBWl0ZW1zBmFjdGl2ZQRkYXRhCmZsb29ySW5kZXgDa2V5BXRhYmxlBmluc2VydAR0YXNrBHdhaXQJZ2V0Rmxvb3JzBXByaW50BXNwYXduAAMOAQEAAAApNQEAAAAAAAAKAQAAGQABABYAAQAGAQAAAgIAAAIDAABMAR0AGgUcAA8GBRgAAAAAGgYZAA8GBRgAAAAAAgcAAAIIAABMBhIAGgoRAA8LCuMBAAAAGgsOAA8LCiYCAAAAGgsLAAkMAAA2DQUAEAQNPgMAAAAQCQ1KBAAAAEo0DAMNAAAADAsIAAAcYIAVCwMBOgbt/wIAAAA6AeL/AgAAABYAAQAJAwEDAgMDAwQDBQUCAwQDBgMHBAAcYIAABAAAAAAHAAAACAAcNQAAAAAAAAATAQAARgEAAAwCAgAABACABAMBAFcCAgIAAAAAGgIQAAYCAQAMAwQAAAAwQBUDAQAVAgABBAQBADQCAAAEAwEAOAIGAAwFBgAAAFBADQYABFcFAgEBAAAAOQL6/xgA6v8LAAAAFgABAAcDCAMJBAAEAIADCgQAADBAAwsEAABQQAEAAQAAAAIABwAWAwAAAQIAB0EAAABAAAAADAEDAAAIEIAGAgAAFQECARYAAQAEBgEDCAMMBAAIEIABAQEAAAAAAg==";
+
+    /// Roblox stores a script it could not compile as a zero version byte and
+    /// the compiler's message (VoltMCP `ReplicatedStorage/BuilderGui`).
+    #[test]
+    fn a_roblox_compile_error_is_written_as_comments() {
+        let decompile = |bytes: &[u8]| super::try_decompile_bytecode_with_script_name(bytes, 1, None).unwrap();
+        assert_eq!(
+            decompile(b"\0:16: Expected identifier when parsing method name, got 'end'"),
+            "-- Roblox could not compile this script:\n-- :16: Expected identifier when parsing method name, got 'end'"
+        );
+        // Every line stays a comment, one ended by a lone carriage return too.
+        assert_eq!(
+            decompile(b"\0first\r\n\nsecond\rthird\n"),
+            "-- Roblox could not compile this script:\n-- first\n--\n-- second\n-- third"
+        );
+        assert_eq!(decompile(b"\0"), "-- Roblox could not compile this script");
+    }
 
     #[test]
     fn nested_loop_reads_live_rebound_upvalue_cell() {
@@ -1989,8 +4184,10 @@ mod correctness_regressions {
 
         assert!(
             !output.lines().any(|line| {
-                let line = line.trim();
-                line.starts_with("local ") && line.ends_with(&stale_alias_suffix)
+                // A snapshot inside rebuild after it assigns the new table is
+                // valid (and can be required before a dynamic callee lookup).
+                // The stale-cell regression hoisted it into the enclosing run.
+                line.starts_with("\tlocal ") && line.ends_with(&stale_alias_suffix)
             }),
             "must not snapshot the captured table before the loop:\n{output}"
         );
@@ -2001,55 +4198,6 @@ mod correctness_regressions {
             }),
             "the numeric loop must read the cell rebound by the child closure:\n{output}"
         );
-    }
-}
-
-fn link_upvalues(
-    body: &mut ast::Block,
-    upvalues: &mut FxHashMap<ByAddress<Arc<Mutex<ast::Function>>>, Vec<ast::RcLocal>>,
-) {
-    for stat in &mut body.0 {
-        stat.traverse_rvalues(&mut |rvalue| {
-            if let ast::RValue::Closure(closure) = rvalue {
-                let old_upvalues = &upvalues[&closure.function];
-                let mut function = closure.function.lock();
-                // TODO: inefficient, try constructing a map of all up -> new up first
-                // and then call replace_locals on main body
-                let mut local_map =
-                    FxHashMap::with_capacity_and_hasher(old_upvalues.len(), Default::default());
-                for (old, new) in
-                    old_upvalues
-                        .iter()
-                        .zip(closure.upvalues.iter().map(|u| match u {
-                            ast::Upvalue::Copy(l) | ast::Upvalue::Ref(l) => l,
-                        }))
-                {
-                    // println!("{} -> {}", old, new);
-                    local_map.insert(old.clone(), new.clone());
-                }
-                link_upvalues(&mut function.body, upvalues);
-                replace_locals(&mut function.body, &local_map);
-            }
-        });
-        match stat {
-            ast::Statement::If(r#if) => {
-                link_upvalues(&mut r#if.then_block.lock(), upvalues);
-                link_upvalues(&mut r#if.else_block.lock(), upvalues);
-            }
-            ast::Statement::While(r#while) => {
-                link_upvalues(&mut r#while.block.lock(), upvalues);
-            }
-            ast::Statement::Repeat(repeat) => {
-                link_upvalues(&mut repeat.block.lock(), upvalues);
-            }
-            ast::Statement::NumericFor(numeric_for) => {
-                link_upvalues(&mut numeric_for.block.lock(), upvalues);
-            }
-            ast::Statement::GenericFor(generic_for) => {
-                link_upvalues(&mut generic_for.block.lock(), upvalues);
-            }
-            _ => {}
-        }
     }
 }
 
@@ -2096,5 +4244,111 @@ fn collect_linked_upvalue_bindings(
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod fresh_closure_gate_tests {
+    use super::*;
+    use deserializer::{chunk::Chunk, constant::Constant, function::Function};
+    use instruction::Instruction::{self, AD, BC};
+    use op_code::OpCode::*;
+
+    fn function(num_parameters: u8, num_upvalues: u8, instructions: Vec<Instruction>, constants: Vec<Constant>, functions: Vec<usize>) -> Function {
+        Function {
+            max_stack_size: 8,
+            num_parameters,
+            num_upvalues,
+            is_vararg: false,
+            flags: 0,
+            instructions,
+            constants,
+            functions,
+            line_defined: 0,
+            function_name: 0,
+            line_gap_log2: None,
+            line_info_delta: None,
+            abs_line_info_delta: None,
+            has_debug_info: false,
+            debug_locals: Vec::new(),
+            debug_upvalue_name_indices: Vec::new(),
+            type_info: None,
+        }
+    }
+
+    fn bc(op_code: op_code::OpCode, a: u8, b: u8) -> Instruction {
+        BC { op_code, a, b, c: 0, aux: 0 }
+    }
+
+    fn ad(op_code: op_code::OpCode, a: u8, d: i16) -> Instruction {
+        AD { op_code, a, d, aux: 0 }
+    }
+
+    /// Main shares a closure (proto 3) and makes proto 1, a function with one
+    /// parameter whose `body` makes proto 2, capturing one value with `capture`.
+    fn chunk(body: Vec<Instruction>, shares: bool) -> Chunk<'static> {
+        let mut main = vec![ad(LOP_NEWCLOSURE, 0, 0), bc(LOP_RETURN, 0, 1)];
+        if shares {
+            main.insert(0, ad(LOP_DUPCLOSURE, 1, 0));
+        }
+        let inner = function(0, 1, vec![bc(LOP_RETURN, 0, 1)], Vec::new(), Vec::new());
+        Chunk {
+            version: 6,
+            string_table: Vec::new(),
+            functions: vec![
+                function(0, 0, main, vec![Constant::Closure(3)], vec![1]),
+                function(1, 0, body, vec![Constant::Number(1.0)], vec![2]),
+                inner,
+                function(0, 0, vec![bc(LOP_RETURN, 0, 1)], Vec::new(), Vec::new()),
+            ],
+            main: 0,
+            userdata_type_names: Vec::new(),
+        }
+    }
+
+    fn makes_closure(prefix: Vec<Instruction>, capture: Instruction) -> Vec<Instruction> {
+        let mut body = prefix;
+        body.extend([ad(LOP_NEWCLOSURE, 3, 0), capture, bc(LOP_RETURN, 3, 2)]);
+        body
+    }
+
+    #[test]
+    fn a_constant_captured_by_value_may_print_shared() {
+        let body = makes_closure(vec![ad(LOP_LOADK, 2, 0)], bc(LOP_CAPTURE, 0, 2));
+        assert!(may_print_shared_fresh_closures(&chunk(body.clone(), true), false));
+        // Without sharing anywhere (-O0), no literal is told apart.
+        assert!(!may_print_shared_fresh_closures(&chunk(body.clone(), false), false));
+        // A capture whose reads Luau folded is -O1 code all the same.
+        assert!(may_print_shared_fresh_closures(&chunk(body.clone(), false), true));
+        // So is a chunk with an import or a constant operand and no shared
+        // closure at all.
+        for o1 in [ad(LOP_GETIMPORT, 2, 0), bc(LOP_ADDK, 2, 2), ad(LOP_JUMPXEQKS, 2, 0)] {
+            let mut chunk = chunk(body.clone(), false);
+            chunk.functions[0].instructions.insert(0, o1);
+            assert!(may_print_shared_fresh_closures(&chunk, false));
+        }
+        // `LOADN` is no evidence: -O0 loads a `for` loop's implicit step so.
+        let mut chunk = chunk(body, false);
+        chunk.functions[0].instructions.insert(0, ad(LOP_LOADN, 2, 1));
+        assert!(!may_print_shared_fresh_closures(&chunk, false));
+    }
+
+    #[test]
+    fn an_upvalue_the_code_never_touches_is_folded() {
+        let body = makes_closure(vec![ad(LOP_LOADK, 2, 0)], bc(LOP_CAPTURE, 0, 2));
+        let mut chunk = chunk(body, false);
+        assert_eq!(folded_capture_slots(&chunk).into_iter().collect::<Vec<_>>(), vec![(2, vec![0])]);
+        chunk.functions[2].instructions.insert(0, bc(LOP_GETUPVAL, 0, 0));
+        assert!(folded_capture_slots(&chunk).is_empty());
+    }
+
+    #[test]
+    fn a_parameter_a_computed_value_or_a_reference_never_prints_shared() {
+        let parameter = makes_closure(Vec::new(), bc(LOP_CAPTURE, 0, 0));
+        assert!(!may_print_shared_fresh_closures(&chunk(parameter, true), false));
+        let computed = makes_closure(vec![ad(LOP_LOADK, 2, 0), bc(LOP_CALL, 2, 1)], bc(LOP_CAPTURE, 0, 2));
+        assert!(!may_print_shared_fresh_closures(&chunk(computed, true), false));
+        let reference = makes_closure(vec![ad(LOP_LOADK, 2, 0)], bc(LOP_CAPTURE, 1, 2));
+        assert!(!may_print_shared_fresh_closures(&chunk(reference, true), false));
     }
 }

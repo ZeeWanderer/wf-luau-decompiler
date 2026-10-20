@@ -1,15 +1,15 @@
 use nom::{IResult, bytes::complete::take, number::complete::le_u8};
 
-use super::{Dialect, chunk::Chunk};
+use super::chunk::Chunk;
 
 #[derive(Debug)]
-pub enum Bytecode {
+pub enum Bytecode<'a> {
     Error(String),
-    Chunk(Chunk),
+    Chunk(Chunk<'a>),
 }
 
-impl Bytecode {
-    pub fn parse(input: &[u8], encode_key: u8, dialect: Dialect) -> IResult<&[u8], Bytecode> {
+impl<'a> Bytecode<'a> {
+    pub fn parse(input: &'a [u8], encode_key: u8, dialect: super::Dialect) -> IResult<&'a [u8], Self> {
         let (input, status_code) = le_u8(input)?;
         match status_code {
             0 => {
@@ -19,11 +19,12 @@ impl Bytecode {
                     Bytecode::Error(String::from_utf8_lossy(error_msg).to_string()),
                 ))
             }
-            // 4..=13: bytecode versions 4 through 13. v10 adds
+            // 4..=14: bytecode versions 4 through 14. v10 adds
             // LBC_CONSTANT_CLASS_SHAPE + NEWCLASSMEMBER; v11 adds CALLFB/CMPPROTO
             // and a per-proto feedback-vector section; v12 adds size-prefixed
-            // prototypes and v13 adds double-precision vector constants.
-            4..=13 => {
+            // prototypes, v13 adds double-precision vector constants and v14
+            // adds FASTPCALL (no serialization change beyond v12/v13).
+            4..=14 => {
                 let (input, chunk) = Chunk::parse(input, encode_key, status_code, dialect)?;
                 Ok((input, Bytecode::Chunk(chunk)))
             }

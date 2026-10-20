@@ -2,11 +2,12 @@ use futures_util::StreamExt;
 extern crate console_error_panic_hook;
 
 use base64::prelude::*;
-use luau_lifter::{try_decompile_bytecode_with_options, DecompileOptions};
+use luau_lifter::{
+    try_decompile_bytecode_with_options, ControlFlowOutputPolicy, DecompileOptions,
+};
 use serde::{Deserialize, Serialize};
 use worker::*;
 
-const AUTH_SECRET: &str = "ymjKH2O3BbO3bDSsKmpo3ek3vHxIWYLQfj0";
 
 /// Roblox client bytecode decode key (`op = op * key % 256`).
 const CLIENT_KEY: u8 = 203;
@@ -73,6 +74,75 @@ struct BatchResponse {
     results: Vec<BatchResultItem>,
 }
 
+const MAX_BATCH_REUSE_ENTRIES: usize = 1024;
+const MAX_BATCH_REUSE_KEY_BYTES: usize = 4 * 1024 * 1024;
+
+/// Retain only bounded, request-local input keys. Results already belong to the
+/// response; duplicate entries copy their payload from the original result.
+fn decompile_batch_items(
+    scripts: Vec<BatchItem>,
+    reuse_results: bool,
+    mut decompile: impl FnMut(&[u8], Option<&str>) -> std::result::Result<String, String>,
+) -> BatchResponse {
+    use std::collections::{hash_map::Entry, HashMap};
+    let mut contexts: HashMap<(String, Option<String>), usize> = HashMap::new();
+    let mut key_bytes = 0usize;
+    let mut results: Vec<BatchResultItem> = Vec::with_capacity(scripts.len());
+    let mut execute = |encoded: &str, script_name: Option<&str>| {
+        BASE64_STANDARD.decode(encoded.as_bytes())
+            .map_err(|error| format!("base64: {error}"))
+            .and_then(|bytecode| decompile(&bytecode, script_name))
+    };
+    for (index, item) in scripts.into_iter().enumerate() {
+        let id = item.id.unwrap_or_else(|| index.to_string());
+        let outcome = if reuse_results {
+            let retained_bytes = item.encoded_bytecode.capacity()
+                .saturating_add(item.script_name.as_ref().map_or(0, String::capacity));
+            let can_retain = contexts.len() < MAX_BATCH_REUSE_ENTRIES
+                && retained_bytes <= MAX_BATCH_REUSE_KEY_BYTES.saturating_sub(key_bytes);
+            // Exact encoded text and the entire script name are conservative
+            // context keys. Decode key and options are shared by this batch.
+            // Hash collisions still compare both strings; nothing is interned
+            // or retained beyond this request.
+            match contexts.entry((item.encoded_bytecode, item.script_name)) {
+                Entry::Occupied(entry) => {
+                    let previous = &results[*entry.get()];
+                    results.push(BatchResultItem {
+                        index, id, ok: previous.ok,
+                        decompilation: previous.decompilation.clone(),
+                        error: previous.error.clone(),
+                    });
+                    continue;
+                }
+                Entry::Vacant(entry) => {
+                    let (encoded, script_name) = entry.key();
+                    let outcome = execute(encoded, script_name.as_deref());
+                    if can_retain {
+                        entry.insert(index);
+                        key_bytes += retained_bytes;
+                    }
+                    outcome
+                }
+            }
+        } else {
+            execute(&item.encoded_bytecode, item.script_name.as_deref())
+        };
+        results.push(match outcome {
+            Ok(source) => BatchResultItem {
+                index, id, ok: true, decompilation: Some(source), error: None,
+            },
+            Err(reason) => BatchResultItem {
+                index, id, ok: false, decompilation: None, error: Some(reason),
+            },
+        });
+    }
+    BatchResponse {
+        count: results.len(),
+        ok_count: results.iter().filter(|result| result.ok).count(),
+        results,
+    }
+}
+
 /// Essence-based `application/octet-stream` detection (tolerates `; charset=...`).
 fn is_octet_stream(req: &Request) -> bool {
     req.headers()
@@ -135,10 +205,125 @@ fn parse_flags_text(raw: &str) -> std::result::Result<DecompileOptions, String> 
         match normalized.as_str() {
             "NONE" => {}
             "DONT_REUSE_VAR" => options.dont_reuse_var = true,
+            "STRICT_NO_SYNTHETIC_CONTROL" => {
+                options.control_flow_policy = ControlFlowOutputPolicy::StrictNoSyntheticControl;
+            }
             _ => return Err(format!("unsupported decompile flag: {token}")),
         }
     }
     Ok(options)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use luau_lifter::{ControlFlowOutputPolicy, STRICT_NO_SYNTHETIC_CONTROL};
+
+    #[test]
+    fn worker_accepts_strict_control_policy_by_name_and_bits() {
+        let named = parse_flags_text("strict-no-synthetic-control").unwrap();
+        assert_eq!(
+            named.control_flow_policy,
+            ControlFlowOutputPolicy::StrictNoSyntheticControl
+        );
+        let numeric = parse_flags_text(&STRICT_NO_SYNTHETIC_CONTROL.to_string()).unwrap();
+        assert_eq!(numeric, named);
+    }
+
+    fn item(bytes: &[u8], name: Option<&str>, id: Option<&str>) -> BatchItem {
+        BatchItem {
+            id: id.map(str::to_owned),
+            encoded_bytecode: BASE64_STANDARD.encode(bytes),
+            script_name: name.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn batch_reuse_preserves_order_ids_errors_and_complete_context() {
+        let inputs = || vec![
+            item(&[1], Some("Folder/A"), Some("first")),
+            item(&[1], Some("Folder/A"), None),
+            item(&[1], Some("Other/A"), Some("same module hint, distinct key")),
+            item(&[1], None, None),
+            item(&[1], Some(""), None),
+            item(&[2], Some("Folder/A"), Some("failed")),
+            item(&[2], Some("Folder/A"), Some("failed duplicate")),
+            BatchItem { id: None, encoded_bytecode: "!".into(), script_name: None },
+            BatchItem { id: Some("bad base64".into()), encoded_bytecode: "!".into(), script_name: None },
+            item(&[1], Some("Folder/A"), Some("last")),
+        ];
+        let outcome = |bytes: &[u8], name: Option<&str>| {
+            if bytes == [2] { Err("decompiler error".to_string()) }
+            else { Ok(format!("{bytes:?}/{name:?}")) }
+        };
+        let mut fresh_calls = 0;
+        let fresh = decompile_batch_items(inputs(), false, |bytes, name| {
+            fresh_calls += 1;
+            outcome(bytes, name)
+        });
+        let mut reused_calls = 0;
+        let reused = decompile_batch_items(inputs(), true, |bytes, name| {
+            reused_calls += 1;
+            outcome(bytes, name)
+        });
+        assert_eq!(fresh_calls, 8);
+        assert_eq!(reused_calls, 5);
+        assert_eq!(serde_json::to_value(&fresh).unwrap(), serde_json::to_value(&reused).unwrap());
+        assert_eq!(reused.count, 10);
+        assert_eq!(reused.ok_count, 6);
+        assert_eq!(reused.results[1].id, "1");
+        assert_eq!(reused.results[6].id, "failed duplicate");
+        assert_eq!(reused.results[9].index, 9);
+        assert_eq!(reused.results[9].id, "last");
+    }
+
+    #[test]
+    fn batch_reuse_is_bounded_by_entries_and_keeps_admitted_hits() {
+        let mut inputs = (0..=MAX_BATCH_REUSE_ENTRIES)
+            .map(|index| item(&index.to_le_bytes(), None, None)).collect::<Vec<_>>();
+        inputs.push(item(&0usize.to_le_bytes(), None, None));
+        inputs.push(item(&MAX_BATCH_REUSE_ENTRIES.to_le_bytes(), None, None));
+        let mut calls = 0;
+        let response = decompile_batch_items(inputs, true, |bytes, _| {
+            calls += 1;
+            Ok(BASE64_STANDARD.encode(bytes))
+        });
+        assert_eq!(calls, MAX_BATCH_REUSE_ENTRIES + 2);
+        assert_eq!(response.count, MAX_BATCH_REUSE_ENTRIES + 3);
+        assert_eq!(response.ok_count, response.count);
+    }
+
+    #[test]
+    fn batch_reuse_budgets_retained_capacity_and_drops_keys_between_requests() {
+        let reserved = |byte, capacity| {
+            let mut input = item(&[byte], None, None);
+            let mut encoded = String::with_capacity(capacity);
+            encoded.push_str(&input.encoded_bytecode);
+            input.encoded_bytecode = encoded;
+            input
+        };
+        // These short keys reserve far more than their lengths. One admitted
+        // key consumes half the byte budget; the second exceeds the remainder.
+        let inputs = vec![
+            reserved(1, MAX_BATCH_REUSE_KEY_BYTES / 2),
+            reserved(2, MAX_BATCH_REUSE_KEY_BYTES / 2 + 1),
+            item(&[1], None, None),
+            reserved(2, MAX_BATCH_REUSE_KEY_BYTES / 2 + 1),
+        ];
+        let mut calls = 0;
+        let response = decompile_batch_items(inputs, true, |_, _| { calls += 1; Ok("ok".into()) });
+        assert_eq!(calls, 3);
+        assert_eq!(response.ok_count, 4);
+        let oversized = vec![reserved(3, MAX_BATCH_REUSE_KEY_BYTES + 1), reserved(3, MAX_BATCH_REUSE_KEY_BYTES + 1)];
+        decompile_batch_items(oversized, true, |_, _| { calls += 1; Ok("ok".into()) });
+        assert_eq!(calls, 5);
+        decompile_batch_items(vec![item(&[1], None, None), item(&[1], None, None)], true,
+            |_, _| { calls += 1; Ok("new request".into()) });
+        assert_eq!(calls, 6);
+        decompile_batch_items(vec![item(&[1], None, None), item(&[1], None, None)], false,
+            |_, _| { calls += 1; Ok("fresh diagnostic execution".into()) });
+        assert_eq!(calls, 8);
+    }
 }
 
 fn parse_bool(raw: &str, field: &str) -> std::result::Result<bool, String> {
@@ -149,24 +334,30 @@ fn parse_bool(raw: &str, field: &str) -> std::result::Result<bool, String> {
     }
 }
 
+fn authorize(req: &Request, env: &Env) -> Result<Option<Response>> {
+    let secret = match env.secret("AUTH_SECRET") {
+        Ok(secret) => secret.to_string(),
+        Err(_) => return Response::error("authentication is not configured", 503).map(Some),
+    };
+    if secret.is_empty() {
+        return Response::error("authentication is not configured", 503).map(Some);
+    }
+    let provided = req.headers().get("Authorization")?.unwrap_or_default();
+    if provided != secret {
+        return Response::error("invalid license", 403).map(Some);
+    }
+    Ok(None)
+}
+
 #[event(fetch, respond_with_errors)]
 pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Response> {
     console_error_panic_hook::set_once();
 
     let router = Router::new();
     router
-        .get_async("/decompile_ws", |req, _ctx| async move {
-            // A missing/invalid Authorization header must be a clean 403, not a
-            // panicked 500 — so read it without `.expect()`.
-            let license = req
-                .headers()
-                .get("Authorization")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-
-            if license != AUTH_SECRET {
-                return Response::error("invalid license", 403);
+        .get_async("/decompile_ws", |req, ctx| async move {
+            if let Some(response) = authorize(&req, &ctx.env)? {
+                return Ok(response);
             }
 
             let header_options = match request_options(&req) {
@@ -225,18 +416,9 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
 
             Response::from_websocket(pair.client)
         })
-        .post_async("/decompile", |mut req, _ctx| async move {
-            // A missing/invalid Authorization header must be a clean 403, not a
-            // panicked 500 — so read it without `.expect()`.
-            let license = req
-                .headers()
-                .get("Authorization")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-
-            if license != AUTH_SECRET {
-                return Response::error("invalid license", 403);
+        .post_async("/decompile", |mut req, ctx| async move {
+            if let Some(response) = authorize(&req, &ctx.env)? {
+                return Ok(response);
             }
 
             let script_name = req.headers().get("X-Script-Name").ok().flatten();
@@ -267,18 +449,9 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
                 Err(reason) => Response::error(format!("decompile failed: {reason}"), 422),
             }
         })
-        .post_async("/decompile_batch", |mut req, _ctx| async move {
-            // A missing/invalid Authorization header must be a clean 403, not a
-            // panicked 500 — so read it without `.expect()`.
-            let license = req
-                .headers()
-                .get("Authorization")
-                .ok()
-                .flatten()
-                .unwrap_or_default();
-
-            if license != AUTH_SECRET {
-                return Response::error("invalid license", 403);
+        .post_async("/decompile_batch", |mut req, ctx| async move {
+            if let Some(response) = authorize(&req, &ctx.env)? {
+                return Ok(response);
             }
 
             let body = req.bytes().await?;
@@ -301,45 +474,15 @@ pub async fn main(req: Request, env: Env, _ctx: worker::Context) -> Result<Respo
             // Single-threaded wasm: decompile sequentially. One bad script becomes a
             // per-item error (via the `try_*` Result path) rather than aborting the
             // whole batch.
-            let mut results = Vec::with_capacity(request.scripts.len());
-            for (index, item) in request.scripts.into_iter().enumerate() {
-                let id = item.id.unwrap_or_else(|| index.to_string());
-                let outcome = BASE64_STANDARD
-                    .decode(item.encoded_bytecode.as_bytes())
-                    .map_err(|e| format!("base64: {e}"))
-                    .and_then(|bytecode| {
-                        try_decompile_bytecode_with_options(
-                            &bytecode,
-                            key,
-                            item.script_name.as_deref(),
-                            options,
-                        )
-                    });
-                results.push(match outcome {
-                    Ok(source) => BatchResultItem {
-                        index,
-                        id,
-                        ok: true,
-                        decompilation: Some(source),
-                        error: None,
-                    },
-                    Err(reason) => BatchResultItem {
-                        index,
-                        id,
-                        ok: false,
-                        decompilation: None,
-                        error: Some(reason),
-                    },
-                });
-            }
-
-            let ok_count = results.iter().filter(|r| r.ok).count();
-            Response::from_json(&BatchResponse {
-                count: results.len(),
-                ok_count,
-                results,
-            })
+            let reuse_results = request.scripts.len() > 1
+                && !luau_lifter::requires_fresh_decompilation();
+            let response = decompile_batch_items(request.scripts, reuse_results, |bytecode, script_name| {
+                try_decompile_bytecode_with_options(bytecode, key, script_name, options)
+            });
+            Response::from_json(&response)
         })
         .run(req, env)
         .await
 }
+#[cfg(all(target_arch = "wasm32", panic = "abort"))]
+compile_error!("Build the Worker with worker-build --panic-unwind; abort cannot isolate batch items.");

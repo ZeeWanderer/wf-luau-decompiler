@@ -1042,10 +1042,11 @@ fn field_assignment_parts<'a>(
     if assign.left.len() == 1
         && assign.right.len() == 1
         && let ast::LValue::Index(ast::Index {
-            left: box ast::RValue::Local(local),
+            left,
             right,
             ..
         }) = &assign.left[0]
+        && let ast::RValue::Local(local) = left.as_ref()
         && local == object_local
     {
         Some((right, &assign.right[0]))

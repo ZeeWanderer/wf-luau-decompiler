@@ -3447,16 +3447,16 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                     let mut index = index;
                     let mut valid = true;
                     loop {
-                        if let box RValue::Literal(Literal::String(key)) = &index.right
+                        if let RValue::Literal(Literal::String(key)) = index.right.as_ref()
                             && Self::is_valid_name(key)
                         {
-                            match index.left {
-                                box RValue::Index(ref i) => {
+                            match index.left.as_ref() {
+                                RValue::Index(i) => {
                                     index = i;
                                     continue;
                                 }
-                                box RValue::Global(ref global) if spellable(global) => {}
-                                box RValue::Local(_) => {}
+                                RValue::Global(global) if spellable(global) => {}
+                                RValue::Local(_) => {}
                                 _ => valid = false,
                             }
                         } else {

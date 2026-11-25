@@ -1,4 +1,3 @@
-#![feature(box_patterns)]
 #![feature(let_chains)]
 
 use ast::{

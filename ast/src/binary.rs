@@ -216,18 +216,22 @@ impl<'a: 'b, 'b> Reduce for Binary {
             }
             (
                 RValue::Binary(Binary {
-                    left:
-                        box value @ RValue::Unary(Unary {
-                            operation: UnaryOperation::Not,
-                            ..
-                        }),
-                    right: box RValue::Literal(Literal::Boolean(true)),
+                    left: value,
+                    right,
                     operation: BinaryOperation::And,
                     ..
                 }),
                 RValue::Literal(Literal::Boolean(false)),
                 BinaryOperation::Or,
-            ) => value,
+            ) if matches!(
+                value.as_ref(),
+                RValue::Unary(Unary {
+                    operation: UnaryOperation::Not,
+                    ..
+                })
+            ) && matches!(right.as_ref(), RValue::Literal(Literal::Boolean(true))) => {
+                *value
+            }
             (left, right, BinaryOperation::Or)
                 if crate::is_total_pure(&left) && crate::is_total_pure(&right) && left == right =>
             {
@@ -445,7 +449,10 @@ impl fmt::Display for Binary {
 
 #[cfg(test)]
 mod tests {
-    use crate::{Binary, BinaryOperation, Global, Index, Literal, RValue, RcLocal, Reduce};
+    use crate::{
+        Binary, BinaryOperation, Global, Index, Literal, RValue, RcLocal, Reduce, Unary,
+        UnaryOperation,
+    };
 
     fn local() -> RValue {
         RValue::Local(RcLocal::default())
@@ -458,6 +465,30 @@ mod tests {
     }
     fn is_binary(r: &RValue, op: BinaryOperation) -> bool {
         matches!(r, RValue::Binary(b) if b.operation == op)
+    }
+
+    #[test]
+    fn boolean_wrapper_folds_only_a_negation_with_true_and_false_arms() {
+        let negation: RValue = Unary::new(local(), UnaryOperation::Not).into();
+        let wrapper = |value, then_value, else_value| {
+            Binary::new(
+                Binary::new(value, then_value, BinaryOperation::And).into(),
+                else_value,
+                BinaryOperation::Or,
+            )
+            .reduce()
+        };
+        assert_eq!(
+            wrapper(negation.clone(), boolean(true), boolean(false)),
+            negation
+        );
+        for (value, then_value, else_value) in [
+            (local(), boolean(true), boolean(false)),
+            (negation.clone(), Literal::Number(7.0).into(), boolean(false)),
+            (negation, boolean(true), Literal::Number(7.0).into()),
+        ] {
+            assert!(is_binary(&wrapper(value, then_value, else_value), BinaryOperation::Or));
+        }
     }
 
     // P1: `a or a` collapses to `a` only when `a` is side-effect-free; a

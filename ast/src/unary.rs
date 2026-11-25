@@ -84,7 +84,7 @@ impl Reduce for Unary {
             }
             (
                 RValue::Unary(Unary {
-                    box value,
+                    value,
                     operation: UnaryOperation::Not,
                     ..
                 }),
@@ -232,7 +232,7 @@ impl Reduce for Unary {
             }
             (
                 RValue::Unary(Unary {
-                    box value,
+                    value,
                     operation: UnaryOperation::Not,
                     ..
                 }),

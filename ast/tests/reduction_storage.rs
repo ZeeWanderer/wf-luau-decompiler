@@ -1,4 +1,3 @@
-#![feature(box_patterns)]
 //! Frozen pre-storage-reuse reduction oracle. No skipped or extra reduction calls.
 use ast::*;
 use by_address::ByAddress;
@@ -129,18 +128,22 @@ impl LegacyReduce for Binary {
             }
             (
                 RValue::Binary(Binary {
-                    left:
-                        box value @ RValue::Unary(Unary {
-                            operation: UnaryOperation::Not,
-                            ..
-                        }),
-                    right: box RValue::Literal(Literal::Boolean(true)),
+                    left: value,
+                    right,
                     operation: BinaryOperation::And,
                     ..
                 }),
                 RValue::Literal(Literal::Boolean(false)),
                 BinaryOperation::Or,
-            ) => value,
+            ) if matches!(
+                value.as_ref(),
+                RValue::Unary(Unary {
+                    operation: UnaryOperation::Not,
+                    ..
+                })
+            ) && matches!(right.as_ref(), RValue::Literal(Literal::Boolean(true))) => {
+                *value
+            }
             (left, right, BinaryOperation::Or)
                 if ast::is_total_pure(&left) && ast::is_total_pure(&right) && left == right =>
             {
@@ -288,7 +291,7 @@ impl LegacyReduce for Unary {
             }
             (
                 RValue::Unary(Unary {
-                    box value,
+                    value,
                     operation: UnaryOperation::Not,
                     ..
                 }),
@@ -435,7 +438,7 @@ impl LegacyReduce for Unary {
             }
             (
                 RValue::Unary(Unary {
-                    box value,
+                    value,
                     operation: UnaryOperation::Not,
                     ..
                 }),

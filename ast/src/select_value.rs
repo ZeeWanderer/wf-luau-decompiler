@@ -94,16 +94,16 @@ pub fn select_value(
     // out: `if not x then b else x` is `x or b`, `if not x then x else b` is
     // `x and b`.
     if let RValue::Unary(Unary {
-        box value,
+        value,
         operation: UnaryOperation::Not,
         ..
     }) = &*condition
     {
-        if *value == else_value && crate::is_total_pure(&else_value) {
+        if **value == else_value && crate::is_total_pure(&else_value) {
             *condition = Literal::Nil.into();
             return Some(Binary::new(else_value, then_value, BinaryOperation::Or).reduce());
         }
-        if *value == then_value && crate::is_total_pure(&then_value) {
+        if **value == then_value && crate::is_total_pure(&then_value) {
             *condition = Literal::Nil.into();
             return Some(Binary::new(then_value, else_value, BinaryOperation::And).reduce());
         }
@@ -145,12 +145,12 @@ pub fn select_value(
         let cond = std::mem::replace(condition, Literal::Nil.into()).reduce_condition();
         match cond {
             RValue::Unary(Unary {
-                box value,
+                value,
                 operation: UnaryOperation::Not,
                 ..
             }) => {
                 std::mem::swap(&mut then_value, &mut else_value);
-                value
+                *value
             }
             RValue::Binary(mut binary) if binary.operation == BinaryOperation::NotEqual => {
                 std::mem::swap(&mut then_value, &mut else_value);

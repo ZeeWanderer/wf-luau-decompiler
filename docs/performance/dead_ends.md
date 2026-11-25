@@ -1,7 +1,7 @@
 # Các hướng tối ưu hiệu năng đã thử nhưng không đáng làm
 
 Danh sách gộp mọi hướng tối ưu đã **đo** và bị loại, từ 2026-06 đến 2026-10-04, kèm con số
-và nguồn. Mục đích là không đề xuất và đo lại cùng một ý tưởng ở các vòng sau.
+và nguồn; bổ sung thí nghiệm cloud ngày 2026-10-27. Mục đích là không đề xuất và đo lại cùng một ý tưởng ở các vòng sau.
 
 Quy tắc:
 
@@ -52,6 +52,34 @@ Quy tắc:
 | Index theo key cho việc gộp field vào constructor ở tầng SSA (`cfg/src/ssa/inline.rs`) | Không đo được lợi ích: template DUPTABLE tối đa 32 key, các workload table chạy cả pipeline không đổi; lại trùng logic với `PlaceholderEntries` | review PR #6, 2026-10-04 |
 | Deinline, lượt vào pha gán: bỏ qua matcher thường ở mọi chỗ mà lượt trước (không đổi gì) đã thử và không thấy site | Sai output (2 file, `HitboxFunctions`): trong cùng lượt, một store được dựng lại ở khối con làm đổi cửa sổ của khối cha, nên matcher thường của cha lại khớp. Chỉ bỏ qua được khi chưa có splice nào trong khối hay khối con của nó, và pattern không chứa closure (`Rescan`) | m2a-perf, 2026-10-09 |
 | Deinline: gác cửa sổ của target có thể specialize bằng câu đầu của pattern thường | Không hợp lệ, không đo: specialization thay tham số rồi `reduce()` gập biểu thức (`x = p + 1` với `p = 2` thành `x = 3`), nên câu đầu không unify với pattern thường vẫn có thể khớp. Gác câu đầu (`head_refused`) chỉ dùng cho target không specialize được | m2a-perf, 2026-10-09 |
+
+### Public V2.7, 27/10/2026: chia sẻ thêm một lượt decode source lines
+
+Thử truyền Vec source lines từ prototype setup sang Lifter để tránh decode hai lần cho M6. Output byte-identical trên 513 input public. Release A/B cùng nightly-2026-06-15, ghim CPU, cache artifact tắt; benchmark_v2.py dùng output directory ấm, 25 sample xen kẽ mỗi bên: 1 worker median 0,669725 → 0,682328 s (+1,88%), 4 workers 0,199420 → 0,197583 s (-0,92%). Lượt thăm dò 7 sample cũng không có lợi ở một luồng. Không giữ thay đổi vì không cải thiện mục tiêu một luồng; không dùng việc giảm số lần decode làm bằng chứng speedup. Raw reports, source patch và binary ở `/workspace/work/v27/lines-repeat-t{1,4}.json`, `lines-rejected.patch`, `luau-lifter-lines`; không có private dump/Windows timing claim.
+
+### Public V2.7, 27/10/2026: ASCII buffer cho naming
+
+Thử chuyển shared lower-camel và hai sanitizer từ Vec<char> sang Vec<u8>, dùng String::from_utf8 để giữ buffer. 1.161 AST tests đạt; mọi public output byte-identical. So với candidate chỉ có cache formatter, 7 sample A/B cho median 1t -0,5%, 4t -1,1%; 51 sample xen kẽ ghim CPU cho median 1t 0,778117 → 0,770349 s (-1,0%), 4t 0,218694 → 0,218607 s (gần 0%). Nhưng median paired ratios 1,0103/1,0012, chỉ 25/51 và 22/51 cặp nhanh hơn; RSS median không giảm. Loại vì chưa chứng minh lợi ích end-to-end ổn định, không dùng bớt allocation lý thuyết làm speedup. Evidence: `/workspace/work/v27/ascii-naming-candidate.patch`, `luau-lifter-ascii-naming`, `ascii-naming-{measure,confirm-t1.json,confirm-t4.json}`; không có private workload claim.
+
+### Public V2.7, 27/10/2026: scoped candidate index
+
+Port riêng bộ lọc head từ `origin/feat/deinline-next` (`e0b2f3c`), không lấy refactor/recovery khác. Bitset theo thứ tự priority chỉ bỏ attempt đã bị gate kind/name hiện hữu từ chối trước search fuel; rivals và thứ tự đầy đủ vẫn giữ. 154 deinline tests đạt, gồm bảy test index đối chiếu predicate độc lập. 513 outputs public byte-identical ở mọi mẫu. Profile riêng cho thấy index chỉ được dựng 18 lần/291 target entries trên 3/513 inputs.
+
+7 mẫu ordinary release: 1t -0,6%, 4t +1,1%. 51 mẫu xen kẽ, ghim CPU: 1t median 0,765077 → 0,762502 s (-0,34%), 4t 0,220181 → 0,220367 s (+0,08%); paired medians 1,0113/0,9992, thắng 21/51 và 27/51 cặp. RSS không giảm. Loại vì không cải thiện end-to-end trên workload public khả dụng; không suy lợi ích từ synthetic distinct-anchor workload của nhánh gốc. Không chạy full 33 gates cho code bị loại. Binary `8dc5032cb3d7d1d4b3bef83d2101143d18eea5638da67ca2b5f243753ee3c979`, patch/module, profile và reports được lưu tại `/workspace/work/v27/scoped-candidates-*`; source khôi phục byte-for-byte về `ba776bd`.
+
+### Public V2.7, 28/10/2026: import-only census và expression helper shape
+
+Thử một cấp census chỉ thu globals/environment cho `fold_import_callees`, cùng traversal/refusal bounds như full census; expression helper admission dùng shape-only census hiện hữu. 1.166 AST tests đạt, gồm differential facts và budget boundaries. 513 public outputs giữ từng byte qua mọi sample. Lượt thăm dò 7 samples cho 1t -4,8%, 4t -5,4%, nhưng xác nhận 51 samples xen kẽ ghim CPU chỉ cho median 1t 0,729905 → 0,729122 s (-0,11%), 4t 0,210078 → 0,209108 s (-0,46%). Paired medians 0,98398/0,99744, thắng 30/51 và 28/51 cặp; RSS không giảm đáng kể. Loại vì không có lợi ích end-to-end ổn định đủ để giữ thêm cấp facts; không lấy lượt thăm dò làm kết quả cuối. Không chạy full 33 gates cho code bị loại. Patch, binary và toàn bộ sample nằm tại `/workspace/work/v27/census-facts-{rejected.patch,r7-t1.json,r7-t4.json,r51-t1.json,r51-t4.json}`, binary SHA256 `679cc599dd71d6374748c2fc3d98690d6482516e35e4d0cb7e68673514ce7645`. Source ba file khôi phục byte-for-byte về `d3e64a2`. Không có private/Windows timing claim.
+
+### Public V2.7, 28/10/2026: lọc SSA producer trước proof di chuyển
+
+Từ CPU profile tại `d3e64a2`, thử kiểm tra destination có thuộc eligibility snapshot của consumer trước các proof depth/capture/handle. Không bỏ statement barriers, iterator-pack path hoặc đổi thứ tự producer. 39 inliner tests đạt, gồm differential từng sweep/origins/events và controls với 32 producer không liên quan, callback barriers, pack 2/3 slots. Mọi 513 output public giữ từng byte. Thăm dò 7 samples: 1t -1,1%, 4t +3,9%. Xác nhận 51 samples xen kẽ ghim CPU: median 1t 0,776666 → 0,780553 s (+0,50%), 4t 0,218285 → 0,218774 s (+0,22%); paired medians 0,99907/0,99761, thắng 26/51 và 27/51. Loại vì không có lợi ích end-to-end; không chạy full 33 gates cho code bị loại. Evidence tại `/workspace/work/v27/ssa-relevance-*`, binary SHA256 `58d2d8328f4ed092074abc91673ade5a12e1227f5a6ca2777a7c31695d602ea6`; source khôi phục byte-for-byte về `d3e64a2`. Không có private/Windows timing claim.
+
+### Public V2.7, 28/10/2026: bỏ alias scan khi captured-cell map rỗng
+
+Thử chuẩn hóa `Some(empty)` thành `None` tại shared `remove_unnecessary_params`, tránh duyệt/resolving mọi incoming alias chỉ để hỏi một map rỗng. 16 construct tests đạt, trong đó differential mới mở rộng thành 45 tổ hợp no-map/empty/grouped captures, duplicate/raw aliases/self edges; schema failure boundary và local-map order giữ nguyên. Mọi 513 public outputs byte-identical.
+
+So với `b798e5b`, thăm dò 7 samples: 1t +5,8%, 4t -0,7%. Xác nhận 51 samples xen kẽ ghim CPU: median 1t 0,725481 → 0,718761 (-0,9%), 4t 0,220796 → 0,220015 (-0,4%); paired medians 1,00183/0,99576, thắng 24/51 và 28/51. [CPU-time diagnostic](../v2_7/checkpoint_cpu_time.md), thêm 25 samples cùng binary, cho paired CPU ratios 1,00640/0,99280, thắng 11/25 và 17/25; intervals vẫn chứa 1. Loại vì không xác nhận lợi ích end-to-end, nhất là mục tiêu một worker; không lấy bỏ một lượt quét làm speedup. Không chạy full 33 gates cho code bị loại. Patch, binary `73145408e16e1e2c17bdbb059217927827f7bccca05d491b0ab47debfbcb58cf`, logs và raw samples tại `/workspace/work/v27/empty-cells-*`, cùng `ssa-cpu-*`. Source khôi phục byte-for-byte và binary thông thường phục hồi về `b798e5b`; không có private/Windows timing claim.
 
 ## 3. Build và toolchain
 

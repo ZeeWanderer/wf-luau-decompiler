@@ -69,6 +69,18 @@ fn source_and_json_are_separate_for_both_dialects() {
 }
 
 #[test]
+fn warframe_vectors_do_not_assume_a_roblox_constructor() {
+    let mut bytes = fixture(true);
+    let vector = [7].into_iter().chain([1.0_f32, 2.0, 3.0, 0.0].into_iter().flat_map(f32::to_le_bytes));
+    bytes.splice(21..26, vector);
+    let output = invoke(&["-", "--diagnostics", "json"], &bytes);
+    diagnostic(&output, true);
+    let source = std::str::from_utf8(&output.stdout).unwrap();
+    assert!(source.contains("vector.create"), "{source}");
+    assert!(!source.contains("Vector3.new"), "{source}");
+}
+
+#[test]
 fn malformed_input_is_failure_not_partial_source() {
     for input in [&[][..], &[255][..], &fixture(true)[..20]] {
         let output = invoke(&["-", "--diagnostics", "json"], input);

@@ -107,13 +107,13 @@ impl<'a> Lifter<'a> {
             for_origins_by_step: FxHashMap::default(),
             current_node: None,
             upvalues: Vec::new(),
-            source_lines: Vec::new(),
+            source_lines: crate::upvalue_analysis::decode_source_lines(&f_list[function_id]),
         };
 
         if let (true, Some(identity)) = (trace_provenance, &context.static_function_id) {
             context.function.provenance = Some(Box::new(cfg::provenance::FunctionTrace::new(function_id, identity.clone())));
             context.function.provenance.as_mut().unwrap().instruction_count = f_list[function_id].instructions.len();
-            context.source_lines = crate::upvalue_analysis::decode_source_lines(&f_list[function_id]);
+
         }
 
         context.debug_bindings = f_list[function_id].debug_locals.iter()
@@ -596,9 +596,8 @@ impl<'a> Lifter<'a> {
         };
 
         let mut top: Option<(ast::RValue, u8)> = None;
-        // PC of the CALL whose fallback follows the most recent FASTCALL or
-        // FASTPCALL in this block.
-        let mut fastcall_target: Option<usize> = None;
+        // CALL target and builtin ID; FASTPCALL's A is a register, not a builtin.
+        let mut fastcall_target: Option<(usize, Option<u8>)> = None;
         let trace_origins = self.function.provenance.is_some();
         let mut pending_pcs = Vec::new();
         let mut statement_origins = Vec::new();
@@ -677,7 +676,7 @@ impl<'a> Lifter<'a> {
                         // (0: none), which decides the order `pairs` visits
                         // keys in (`ast::TableShape`).
                         let mut table = ast::Table::default();
-                        table.2 = ast::TableShape::NewTable { hash: if b == 0 { 0 } else { 1u32 << (u32::from(b) - 1).min(30) } };
+                        table.2 = ast::TableShape::NewTable { hash: if b == 0 { 0 } else { 1u32 << (u32::from(b) - 1).min(30) }, array: aux };
                         statements.push(
                             ast::Assign::new(vec![self.register(a as _).into()], vec![table.into()]).into(),
                         );
@@ -879,7 +878,8 @@ impl<'a> Lifter<'a> {
                     | OpCode::LOP_FASTCALL2K
                     | OpCode::LOP_FASTCALL3
                     | OpCode::LOP_FASTPCALL => {
-                        fastcall_target = Some(pc + 1 + c as usize);
+                        fastcall_target = Some((pc + 1 + c as usize,
+                            (op_code != OpCode::LOP_FASTPCALL).then_some(a)));
                     }
                     OpCode::LOP_NAMECALL | OpCode::LOP_NAMECALLUDATA => {
                         let namecall_base = a;
@@ -983,8 +983,9 @@ impl<'a> Lifter<'a> {
                         };
 
                         let mut call = ast::Call::new(self.register(a as _).into(), arguments);
-                        if fastcall_target.take_if(|target| *target == pc).is_some() {
+                        if let Some((_, builtin)) = fastcall_target.take_if(|(target, _)| *target == pc) {
                             call.callee_after_arguments = true;
+                            call.builtin_fastcall = builtin.map(|builtin| (builtin, c));
                         }
 
                         if c != 0 {
@@ -1824,6 +1825,16 @@ impl<'a> Lifter<'a> {
                 },
                 _ => unimplemented!("{:?}", instruction),
             }
+            if !self.source_lines.is_empty() {
+                let next_pc = iter.clone().next().map_or(block_end + 1, |(index, _)| block_start + index);
+                let lines = ast::source_lines::SourceLines::of(self.source_lines[pc..next_pc].iter().copied().flatten());
+                for statement in &mut statements[lifted_before..] {
+                    ast::source_lines::seed_statement(statement, lines);
+                }
+                if set_pending && let Some((value, _)) = &mut top {
+                    ast::source_lines::seed_value(value, lines);
+                }
+            }
             if track_statement_pcs {
                 statement_pcs.resize(statements.len(), pc);
                 debug_assert!(statement_pcs.len() >= lifted_before);
@@ -2013,7 +2024,7 @@ impl<'a> Lifter<'a> {
 /// Where the loop instruction at `pc` jumping by `offset` lands. A target
 /// too far for the 16-bit offset is reached through a trampoline Luau emits
 /// right before the instruction: `JUMP +1; JUMPX target; <instruction>`.
-fn loop_jump_target(instructions: &[Instruction], pc: usize, offset: i16) -> usize {
+pub(crate) fn loop_jump_target(instructions: &[Instruction], pc: usize, offset: i16) -> usize {
     let target = ((pc + 1) as isize + offset as isize) as usize;
     let trampoline = target + 1 == pc
         && target.checked_sub(1).and_then(|skip| instructions.get(skip))
@@ -2051,6 +2062,33 @@ mod tests {
     fn operand_registers_reach_the_last_register() {
         assert_eq!(super::operand_registers(254, 2), 254..255);
         assert_eq!(super::operand_registers(0, 1), 0..0);
+    }
+
+    #[test]
+    fn builtin_identity_comes_from_the_matching_fastcall_only() {
+        for opcode in [OpCode::LOP_FASTCALL, OpCode::LOP_FASTCALL1, OpCode::LOP_FASTCALL2,
+            OpCode::LOP_FASTCALL2K, OpCode::LOP_FASTCALL3, OpCode::LOP_FASTPCALL]
+        {
+            for builtin in [40, 44, 54, 55] {
+                let register = if opcode == OpCode::LOP_FASTPCALL { builtin } else { 0 };
+                let mut proto = prototype(64, vec![
+                    instruction(opcode, builtin, 0, 1),
+                    instruction(OpCode::LOP_MOVE, register, register + 1, 0),
+                    instruction(OpCode::LOP_CALL, register, 1, 1),
+                    instruction(OpCode::LOP_CALL, register, 1, 1),
+                    instruction(OpCode::LOP_RETURN, 0, 1, 0),
+                ]);
+                proto.max_stack_size = 64;
+                let function = Lifter::lift(&vec![proto], &[], 14, 0, None, &[], false).0;
+                let calls = function.graph().node_weights().flat_map(|block| block.iter())
+                    .filter_map(|statement| statement.as_call()).collect::<Vec<_>>();
+                assert_eq!(calls.len(), 2);
+                assert!(calls[0].callee_after_arguments);
+                assert_eq!(calls[0].builtin_fastcall, (opcode != OpCode::LOP_FASTPCALL).then_some((builtin, 1)));
+                assert!(!calls[1].callee_after_arguments);
+                assert_eq!(calls[1].builtin_fastcall, None);
+            }
+        }
     }
 
     #[test]
@@ -2144,18 +2182,32 @@ mod tests {
                     (actual, expected) => assert_eq!(actual, expected),
                 }
             }
-            let plain = ast::Table::new(vec![
+            let plain = ast::Table(vec![
                 (Some(L::String(b"value".to_vec()).into()), L::Number(0.0).into()),
-            ]);
+            ], Default::default(), ast::TableShape::Template { keys: 1 });
             assert_eq!(loaded[11], &ast::RValue::from(plain.clone()));
-            assert_eq!(loaded[12], &ast::RValue::from(ast::Table::new(vec![
+            assert_eq!(loaded[12], &ast::RValue::from(ast::Table(vec![
                 (Some(L::String(b"value".to_vec()).into()), L::Number(nan).into()),
                 (Some(L::String(vec![]).into()), L::Number(0.0).into()),
                 (Some(L::Boolean(true).into()), L::Nil.into()),
                 (Some(L::Vector(1.0, 2.0, 3.0).into()), L::Nil.into()),
                 (Some(L::Number(-0.0).into()), L::Nil.into()),
-            ])));
+            ], Default::default(), ast::TableShape::Template { keys: 5 })));
         }
+    }
+
+    #[test]
+    fn newtable_keeps_both_initial_allocations() {
+        let proto = prototype(0, vec![
+            Instruction::BC { op_code: OpCode::LOP_NEWTABLE, a: 0, b: 3, c: 0, aux: 7 },
+            instruction(OpCode::LOP_NOP, 0, 0, 0),
+            instruction(OpCode::LOP_RETURN, 0, 2, 0),
+        ]);
+        let (function, _, _) = Lifter::lift(&vec![proto], &[], 9, 0, None, &[], false);
+        let table = function.graph().node_weights().flat_map(|block| block.iter())
+            .filter_map(|statement| statement.as_assign())
+            .find_map(|assign| assign.right[0].as_table()).unwrap();
+        assert_eq!(table.2, ast::TableShape::NewTable { hash: 4, array: 7 });
     }
 
     /// Every copy of a template shares a table or closure baked into it, and

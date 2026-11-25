@@ -5,11 +5,11 @@
 
 This fork adds a [Warframe frontend](WARFRAME.md); upstream interfaces remain available.
 
-**A high-readability, high-performance Luau decompiler.** **Tovek V2.6.1**
+**A high-readability, high-performance Luau decompiler.** **Tovek V2.7**
 
-[**Download V2.6.1 for Windows, Linux or macOS**](https://github.com/Kiet1308/Tovek/releases/tag/v2.6.1) · [What’s new in V2.6.1](https://github.com/Kiet1308/Tovek/releases/tag/v2.6.1) · [All release notes](https://kiet1308.github.io/Tovek/changelog.html)
+[**Download V2.7 for Windows, Linux or macOS**](https://github.com/Kiet1308/Tovek/releases/tag/v2.7) · [What’s new in V2.7](https://kiet1308.github.io/Tovek/changelog/v2.7/) · [All release notes](https://kiet1308.github.io/Tovek/changelog.html)
 
-Builds are published for Windows x86_64, Linux x86_64, Linux aarch64 and macOS on Apple silicon. Each package holds the two programs, `luau-lifter` (CLI) and `web-server` (local HTTP server), plus the licence; the executor client scripts live in this repository. The release tag is `v2.6.1`; Rust package versions are `2.6.1`.
+Builds are published for Windows x86_64, Linux x86_64, Linux aarch64 and macOS on Apple silicon. Each package holds the two programs, `luau-lifter` (CLI) and `web-server` (local HTTP server), plus the licence; the executor client scripts live in this repository. The release tag is `v2.7`; Rust package versions are `2.7.0`.
 
 [**💬 Join the Tovek Discord →**](https://discord.gg/phY6VUDSF7)
 
@@ -134,8 +134,11 @@ for scope, methodology and remaining regressions.
   [v12 validation and limits](https://kiet1308.github.io/Tovek/changelog/v2/#bytecode-v12).
 - **Literal and runtime fidelity.** Integer constants retain their signed 64-bit value
   and `i` suffix; recompilation requires Luau's `LuauIntegerType2` feature. Vector
-  constants capture the standard `vector.create` function at chunk entry, preserving
-  their behavior across later environment changes and O0/O1/O2 recompilation. A
+  constants in generic Luau bytecode capture the standard `vector.create` function
+  at chunk entry, preserving their behavior across later environment changes and
+  O0/O1/O2 recompilation. Roblox client bytecode can spell constants as `Vector3.new`
+  under Roblox's readonly standard constructor; a generic FASTCALL fallback proves
+  only compiler configuration and keeps the snapshot. A
   chunk with no room for that binding (no free register, or a closure already holding
   200 upvalues) spells the constant `vector.create(...)` in place instead, under the
   environment assumption below. The
@@ -146,6 +149,13 @@ for scope, methodology and remaining regressions.
   parser, compiler and VM. V2 passes all 513 public parse/recompile profiles and
   the expanded suite of 246 runtime profiles. These checks cover the tested
   inputs; they do not prove equivalence for every program.
+  CI also exercises all nine input/output O0/O1/O2 combinations at g0/g2 for
+  selected semantic regressions. Reports distinguish runtime passes, expected
+  refusals and exact compiler-sensitive baseline profiles. New or changed
+  mismatches fail even when the original source also changes across compiler
+  optimization levels.
+  See [V2.8 verification and remaining limits](docs/v2_8/ACCEPTANCE.md) for
+  the tested scope and before/after recovery results.
 
 ### Performance
 
@@ -239,8 +249,31 @@ a NaN constant with a payload `0 / 0` does not make, a global
 that is no identifier in a script naming getfenv or setfenv, and output that would
 need more locals or registers than Luau allows.
 
+Table reconstruction uses bounded proofs to preserve allocation and store order,
+including native bulk growth for open SETLIST; an open list store without that
+proof is refused. Recovery covers mixed positional/keyed prefixes and preserves
+invalid-key errors before later field effects. A captured register key is
+snapshotted after its field value, preserving mutations made by a callback.
+Proved incoming captured keys are snapshotted before their field values;
+ambiguous capture contexts remain refused. The output behaves like the input when
+compiled at the input's optimization level. Compiled at another level, Luau's own -O2
+inlining, builtin folding and FASTCALL arity change the timing of some reads and
+lookups, usually exactly as they would for the original source; where the bytecode
+cannot tell which of two spellings the source used, the output may differ from the
+source there too. Every such case known to the cross-optimization audit is reviewed. An actual builtin call prints as
+`(math.abs)(-17)` only where recompiling the plain spelling at the input's level
+would fold it (all arguments constant) or fast-call a builtin the input called
+plainly, either of which would bypass a replaced builtin. Open call results that
+cross an operation other than a FASTCALL fallback's callee load are refused: a
+scalar temporary would lose arbitrary return values, and a wrapper would add a call
+frame.
+Preallocated hash tables remain a compatibility exception: an empty one still
+emits `{}`, as does a constructor whose fields cannot carry the allocation, and
+`pairs`/`next` order is not guaranteed for them. This exception does not justify
+folding populated constructors or matching helpers without a layout proof.
+
 A table keeps its keys and values, and list items stay list items, but not always
-its internal layout: a constructor that takes later stores sizes the table
+its internal layout: a constructor that takes later stores can size the table
 differently. What depends only on the layout can differ, as the language leaves
 it open: the order `pairs` and `next` visit keys, `#` of a table with `nil` holes
 (any border), and the sign a zero key keeps when a store spelled with the other
@@ -399,6 +432,9 @@ set `TOVEK_UPLOAD_TIMEOUT_SECS` to a positive integer to change it. An expired
 upload receives HTTP `408` with `Connection: close` and releases its slot.
 Completed uploads are not subject to this deadline while decompilation runs;
 CPU work retains its slot until it finishes, even if the client disconnects.
+Decompilation uses one thread per CPU; each running thread holds the working
+memory of its script, so `TOVEK_THREADS` set lower trades speed for peak memory.
+Once no request is running, the server returns the memory it freed.
 
 - **Raw** (`/decompile/raw`): send the bytecode bytes verbatim — no base64 encode/decode.
   Use `Content-Type: application/octet-stream`, the optional `X-Script-Name` header, and an

@@ -26,10 +26,88 @@ pub(crate) fn rebuild_with_captured(
     let sunk_changed = sink_total_table_declarations(block, captured);
     let regions_changed = sink_private_constructor_regions(block, captured);
     let drained_changed = extract_drained_constructor_fields(block);
-    rebuild_current_block(block, captured, single_write) | sunk_changed | regions_changed | drained_changed | nested_changed
+    let folded = rebuild_current_block(block, captured, single_write);
+    nil_unread_placeholders(block, captured) | folded | sunk_changed | regions_changed | drained_changed | nested_changed
 }
 
-/// Every constructor under `block` lists a string or boolean key once
+/// A template's loader value need not appear in source when every path fills
+/// the slot before observation, rehash or GC can turn a nil-valued key dead.
+fn nil_unread_placeholders(block: &mut Block, captured: &rustc_hash::FxHashSet<RcLocal>) -> bool {
+    let mut changed = false;
+    for index in 0..block.0.len() {
+        let Some(object) = table_constructor_local(&block.0[index]) else { continue; };
+        if captured.contains(&object) { continue; }
+        let (prefix, rest) = block.0.split_at_mut(index + 1);
+        let table = prefix[index].as_assign_mut().unwrap().right[0].as_table_mut().unwrap();
+        // Keep a DUPTABLE on recompilation: NEWTABLE nil nodes can be reused
+        // by the later constructor fields before the proved store is reached.
+        if !matches!(table.2, crate::TableShape::Template { .. }) || table.0.len() > 32
+            || !table.0.iter().all(|(key, _)| matches!(key,
+                Some(RValue::Literal(crate::Literal::String(name))) if crate::formatter::Formatter::<String>::is_valid_name(name)))
+            // DUPTABLE can preload literal values before earlier effectful
+            // fields run. An earlier collection can kill this nil key, or a
+            // different nil key whose later refill rehashes this slot.
+            || !table.0.iter().all(|(_, value)| cannot_collect(value))
+        { continue; }
+        for field in 0..table.0.len() {
+            if matches!(table.0[field].1, RValue::Literal(crate::Literal::Number(0.0)))
+                && first_private_store(rest, &object, table.0[field].0.as_ref().unwrap(), table, &mut 256, 0) == Ok(true)
+            {
+                table.0[field].1 = crate::Literal::Nil.into();
+                changed = true;
+            }
+        }
+    }
+    changed
+}
+
+fn cannot_collect(value: &RValue) -> bool {
+    let summary = crate::effects::summarize(value, &|_| false);
+    !summary.exhausted && summary.effects.is_total_pure()
+        && !summary.effects.contains(crate::effects::Effects::ALLOCATION)
+}
+
+fn first_private_store(
+    statements: &[Statement], object: &RcLocal, key: &RValue, table: &Table,
+    budget: &mut usize, depth: usize,
+) -> Result<bool, ()> {
+    if depth > 16 { return Err(()); }
+    for statement in statements {
+        if *budget == 0 { return Err(()); }
+        *budget -= 1;
+        if let Statement::If(branch) = statement {
+            if !cannot_collect(&branch.condition)
+                || branch.condition.any_local_read(&mut |read| read == object) { return Err(()); }
+            let yes = first_private_store(&branch.then_block.lock(), object, key, table, budget, depth + 1)?;
+            let no = first_private_store(&branch.else_block.lock(), object, key, table, budget, depth + 1)?;
+            if yes && no { return Ok(true); }
+            continue;
+        }
+        if let Some((written_key, value)) = statement.as_assign()
+            .and_then(|assign| field_assignment_parts(assign, object))
+        {
+            if !cannot_collect(value) || value.any_local_read(&mut |read| read == object) { return Err(()); }
+            if crate::same_table_key(written_key, key) { return Ok(true); }
+            // Only an existing template key can change without a possible rehash.
+            if !table.0.iter().any(|(listed, _)| listed.as_ref().is_some_and(|listed| crate::same_table_key(listed, written_key))) {
+                return Err(());
+            }
+        } else if !match statement {
+            Statement::Assign(assign) => assign.left.iter().all(|value| matches!(value, LValue::Local(_)))
+                && assign.right.iter().all(cannot_collect),
+            Statement::Comment(_) | Statement::Empty(_) => true,
+            _ => false,
+        }
+            || statement.any_local_read(&mut |read| read == object)
+            || statement.any_local_write(&mut |written| written == object)
+        {
+            return Err(());
+        }
+    }
+    Ok(false)
+}
+
+/// Merge repeated string or boolean keys when their layout permits it
 /// ([`mergeable_key`]). A later entry for a key already listed takes the
 /// first entry's place when that entry is a literal and nothing between them
 /// could observe the move: a DUPTABLE
@@ -126,6 +204,7 @@ fn merge_repeated_keys_indexed(
         let barrier = if reads_only { last_nonread } else { last_nonliteral };
         let movable = first.is_some_and(|first| {
             matches!(table.0[first].1, RValue::Literal(_))
+                && crate::table_replaces_entry(table, first, &table.0[later].1)
                 && barrier.is_none_or(|barrier| barrier <= first)
         });
         let position = if let (Some(first), true) = (first, movable) {
@@ -167,6 +246,7 @@ fn merge_repeated_keys_scanning(table: &mut Table) -> bool {
         let moved_reads_only = matches!(table.0[later].1, RValue::Local(_) | RValue::Literal(_));
         let movable = first.is_some_and(|first| {
             matches!(table.0[first].1, RValue::Literal(_))
+                && crate::table_replaces_entry(table, first, &table.0[later].1)
                 && table.0[first + 1..later].iter().all(|(key, value)| {
                     key.as_ref().is_none_or(|key| matches!(key, RValue::Literal(_)) && crate::is_total_table_key(key))
                         && (matches!(value, RValue::Literal(_)) || (moved_reads_only && matches!(value, RValue::Local(_))))
@@ -325,7 +405,7 @@ fn rebuild_current_block(block: &mut Block, captured: &rustc_hash::FxHashSet<RcL
                 None => placement(table, initial_len, key,
                     listed.get_or_insert_with(|| crate::ListedKeys::new(table)), appended_slot_keys),
             };
-            let placement = match placement {
+            let mut placement = match placement {
                 Some(placement) => placement,
                 // Luau emits SETLIST for a constructor's list items only: a
                 // store before one was an entry of the constructor itself,
@@ -336,8 +416,12 @@ fn rebuild_current_block(block: &mut Block, captured: &rustc_hash::FxHashSet<RcL
                 }
                 None => break,
             };
-            if !keeps_template_layout(table, placement) {
-                break;
+            if !keeps_template_layout(table, placement, key, value) {
+                // A constructor may repeat a nil key: retain the later store
+                // when replacing the earlier one would change collision history.
+                if !set_list_follows(rest, &object_local) || !crate::table_takes_another_key(table, key) { break; }
+                appended_slot_keys = true;
+                placement = Placement::Append;
             }
 
             let field_assign = std::mem::replace(statement, crate::Empty {}.into()).into_assign().unwrap();
@@ -363,6 +447,9 @@ fn rebuild_current_block(block: &mut Block, captured: &rustc_hash::FxHashSet<RcL
 /// constructor stands for it.
 pub const LIST_INDEX_GAP: &str = "a SETLIST index far past the array its constructor fills";
 
+/// Per-slot source writes cannot reproduce an unknown bulk array resize.
+pub const OPEN_LIST_TAIL: &str = "an open SETLIST without a proved native constructor";
+
 /// The most `nil` items a hand-made list store's gap may print as.
 const MAX_LIST_GAP: usize = 255;
 
@@ -370,40 +457,501 @@ const MAX_LIST_GAP: usize = 255;
 /// it (a branch or a call came first): Luau sizes the array part from the
 /// list items, and list items keep their place in it, first under `next`.
 /// `nil` items hold the slots until the list's own stores fill them. Runs
-/// once, on the finished tree, every closure included. Refuses
+/// once, on the finished tree, every closure included. Also preserves an
+/// underfilled hash allocation. Refuses an unrepresentable allocation or
 /// ([`LIST_INDEX_GAP`]) a store that skips past the slots the stores fill.
-pub fn reserve_unfolded_list_slots(block: &mut Block) -> Result<(), &'static str> {
+pub fn reserve_unfolded_table_slots(block: &mut Block) -> Result<(), &'static str> {
+    // Leave an unfinished constructor intact for the bounded snapshot recovery.
+    if block.0.iter().any(|statement| matches!(statement, Statement::SetList(list) if list.tail.is_some())) {
+        return Err(OPEN_LIST_TAIL);
+    }
+    unfold_store_sized_fields(block);
     for index in 0..block.0.len() {
         let (head, rest) = block.0.split_at_mut(index + 1);
+        // The constructor the compiler sizes from the stores keeps no padding.
+        let mut sized = false;
         if let Some(object) = table_constructor_local(&head[index])
             && let Statement::Assign(assign) = &mut head[index]
             && let RValue::Table(table) = &mut assign.right[0]
         {
+            sized = sized_by_stores(table, rest, &object);
+            if !sized {
+                reserve_allocation_slots(table)?;
+            }
             reserve_list_slots(table, rest, &object)?;
         }
         let statement = &mut block.0[index];
         let mut nested = Ok(());
         statement.traverse_rvalues(&mut |value| {
-            if let RValue::Closure(closure) = value
-                && nested.is_ok()
-            {
-                nested = reserve_unfolded_list_slots(&mut closure.function.lock().body);
+            if nested.is_ok() {
+                nested = match value {
+                    RValue::Closure(closure) => reserve_unfolded_table_slots(&mut closure.function.lock().body),
+                    // The first table is the constructor itself.
+                    RValue::Table(_) if std::mem::take(&mut sized) => Ok(()),
+                    RValue::Table(table) => reserve_allocation_slots(table),
+                    _ => Ok(()),
+                };
             }
         });
         nested?;
         match statement {
             Statement::If(node) => {
-                reserve_unfolded_list_slots(&mut node.then_block.lock())?;
-                reserve_unfolded_list_slots(&mut node.else_block.lock())?;
+                reserve_unfolded_table_slots(&mut node.then_block.lock())?;
+                reserve_unfolded_table_slots(&mut node.else_block.lock())?;
             }
-            Statement::While(node) => reserve_unfolded_list_slots(&mut node.block.lock())?,
-            Statement::Repeat(node) => reserve_unfolded_list_slots(&mut node.block.lock())?,
-            Statement::NumericFor(node) => reserve_unfolded_list_slots(&mut node.block.lock())?,
-            Statement::GenericFor(node) => reserve_unfolded_list_slots(&mut node.block.lock())?,
+            Statement::While(node) => reserve_unfolded_table_slots(&mut node.block.lock())?,
+            Statement::Repeat(node) => reserve_unfolded_table_slots(&mut node.block.lock())?,
+            Statement::NumericFor(node) => reserve_unfolded_table_slots(&mut node.block.lock())?,
+            Statement::GenericFor(node) => reserve_unfolded_table_slots(&mut node.block.lock())?,
             _ => {}
         }
     }
     Ok(())
+}
+
+/// A constructor holding named fields of a table its later stores also
+/// fill, smaller than the allocation those stores size (`local M = { A =
+/// function() end }; function M.B() end ...`): as stores again, right after
+/// `local M = {}`, the fields let Luau size the table from all of them, as
+/// the source did; kept, the constructor needs `nil` fields to hold the
+/// allocation ([`Table::hash_padding`]).
+fn unfold_store_sized_fields(block: &mut Block) {
+    let mut index = 0;
+    while index < block.0.len() {
+        if let Some(object) = table_constructor_local(&block.0[index])
+            && let Statement::Assign(assign) = &block.0[index]
+            && let RValue::Table(table) = &assign.right[0]
+            && let crate::TableShape::NewTable { hash, array } = table.2
+            && table.0.len().next_power_of_two() != hash as usize
+            && let Some(name) = object.0.0.lock().0.clone()
+            && let Some(fields) = table.0.iter().map(|(key, value)| match key {
+                // Moved past the declaration, a value would read the new
+                // local where it read another `name`.
+                Some(RValue::Literal(crate::Literal::String(field)))
+                    if crate::formatter::Formatter::<String>::is_valid_name(field) && !mentions(value, &name) =>
+                {
+                    Some(field.clone())
+                }
+                _ => None,
+            }).collect::<Option<rustc_hash::FxHashSet<_>>>()
+        {
+            let mut prediction = ArrayPrediction { object: &object, size: 0, loops: Default::default(), fields };
+            prediction.block(&block.0[index + 1..]);
+            if prediction.size == array && prediction.fields.len().next_power_of_two() == hash as usize {
+                let Statement::Assign(assign) = &mut block.0[index] else { unreachable!() };
+                let RValue::Table(table) = &mut assign.right[0] else { unreachable!() };
+                let stores: Vec<Statement> = std::mem::take(&mut table.0)
+                    .into_iter()
+                    .map(|(key, value)| Assign::new(vec![Index::new(object.clone().into(), key.unwrap()).into()], vec![value]).into())
+                    .collect();
+                let after = index + 1;
+                index += stores.len();
+                block.0.splice(after..after, stores);
+            }
+        }
+        index += 1;
+    }
+}
+
+/// Whether `value` prints `name` as a word.
+fn mentions(value: &RValue, name: &str) -> bool {
+    let text = value.to_string();
+    let word = |c: Option<char>| c.is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
+    text.match_indices(name).any(|(at, _)| !word(text[..at].chars().next_back()) && !word(text[at + name.len()..].chars().next()))
+}
+
+/// An array allocation no `nil` items spell ([`create_large_allocations`]).
+pub const LARGE_ALLOCATION: &str = "a NEWTABLE array allocation without enough reproducible constructor items";
+
+/// `table.create(n)` for an empty constructor whose array part is past what
+/// `nil` items may spell: Luau allocates the same table (`lua_createtable(L,
+/// n, 0)`). Only where `table` is the builtin library: the chunk never
+/// assigns it and has a fixed environment. The hash part of an empty
+/// constructor is not kept elsewhere either ([`Table::hash_padding`]).
+pub fn create_large_allocations(block: &mut Block) {
+    for index in 0..block.0.len() {
+        // A constructor its stores size keeps `{}`.
+        let (head, rest) = block.0.split_at(index + 1);
+        let mut sized = table_constructor_local(&head[index]).is_some_and(|object| {
+            matches!(&head[index], Statement::Assign(assign)
+                if matches!(&assign.right[0], RValue::Table(table) if sized_by_stores(table, rest, &object)))
+        });
+        let statement = &mut block.0[index];
+        statement.traverse_rvalues(&mut |value| match value {
+            RValue::Closure(closure) => create_large_allocations(&mut closure.function.lock().body),
+            RValue::Table(_) if std::mem::take(&mut sized) => {}
+            RValue::Table(table)
+                if table.0.is_empty()
+                    && matches!(table.2, crate::TableShape::NewTable { array, .. }
+                        if array as usize > crate::table::MAX_ALLOCATION_PADDING) =>
+            {
+                let crate::TableShape::NewTable { array, .. } = table.2 else { unreachable!() };
+                let create = Index::new(
+                    crate::Global::new(b"table".to_vec()).into(),
+                    crate::Literal::String(b"create".to_vec()).into(),
+                );
+                *value = crate::Call::new(create.into(), vec![crate::Literal::Number(f64::from(array)).into()]).into();
+            }
+            _ => {}
+        });
+        match statement {
+            Statement::If(node) => {
+                create_large_allocations(&mut node.then_block.lock());
+                create_large_allocations(&mut node.else_block.lock());
+            }
+            Statement::While(node) => create_large_allocations(&mut node.block.lock()),
+            Statement::Repeat(node) => create_large_allocations(&mut node.block.lock()),
+            Statement::NumericFor(node) => create_large_allocations(&mut node.block.lock()),
+            Statement::GenericFor(node) => create_large_allocations(&mut node.block.lock()),
+            _ => {}
+        }
+    }
+}
+
+/// Late recovery for effectful prefix fields. The pipeline's final local and
+/// register checks also cover these introduced bindings; no cleanup may move them.
+// shortcut: bound recovery to 64 regions with 32 fields; expand with headroom and motion controls.
+pub fn snapshot_open_list_constructors(block: &mut Block) -> Option<crate::local_producers::Pass> {
+    let inventory = crate::lower_conditionals::prepare_local_rewrite(block, |block|
+        block.0.iter().any(|statement| matches!(statement, Statement::SetList(list) if list.tail.is_some()))
+    ).ok()??;
+    let mut state = OpenListSnapshots { safety: crate::deinline_safety::CaptureSafety::captures(block),
+        inventory, visited: Default::default(), regions: 0,
+        pass: crate::local_producers::Pass { pass: "table_open_list_snapshots",
+            rewrite_model: "private-prefix-snapshots-v1", introduced_locals: 0, ledger: Default::default() } };
+    state.block(block, None);
+    (state.regions > 0).then_some(state.pass)
+}
+
+struct OpenListSnapshots {
+    safety: crate::deinline_safety::CaptureSafety,
+    inventory: crate::lower_conditionals::RewriteInventory,
+    visited: rustc_hash::FxHashSet<usize>,
+    regions: usize,
+    pass: crate::local_producers::Pass,
+}
+
+impl OpenListSnapshots {
+    fn can_snapshot_key(&self, key: &RValue, value: &RValue, function: Option<usize>) -> bool {
+        // shortcut: ambiguous capture contexts stay refused until read timing is proved for every occurrence.
+        !matches!(key, RValue::Local(local) if self.inventory.captured.contains(&local.stable_id())
+            && !crate::is_total_pure(value) && !self.safety.register_of(local, function)
+            && !self.safety.upvalue_of(local, function))
+    }
+
+    fn snapshots(&mut self, fields: &mut [(Option<RValue>, RValue)], function: Option<usize>) -> Vec<Statement> {
+        let mut prefix = Vec::new();
+        for (key, value) in fields {
+            // An owning register key is read by SETTABLE after the value callback.
+            let key_last = matches!(key, Some(RValue::Local(local))
+                if self.inventory.captured.contains(&local.stable_id())
+                    && !crate::is_total_pure(value) && self.safety.register_of(local, function));
+            let mut values = [(key.as_mut(), "constructorKey"), (Some(value), "constructorValue")];
+            if key_last { values.swap(0, 1); }
+            for (value, name) in values {
+                let Some(value) = value else { continue; };
+                if matches!(value, RValue::Literal(_)) { continue; }
+                let local = crate::rehoist_constants::unique_local(name, &mut self.inventory.reserved);
+                let mut declaration = Assign::new(vec![local.clone().into()],
+                    vec![std::mem::replace(value, local.clone().into())]);
+                declaration.prefix = true;
+                prefix.push(declaration.into());
+                self.pass.introduced_locals += 1;
+                self.pass.ledger.record(&local, crate::local_producers::Role::ConstructorInitializerSnapshot);
+            }
+        }
+        prefix
+    }
+
+    fn value(&mut self, value: &mut RValue) {
+        if let RValue::Closure(closure) = value {
+            let function = (&*closure.function.0 as *const _) as usize;
+            if self.visited.insert(function) {
+                self.block(&mut closure.function.lock().body, Some(function));
+            }
+        } else {
+            value.visit_rvalues_mut(&mut |child| { self.value(child); true });
+        }
+    }
+
+    fn block(&mut self, block: &mut Block, function: Option<usize>) {
+        for statement in &mut block.0 {
+            if let Statement::Assign(assign) = statement {
+                for left in &mut assign.left {
+                    if let LValue::Index(index) = left {
+                        self.value(&mut index.left);
+                        self.value(&mut index.right);
+                    }
+                }
+            }
+            statement.visit_rvalues_mut(&mut |value| { self.value(value); true });
+            match statement {
+                Statement::If(node) => { self.block(&mut node.then_block.lock(), function); self.block(&mut node.else_block.lock(), function); }
+                Statement::While(node) => self.block(&mut node.block.lock(), function),
+                Statement::Repeat(node) => self.block(&mut node.block.lock(), function),
+                Statement::NumericFor(node) => self.block(&mut node.block.lock(), function),
+                Statement::GenericFor(node) => self.block(&mut node.block.lock(), function),
+                _ => {}
+            }
+        }
+        let mut index = 0;
+        while index < block.0.len() && self.regions < 64 {
+            let Some(object) = table_constructor_local(&block.0[index]) else { index += 1; continue; };
+            if self.inventory.captured.contains(&object.stable_id()) { index += 1; continue; }
+            let original = block.0[index].as_assign().unwrap().right[0].as_table().unwrap();
+            let crate::TableShape::NewTable { hash, array } = original.2 else { index += 1; continue; };
+            let positional = original.0.iter().filter(|(key, _)| key.is_none()).count();
+            let mut keyed = original.0.len() - positional;
+            if original.0.len() > 32 || keyed > hash as usize
+                || original.0.last().is_some_and(|(key, value)| key.is_none() && expands(value))
+                || original.0.iter().any(|(key, value)| key.as_ref().is_some_and(|key| !self.can_snapshot_key(key, value, function)))
+            {
+                index += 1; continue;
+            }
+            let mut can_raise = false;
+            let mut interleave_checks = false;
+            for (key, value) in &original.0 {
+                // Once a store can fail, no later expression may run early.
+                interleave_checks |= can_raise && (key.as_ref().is_some_and(|key| !crate::is_total_pure(key))
+                    || !crate::is_total_pure(value));
+                can_raise |= key.as_ref().is_some_and(|key| !crate::is_total_table_key(key));
+            }
+            let initial_fields = original.0.len();
+            let mut table = original.clone();
+            let mut stores = Vec::new();
+            let mut endpoint = None;
+            let mut proof = ConstructorMotion { object: object.stable_id(), dependencies: Default::default(), remaining: 4096 };
+            for next in index + 1..block.0.len().min(index + 65) {
+                if let Statement::SetList(list) = &block.0[next] {
+                    if list.tail.is_some() && can_append_set_list(&table, list, &object) { endpoint = Some(next); }
+                    break;
+                }
+                if let Some((key, value)) = block.0[next].as_assign()
+                    .and_then(|assign| field_assignment_parts(assign, &object))
+                {
+                    // These keys remain explicit beside the tail, so each consumes hash syntax.
+                    if table.0.len() >= 32 || keyed >= hash as usize
+                        || !self.can_snapshot_key(key, value, function)
+                        || !crate::table_takes_another_key(&table, key)
+                        || !proof.value(key, 0) || !proof.value(value, 0) { break; }
+                    can_raise |= !crate::is_total_table_key(key);
+                    stores.push((next, table.0.len()));
+                    // Repeat the store, not its final value: nil can change collision history.
+                    table.0.push((Some(key.clone()), value.clone()));
+                    keyed += 1;
+                } else if !proof.statement(&block.0[next], 0) { break; }
+            }
+            let Some(end) = endpoint else { index += 1; continue; };
+            let list = block.0[end].as_set_list().unwrap();
+            let tail = list.tail.as_ref().unwrap();
+            // Retaining positional fields must reproduce the original static array allocation, not an earlier resize.
+            if positional > 0 && (!expands(tail) || array as usize != positional + list.values.len()
+                + usize::from(!matches!(tail, RValue::VarArg(_))))
+            { index += 1; continue; }
+            table.0.extend(list.values.iter().cloned().map(|value| (None, single_value(value))));
+            table.0.push((None, list.tail.clone().unwrap()));
+            if table.hash_padding().is_err() { index += 1; continue; }
+            // A private key checker needs no array padding that might overwrite a checked numeric key.
+            interleave_checks |= positional > 0 && can_raise;
+            let mut prefix = if interleave_checks {
+                let mut check = block.0[index].as_assign().unwrap().clone();
+                // This private table only checks keys; the final constructor retains allocation and layout.
+                check.right[0] = Table::default().into();
+                let mut prefix = vec![check.into()];
+                for field in &mut table.0[..initial_fields] {
+                    prefix.extend(self.snapshots(std::slice::from_mut(field), function));
+                    if let Some(key) = &field.0 {
+                        prefix.push(Assign::new(vec![Index::new(object.clone().into(), key.clone()).into()],
+                            vec![field.1.clone()]).into());
+                    }
+                }
+                prefix
+            } else {
+                self.snapshots(&mut table.0[..initial_fields], function)
+            };
+            let mut replacements = Vec::new();
+            for (position, field) in stores {
+                let mut prefix = self.snapshots(&mut table.0[field..field + 1], function);
+                if can_raise {
+                    let mut store = block.0[position].as_assign().unwrap().clone();
+                    store.left[0].as_index_mut().unwrap().right = Box::new(table.0[field].0.clone().unwrap());
+                    store.right[0] = table.0[field].1.clone();
+                    prefix.push(store.into());
+                }
+                replacements.push((position, prefix));
+            }
+            let mut initializer = block.0[index].as_assign().unwrap().clone();
+            initializer.right[0].as_table_mut().unwrap().0.clone_from_slice(&table.0[..initial_fields]);
+            let mut final_store = initializer.clone();
+            final_store.prefix = !can_raise;
+            final_store.node_origin.merge(&list.node_origin);
+            final_store.right[0] = table.into();
+            block.0[end] = final_store.into();
+            if can_raise && !interleave_checks { prefix.push(initializer.into()); }
+            let inserted = prefix.len();
+            for (position, replacement) in replacements.into_iter().rev() {
+                block.0.splice(position..=position, replacement);
+            }
+            block.0.splice(index..=index, prefix);
+            self.regions += 1;
+            index += inserted;
+        }
+    }
+}
+
+fn lower_array_keys(table: &mut Table) -> Result<usize, &'static str> {
+    let crate::TableShape::NewTable { hash, array } = table.2 else { return Ok(0); };
+    let positional = table.0.iter().filter(|(key, _)| key.is_none()).count();
+    // Positional fields have their own numbering: converting `[2]` in
+    // `{1, [2] = nil, 3}` would shift the final store from index 2 to 3.
+    if positional > 0 { return Ok(positional); }
+    let sequential = table.0.iter().filter_map(|(key, _)| key.as_ref().and_then(|key| table.array_index(key)))
+        .enumerate().all(|(slot, index)| index == slot + 1);
+    if !sequential {
+        // Pad the array before these stores, retaining their explicit keys and
+        // order. Their keyed syntax must still fit the original hash allocation.
+        return if table.0.len() <= hash as usize { Ok(0) }
+            else { Err("nonsequential constructor stores into a preallocated array") };
+    }
+    let mut slots = 0;
+    for (key, value) in &mut table.0 {
+        if let Some(RValue::Literal(crate::Literal::Number(index))) = key
+            && *index >= 1.0 && *index <= f64::from(array) && index.fract() == 0.0
+        {
+            if *index != (slots + 1) as f64 {
+                return Err("nonsequential constructor stores into a preallocated array");
+            }
+            *key = None;
+            *value = single_value(std::mem::replace(value, crate::Literal::Nil.into()));
+        }
+        slots += usize::from(key.is_none());
+    }
+    Ok(slots)
+}
+
+/// Whether Luau gives the printed `local object = {}` the array part the
+/// bytecode allocated without any `nil` items: it sizes an empty constructor
+/// declared alone from the stores to the local that follow (`TableShape.cpp`).
+fn sized_by_stores(table: &Table, rest: &[Statement], object: &RcLocal) -> bool {
+    let crate::TableShape::NewTable { array, .. } = table.2 else { return false };
+    array > 0
+        && table.0.is_empty()
+        && !rest.iter().any(|statement| matches!(statement, Statement::SetList(list) if &list.object_local == object))
+        && {
+            let mut prediction = ArrayPrediction { object, size: 0, loops: Default::default(), fields: Default::default() };
+            prediction.block(rest);
+            prediction.size == array
+        }
+}
+
+/// Luau's `predictTableShapes` for one table, over the printed statements in
+/// source order, nested blocks and closures included: `object[n] = v` grows
+/// the array part when `n` is the next index; `object[i] = v` in a
+/// `for i = 1, k` loop (`k <= 16`, no step) sizes a still-empty one to `k`;
+/// each distinct `object.name = v` adds a hash node (`fields`). Compound
+/// assignments and declarations never count.
+struct ArrayPrediction<'a> {
+    object: &'a RcLocal,
+    size: u32,
+    loops: rustc_hash::FxHashMap<RcLocal, u32>,
+    fields: rustc_hash::FxHashSet<Vec<u8>>,
+}
+
+impl ArrayPrediction<'_> {
+    fn block(&mut self, statements: &[Statement]) {
+        for statement in statements {
+            self.statement(statement);
+        }
+    }
+
+    fn statement(&mut self, statement: &Statement) {
+        match statement {
+            Statement::Assign(assign) if !assign.prefix && !crate::formatter::prints_as_compound(assign) => {
+                for left in &assign.left {
+                    if let LValue::Index(Index { left: object, right: key, .. }) = left
+                        && let RValue::Local(base) = object.as_ref()
+                        && base == self.object
+                    {
+                        match &**key {
+                            RValue::Literal(crate::Literal::Number(index)) if *index == f64::from(self.size) + 1.0 => {
+                                self.size += 1;
+                            }
+                            RValue::Local(counter) if self.size == 0 => {
+                                if let Some(&bound) = self.loops.get(counter) {
+                                    self.size = bound;
+                                }
+                            }
+                            RValue::Literal(crate::Literal::String(name)) if crate::formatter::Formatter::<String>::is_valid_name(name) => {
+                                self.fields.insert(name.clone());
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for right in &assign.right {
+                    self.closures(right);
+                }
+                return;
+            }
+            Statement::NumericFor(node) => {
+                for value in [&node.initial, &node.limit, &node.step] {
+                    self.closures(value);
+                }
+                if let (
+                    RValue::Literal(crate::Literal::Number(initial)),
+                    RValue::Literal(crate::Literal::Number(limit)),
+                    RValue::Literal(crate::Literal::Number(step)),
+                ) = (&node.initial, &node.limit, &node.step)
+                    && *initial == 1.0
+                    && *step == 1.0
+                    && (1.0..=16.0).contains(limit)
+                {
+                    self.loops.insert(node.counter.clone(), *limit as u32);
+                }
+                self.block(&node.block.lock());
+                return;
+            }
+            _ => {}
+        }
+        statement.traverse_rvalues_ref(&mut |value| {
+            if let RValue::Closure(closure) = value {
+                self.block(&closure.function.lock().body);
+            }
+        });
+        match statement {
+            Statement::If(node) => {
+                self.block(&node.then_block.lock());
+                self.block(&node.else_block.lock());
+            }
+            Statement::While(node) => self.block(&node.block.lock()),
+            Statement::Repeat(node) => self.block(&node.block.lock()),
+            Statement::GenericFor(node) => self.block(&node.block.lock()),
+            _ => {}
+        }
+    }
+
+    fn closures(&mut self, value: &RValue) {
+        let mut visit = |value: &RValue| {
+            if let RValue::Closure(closure) = value {
+                self.block(&closure.function.lock().body);
+            }
+        };
+        visit(value);
+        value.traverse_rvalues_ref(&mut visit);
+    }
+}
+
+fn reserve_allocation_slots(table: &mut Table) -> Result<(), &'static str> {
+    let crate::TableShape::NewTable { array, .. } = table.2 else { return Ok(()); };
+    let slots = lower_array_keys(table)?;
+    let missing = (array as usize).saturating_sub(slots);
+    if missing > 0 {
+        if missing > crate::table::MAX_ALLOCATION_PADDING || table.0.last().is_some_and(|(key, value)| key.is_none() && expands(value)) {
+            return Err(LARGE_ALLOCATION);
+        }
+        pad_array_slots(table, slots, array as usize)?;
+    }
+    table.hash_padding().map(|_| ())
 }
 
 fn reserve_list_slots(table: &mut Table, statements: &[Statement], object: &RcLocal) -> Result<bool, &'static str> {
@@ -453,8 +1001,29 @@ fn reserve_list_slots(table: &mut Table, statements: &[Statement], object: &RcLo
     if slots - listed > stored.saturating_add(MAX_LIST_GAP) {
         return Err(LIST_INDEX_GAP);
     }
-    table.0.extend(std::iter::repeat_with(|| (None, RValue::Literal(crate::Literal::Nil))).take(slots - listed));
+    pad_array_slots(table, listed, slots)?;
     Ok(true)
+}
+
+fn pad_array_slots(table: &mut Table, listed: usize, slots: usize) -> Result<(), &'static str> {
+    // With no positional fields, reserve before keyed stores: a computed key
+    // may address the array. Luau flushes these nil items before the first key.
+    let position = if listed == 0 { 0 } else { table.0.len() };
+    // An explicit key could already hold a value in a slot that padding clears.
+    if table.0[..position].iter().any(|(key, value)| {
+        let aliases = match key {
+            Some(RValue::Literal(crate::Literal::Number(index))) => {
+                index.fract() == 0.0 && *index > listed as f64 && *index <= slots as f64
+            }
+            None | Some(RValue::Literal(_)) => false,
+            Some(_) => true,
+        };
+        aliases && !matches!(value, RValue::Literal(crate::Literal::Nil))
+    }) {
+        return Err("array allocation padding that could overwrite an explicit key");
+    }
+    table.0.splice(position..position, std::iter::repeat_n((None, crate::Literal::Nil.into()), slots - listed));
+    Ok(())
 }
 
 /// Whether `statement`, its nested blocks included, assigns `local`.
@@ -625,7 +1194,7 @@ fn sink_total_table_declarations(
             || !block.0[field_index]
                 .as_assign()
                 .and_then(|assign| field_assignment_parts(assign, &object))
-                .is_some_and(|(key, _)| absorbs_store(table, key))
+                .is_some_and(|(key, value)| absorbs_store(table, key, value))
         {
             index += 1;
             continue;
@@ -747,7 +1316,7 @@ fn sink_private_constructor_regions(
                     // property layout; motion must improve the output tree.
                     .is_some_and(|(key, value)| !matches!(value, RValue::Closure(_))
                         && can_fold_table_field_assignment(key, value, &object)
-                        && absorbs_store(table, key)),
+                        && absorbs_store(table, key, value)),
                 Statement::SetList(list) => can_append_set_list(table, list, &object),
                 _ => false,
             };
@@ -1103,23 +1672,25 @@ fn placement(
 /// b = 2, c = 3}` under `pairs` (fr-t1110 F2). A template's keys all exist
 /// before its stores, so moving one to the end (a `nil` slot) changes the
 /// order of insertion too.
-fn keeps_template_layout(table: &Table, placement: Placement) -> bool {
+fn keeps_template_layout(table: &Table, placement: Placement, key: &RValue, value: &RValue) -> bool {
     match placement {
-        Placement::Replace(_) => true,
-        Placement::MoveToEnd(_) => !crate::is_template_copy(table),
-        Placement::Append => crate::template_takes_another_key(table),
+        Placement::Replace(position) => crate::table_replaces_entry(table, position, value),
+        Placement::MoveToEnd(position) => crate::table_moves_entry_to_end(table, position),
+        Placement::Append => crate::table_takes_another_key(table, key),
     }
 }
 
 /// Whether the constructor could take a store to `key` right now. Sinking a
 /// declaration toward a store it cannot absorb only moves the table.
-fn absorbs_store(table: &Table, key: &RValue) -> bool {
+fn absorbs_store(table: &Table, key: &RValue, value: &RValue) -> bool {
     match last_entry_for(&table.0, key) {
-        None => true,
+        None => crate::table_takes_another_key(table, key),
         Some(position) => keeps_listed_key(table, position, key)
-            && (inert_suffix(table, position, table.0.len())
+            && ((inert_suffix(table, position, table.0.len())
+                    && crate::table_replaces_entry(table, position, value))
                 || (matches!(&table.0[position].1, RValue::Literal(crate::Literal::Nil))
-                    && crate::is_total_table_key(key))),
+                    && crate::is_total_table_key(key)
+                    && crate::table_moves_entry_to_end(table, position))),
     }
 }
 
@@ -1303,6 +1874,557 @@ mod tests {
 
     fn print(value: RValue) -> crate::Statement {
         Call::new(global("print"), vec![value]).into()
+    }
+
+    #[test]
+    fn template_placeholder_becomes_nil_only_after_both_paths_fill_it() {
+        let object = local("object");
+        let table = Table(vec![(Some(string("Selected")), number(0.0)),
+            (Some(string("Other")), number(0.0))], Default::default(), crate::TableShape::Template { keys: 2 });
+        let mut block = Block(vec![declare(&object, table.into()),
+            If::new(local_value(&local("condition")),
+                Block(vec![assign_field(&object, string("Selected"), number(1.0))]),
+                Block(vec![assign_field(&object, string("Selected"), number(2.0))])).into(),
+            print(local_value(&object))]);
+        assert!(super::nil_unread_placeholders(&mut block, &Default::default()));
+        let table = block.0[0].as_assign().unwrap().right[0].as_table().unwrap();
+        assert_eq!(table.0[0].1, nil());
+        assert_eq!(table.0[1].1, number(0.0));
+        assert!(!super::nil_unread_placeholders(&mut block, &Default::default()));
+    }
+
+    #[test]
+    fn template_placeholder_keeps_zero_before_observation_or_possible_rehash() {
+        let object = local("object");
+        let table = Table(vec![(Some(string("Selected")), number(0.0))],
+            Default::default(), crate::TableShape::Template { keys: 1 });
+        for kind in 0..8 {
+            let write = assign_field(&object, string("Selected"), number(1.0));
+            let hazard = match kind {
+                0 => print(local_value(&object)),
+                1 => assign_field(&object, string("Added"), number(2.0)),
+                2 => assign_field(&object, global("key"), number(2.0)),
+                3 => print(closure_capturing(&object)),
+                4 => If::new(global("condition"), Block(vec![write.clone()]), Block::default()).into(),
+                5 => Return::new(vec![local_value(&object)]).into(),
+                6 => crate::While::new(global("condition"), Block(vec![write.clone()])).into(),
+                _ => assign_field(&object, string("Selected"), Index::new(local_value(&object), string("Selected")).into()),
+            };
+            let mut block = Block(vec![declare(&object, table.clone().into()), hazard]);
+            if kind != 4 { block.0.push(write); }
+            assert!(!super::nil_unread_placeholders(&mut block, &Default::default()), "hazard {kind}");
+        }
+        let mut block = Block(vec![declare(&object, table.into()),
+            assign_field(&object, string("Selected"), number(1.0))]);
+        assert!(!super::nil_unread_placeholders(&mut block, &[object].into_iter().collect()));
+    }
+
+    #[test]
+    fn template_placeholder_keeps_zero_across_possible_collection() {
+        let object = local("object");
+        let temporary = local("temporary");
+        let table = Table(vec![(Some(string("Selected")), number(0.0))],
+            Default::default(), crate::TableShape::Template { keys: 1 });
+        let call = || RValue::Call(Call::new(global("collect"), vec![]));
+        let write = || assign_field(&object, string("Selected"), number(1.0));
+        let hazards = vec![
+            print(number(1.0)),
+            declare(&temporary, call()),
+            declare(&temporary, Table::new(vec![]).into()),
+            declare(&temporary, closure_capturing(&temporary)),
+            assign_field(&object, string("Selected"), call()),
+            If::new(call(), Block(vec![write()]), Block(vec![write()])).into(),
+            If::new(global("condition"), Block(vec![write()]), Block(vec![write()])).into(),
+        ];
+        for (index, hazard) in hazards.into_iter().enumerate() {
+            let mut block = Block(vec![declare(&object, table.clone().into()), hazard, write()]);
+            assert!(!super::nil_unread_placeholders(&mut block, &Default::default()), "hazard {index}");
+            assert_eq!(block[0].as_assign().unwrap().right[0].as_table().unwrap().0[0].1, number(0.0));
+        }
+    }
+
+    #[test]
+    fn template_placeholder_checks_all_constructor_values_and_keeps_safe_slots() {
+        let object = local("object");
+        for value in [RValue::Call(Call::new(global("collect"), vec![])), Table::new(vec![]).into()] {
+            for duplicate in [false, true] {
+                for earlier in [false, true] {
+                    let mut fields = vec![(Some(string("Selected")), number(0.0)),
+                        (Some(string(if duplicate { "Selected" } else { "Other" })), value.clone())];
+                    if earlier { fields.reverse(); }
+                    let table = Table(fields, Default::default(), crate::TableShape::Template { keys: 2 });
+                    let mut block = Block(vec![declare(&object, table.into()),
+                        assign_field(&object, string("Selected"), number(1.0))]);
+                    assert!(!super::nil_unread_placeholders(&mut block, &Default::default()));
+                }
+            }
+        }
+        let table = Table(vec![(Some(string("Before")), number(7.0)),
+            (Some(string("Selected")), number(0.0))], Default::default(), crate::TableShape::Template { keys: 2 });
+        let mut block = Block(vec![declare(&object, table.into()),
+            assign_field(&object, string("Selected"), number(1.0))]);
+        assert!(super::nil_unread_placeholders(&mut block, &Default::default()));
+        assert_eq!(block[0].as_assign().unwrap().right[0].as_table().unwrap().0[1].1, nil());
+    }
+
+    #[test]
+    fn template_placeholder_keeps_zero_when_an_earlier_dead_key_can_rehash() {
+        let object = local("object");
+        for value in [RValue::Call(Call::new(global("collect"), vec![])),
+            Table::new(vec![]).into(), closure_capturing(&local("captured"))]
+        {
+            let table = Table(vec![(Some(string("Earlier")), nil()),
+                (Some(string("Collector")), value),
+                (Some(string("Selected")), number(0.0))], Default::default(),
+                crate::TableShape::Template { keys: 3 });
+            let mut block = Block(vec![declare(&object, table.into()),
+                If::new(local_value(&local("condition")),
+                    Block(vec![assign_field(&object, string("Earlier"), number(1.0))]),
+                    Block(vec![assign_field(&object, string("Earlier"), number(2.0))])).into(),
+                assign_field(&object, string("Selected"), number(3.0))]);
+            assert!(!super::nil_unread_placeholders(&mut block, &Default::default()));
+            assert_eq!(block[0].as_assign().unwrap().right[0].as_table().unwrap().0[2].1, number(0.0));
+            block.0.remove(1);
+            assert!(!super::nil_unread_placeholders(&mut block, &Default::default()));
+        }
+    }
+
+    #[test]
+    fn hash_padding_repeats_only_the_first_key_and_is_bounded() {
+        let mut table = Table(vec![(Some(string("first")), number(1.0)),
+            (Some(string("second")), nil())], Default::default(), crate::TableShape::NewTable { hash: 8, array: 0 });
+        let original = table.0.clone();
+        super::reserve_allocation_slots(&mut table).unwrap();
+        assert_eq!(table.0, original);
+        assert_eq!(table.to_string().matches("[\"first\"] = nil").count(), 3);
+        let padded = table.clone();
+        super::reserve_allocation_slots(&mut table).unwrap();
+        assert_eq!(table, padded);
+        // No field can carry the padding: the legacy constructor prints unchanged.
+        for fields in [vec![(None, number(1.0))], vec![(Some(global("key")), number(1.0))]] {
+            let mut table = Table(fields, Default::default(), crate::TableShape::NewTable { hash: 8, array: 0 });
+            let before = table.0.clone();
+            super::reserve_allocation_slots(&mut table).unwrap();
+            assert_eq!(table.0, before);
+        }
+        table.2 = crate::TableShape::NewTable { hash: 1 << 30, array: 0 };
+        super::reserve_allocation_slots(&mut table).unwrap();
+        table.2 = crate::TableShape::NewTable { hash: 0, array: (crate::table::MAX_ALLOCATION_PADDING + 1) as u32 };
+        assert!(super::reserve_allocation_slots(&mut table).is_err());
+    }
+
+    #[test]
+    fn preallocated_array_keys_keep_positions_capacity_and_single_values() {
+        let mut table = Table(vec![(Some(number(1.0)), nil()),
+            (Some(number(2.0)), Call::new(global("many"), vec![]).into())],
+            Default::default(), crate::TableShape::NewTable { hash: 0, array: 2 });
+        super::reserve_allocation_slots(&mut table).unwrap();
+        assert_eq!(table.to_string(), "{ nil, (many()) }");
+        table.2 = crate::TableShape::NewTable { hash: 0, array: 3 };
+        super::reserve_allocation_slots(&mut table).unwrap();
+        assert_eq!(table.0.len(), 3);
+        assert_eq!(table.0[2], (None, nil()));
+        table.2 = crate::TableShape::NewTable { hash: 1, array: 3 };
+        let fields = table.0.clone();
+        for _ in 0..2 {
+            super::reserve_allocation_slots(&mut table).unwrap();
+            assert!(table.to_string().contains("[1] = nil"));
+            assert_eq!(table.0, fields);
+        }
+        let mut gap = Table(vec![(Some(number(2.0)), number(1.0))],
+            Default::default(), crate::TableShape::NewTable { hash: 0, array: 3 });
+        assert!(super::reserve_allocation_slots(&mut gap).is_err());
+        let mut mixed = Table(vec![(None, number(1.0)), (Some(number(2.0)), nil()), (None, number(3.0))],
+            Default::default(), crate::TableShape::NewTable { hash: 1, array: 2 });
+        super::reserve_allocation_slots(&mut mixed).unwrap();
+        assert!(mixed.to_string().contains("[2] = nil"));
+        assert_eq!(mixed.0.len(), 3);
+        mixed.0.pop();
+        mixed.0[1].1 = number(9.0);
+        assert!(super::reserve_allocation_slots(&mut mixed).is_err());
+    }
+
+    #[test]
+    fn nonsequential_array_stores_keep_keys_after_initial_nil_reservation() {
+        for keys in [vec![2.0], vec![1.0, 3.0], vec![3.0, 1.0]] {
+            let fields: Vec<_> = keys.into_iter().map(|key| (Some(number(key)), number(key * 10.0))).collect();
+            let mut table = Table(fields.clone(), Default::default(), crate::TableShape::NewTable { hash: 4, array: 3 });
+            super::reserve_allocation_slots(&mut table).unwrap();
+            assert_eq!(&table.0[..3], &[(None, nil()), (None, nil()), (None, nil())]);
+            assert_eq!(&table.0[3..], &fields);
+            let padded = table.clone();
+            super::reserve_allocation_slots(&mut table).unwrap();
+            assert_eq!(table, padded);
+        }
+        let fields = vec![(Some(number(1.0)), number(1.0)), (Some(number(3.0)), number(3.0))];
+        let mut table = Table(fields.clone(), Default::default(), crate::TableShape::NewTable { hash: 1, array: 3 });
+        assert!(super::reserve_allocation_slots(&mut table).is_err());
+        assert_eq!(table.0, fields);
+    }
+
+    #[test]
+    fn array_reservation_precedes_computed_keys_that_can_address_it() {
+        let original = vec![(Some(global("key")), number(9.0))];
+        let mut table = Table(original.clone(), Default::default(),
+            crate::TableShape::NewTable { hash: 1, array: 2 });
+        let object = local("object");
+        let mut block = Block(vec![declare(&object, table.clone().into()),
+            crate::SetList::new(object.clone(), 1, vec![number(1.0)],
+                Some(Call::new(global("tail"), vec![]).into())).into()]);
+        super::reserve_allocation_slots(&mut table).unwrap();
+        assert_eq!(table.0[..2], [(None, nil()), (None, nil())]);
+        assert_eq!(table.0[2..], original);
+        let reserved = table.clone();
+        super::reserve_allocation_slots(&mut table).unwrap();
+        assert_eq!(table, reserved);
+        // An open tail is refused before mutating the constructor, so the late
+        // snapshot recovery can still see the original fields.
+        assert_eq!(super::reserve_unfolded_table_slots(&mut block), Err(super::OPEN_LIST_TAIL));
+        assert_eq!(block.0[0].as_assign().unwrap().right[0].as_table().unwrap().0, original);
+    }
+
+    #[test]
+    fn final_reservation_refuses_open_tails_in_nested_blocks() {
+        for tail in [Some(Call::new(global("tail"), vec![]).into()), Some(crate::VarArg {}.into()), None] {
+            let open = tail.is_some();
+            let object = local("object");
+            let body = Block(vec![declare(&object, Table::default().into()),
+                crate::SetList::new(object, 1, vec![number(1.0)], tail).into()]);
+            let mut block = Block(vec![If::new(global("condition"), body, Block::default()).into()]);
+            assert_eq!(super::reserve_unfolded_table_slots(&mut block),
+                if open { Err(super::OPEN_LIST_TAIL) } else { Ok(()) });
+        }
+    }
+
+    #[test]
+    fn late_list_snapshots_keep_evaluation_order_and_record_fresh_bindings() {
+        for dynamic_key in [false, true] {
+            let object = local("object");
+            let key = if dynamic_key { Call::new(global("key"), vec![]).into() } else { string("second") };
+            let table = Table(vec![(Some(string("first")), Call::new(global("first"), vec![]).into()),
+                (Some(key), Call::new(global("last"), vec![]).into())], Default::default(),
+                crate::TableShape::NewTable { hash: 2, array: 2 });
+            let mut block = Block(vec![declare(&object, table.into()), Call::new(global("middle"), vec![]).into(),
+                crate::SetList::new(object, 1, vec![number(1.0)], Some(Call::new(global("tail"), vec![]).into())).into()]);
+            let pass = super::snapshot_open_list_constructors(&mut block).unwrap();
+            assert_eq!(pass.introduced_locals, if dynamic_key { 3 } else { 2 });
+            assert_eq!(pass.ledger.records.len(), pass.introduced_locals);
+            let text = block.to_string();
+            assert!(text.find("first()").unwrap() < text.find("last()").unwrap(), "{text}");
+            assert!(text.find("last()").unwrap() < text.find("middle()").unwrap(), "{text}");
+            assert!(text.find("middle()").unwrap() < text.find("tail()").unwrap(), "{text}");
+            for call in ["first()", "last()", "middle()", "tail()"] { assert_eq!(text.matches(call).count(), 1); }
+            if dynamic_key { assert!(text.find("first()").unwrap() < text.find("key()").unwrap()); }
+            assert_eq!(block.0.iter().filter(|statement| statement.as_assign()
+                .is_some_and(|assign| assign.right.first().is_some_and(|value| value.as_table().is_some()))).count(),
+                if dynamic_key { 2 } else { 1 });
+            assert!(super::reserve_unfolded_table_slots(&mut block).is_ok());
+            assert!(super::snapshot_open_list_constructors(&mut block).is_none());
+        }
+    }
+
+    #[test]
+    fn late_list_snapshots_keep_split_and_repeated_field_stores() {
+        for empty in [false, true] {
+            for dynamic in [false, true] {
+                let object = local("object");
+                let fields = if empty { vec![] } else {
+                    vec![(Some(string("first")), Call::new(global("initial"), vec![]).into())]
+                };
+                let key = if dynamic { Call::new(global("key"), vec![]).into() } else { string("first") };
+                let store = |key, value| Assign::new(
+                    vec![crate::Index::new(object.clone().into(), key).into()], vec![value]).into();
+                let mut block = Block(vec![declare(&object, Table(fields, Default::default(),
+                    crate::TableShape::NewTable { hash: 4, array: 2 }).into()),
+                    Call::new(global("before"), vec![]).into(),
+                    store(key, Call::new(global("stored"), vec![]).into()),
+                    store(string("first"), nil()),
+                    Call::new(global("middle"), vec![]).into(),
+                    crate::SetList::new(object.clone(), 1, vec![number(1.0)],
+                        Some(Call::new(global("tail"), vec![]).into())).into()]);
+                let pass = super::snapshot_open_list_constructors(&mut block).unwrap();
+                assert_eq!(pass.introduced_locals, usize::from(!empty) + usize::from(dynamic) + 1);
+                let text = block.to_string();
+                let calls = ["before()", "stored()", "middle()", "tail()"];
+                for call in calls { assert_eq!(text.matches(call).count(), 1, "{text}"); }
+                for pair in calls.windows(2) {
+                    assert!(text.find(pair[0]).unwrap() < text.find(pair[1]).unwrap(), "{text}");
+                }
+                if dynamic {
+                    assert!(text.find("key()").unwrap() < text.find("stored()").unwrap());
+                    assert!(text.find("object[constructorKey]").unwrap() < text.find("middle()").unwrap(), "{text}");
+                }
+                if !empty { assert!(text.find("initial()").unwrap() < text.find("before()").unwrap()); }
+                let constructors: Vec<_> = block.0.iter().filter_map(|statement| statement.as_assign())
+                    .filter_map(|assign| assign.right.first().and_then(RValue::as_table)).collect();
+                assert_eq!(constructors.len(), if dynamic { 2 } else { 1 });
+                let final_table = constructors.last().unwrap();
+                assert_eq!(final_table.0.iter().filter(|(key, _)| key.is_some()).count(), if empty { 2 } else { 3 });
+                assert!(super::reserve_unfolded_table_slots(&mut block).is_ok());
+            }
+        }
+    }
+
+    #[test]
+    fn late_list_snapshots_read_owned_captured_keys_after_effectful_values() {
+        for nested in [false, true] {
+            for split in [false, true] {
+                for value in [number(9.0), local("unchanged").into(),
+                    Call::new(global("change"), vec![]).into(), global("lookup")]
+                {
+                    let key = local("key");
+                    let object = local("object");
+                    let pure = crate::is_total_pure(&value);
+                    let literal = matches!(value, RValue::Literal(_));
+                    let fields = if split { vec![] } else { vec![(Some(key.clone().into()), value.clone())] };
+                    let mut block = Block(vec![declare(&local("change"), closure_capturing(&key)),
+                        declare(&object, Table(fields, Default::default(),
+                            crate::TableShape::NewTable { hash: 1, array: 1 }).into())]);
+                    if split { block.0.push(assign_field(&object, key.clone().into(), value)); }
+                    block.0.push(Call::new(global("middle"), vec![]).into());
+                    block.0.push(crate::SetList::new(object, 1, vec![],
+                        Some(Call::new(global("tail"), vec![]).into())).into());
+                    if nested {
+                        block = Block(vec![declare(&local("build"), Closure {
+                            node_origin: Default::default(),
+                            function: ByAddress(Arc::new(Mutex::new(Function {
+                                parameters: vec![key], body: block, ..Default::default()
+                            }))), upvalues: vec![],
+                        }.into())]);
+                    }
+                    let pass = super::snapshot_open_list_constructors(&mut block).unwrap();
+                    assert_eq!(pass.introduced_locals, if literal { 1 } else { 2 });
+                    assert_eq!(pass.ledger.records.len(), pass.introduced_locals);
+                    let text = block.to_string();
+                    if !literal {
+                        assert_eq!(text.find("local constructorKey = key").unwrap()
+                            < text.find("local constructorValue = ").unwrap(), pure, "{text}");
+                    }
+                    assert!(super::reserve_unfolded_table_slots(&mut block).is_ok(), "{text}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_list_snapshots_read_incoming_keys_before_effectful_values() {
+        for copy in [false, true] {
+            for grandchild in [false, true] {
+                for split in [false, true] {
+                    for value in [Call::new(global("change"), vec![]).into(), global("lookup")] {
+                        let key = local("key");
+                        let object = local("object");
+                        let fields = if split { vec![] } else { vec![(Some(key.clone().into()), value.clone())] };
+                        let mut body = Block(vec![declare(&object, Table(fields, Default::default(),
+                            crate::TableShape::NewTable { hash: 1, array: 1 }).into())]);
+                        if split { body.0.push(assign_field(&object, key.clone().into(), value)); }
+                        body.0.push(Call::new(global("middle"), vec![]).into());
+                        body.0.push(crate::SetList::new(object, 1, vec![],
+                            Some(Call::new(global("tail"), vec![]).into())).into());
+                        let capture = if copy { Upvalue::Copy(key) } else { Upvalue::Ref(key) };
+                        let mut block = Block(vec![declare(&local("build"), Closure {
+                            node_origin: Default::default(),
+                            function: ByAddress(Arc::new(Mutex::new(Function { body, ..Default::default() }))),
+                            upvalues: vec![capture.clone()],
+                        }.into())]);
+                        if grandchild {
+                            block = Block(vec![declare(&local("outer"), Closure {
+                                node_origin: Default::default(),
+                                function: ByAddress(Arc::new(Mutex::new(Function { body: block, ..Default::default() }))),
+                                upvalues: vec![capture],
+                            }.into())]);
+                        }
+                        let pass = super::snapshot_open_list_constructors(&mut block).unwrap();
+                        assert_eq!(pass.introduced_locals, 2);
+                        assert_eq!(pass.ledger.records.len(), 2);
+                        let text = block.to_string();
+                        assert!(text.find("local constructorKey = key").unwrap()
+                            < text.find("local constructorValue = ").unwrap(), "{text}");
+                        assert!(super::reserve_unfolded_table_slots(&mut block).is_ok(), "{text}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_list_snapshots_refuse_ambiguous_captured_keys() {
+        for reverse in [false, true] {
+            for split in [false, true] {
+                for value in [Call::new(global("change"), vec![]).into(), global("lookup")] {
+                    let key = local("key");
+                    let object = local("object");
+                    let fields = if split { vec![] } else { vec![(Some(key.clone().into()), value.clone())] };
+                    let mut body = Block(vec![declare(&object, Table(fields, Default::default(),
+                        crate::TableShape::NewTable { hash: 1, array: 1 }).into())]);
+                    if split { body.0.push(assign_field(&object, key.clone().into(), value)); }
+                    body.0.push(Call::new(global("middle"), vec![]).into());
+                    body.0.push(crate::SetList::new(object, 1, vec![],
+                        Some(Call::new(global("tail"), vec![]).into())).into());
+                    let function = ByAddress(Arc::new(Mutex::new(Function { body, ..Default::default() })));
+                    let closure = Closure { node_origin: Default::default(), function,
+                        upvalues: vec![Upvalue::Ref(key)] };
+                    // One occurrence supplies captures absent from the other shared body.
+                    let mut first = closure.clone();
+                    first.upvalues.clear();
+                    let mut block = Block(vec![declare(&local("first"), first.into()),
+                        declare(&local("build"), closure.into())]);
+                    if reverse { block.0.reverse(); }
+                    let before = block.to_string();
+                    assert!(super::snapshot_open_list_constructors(&mut block).is_none());
+                    assert_eq!(block.to_string(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_list_snapshots_check_initial_keys_before_later_effects() {
+        for later in [Call::new(global("effect"), vec![]).into(), global("observable_lookup")] {
+            let object = local("object");
+            let shape = crate::TableShape::NewTable { hash: 2, array: 2 };
+            let fields = vec![(Some(Call::new(global("key"), vec![]).into()), Call::new(global("first"), vec![]).into()),
+                (Some(string("second")), later.clone())];
+            let mut block = Block(vec![declare(&object, Table(fields, Default::default(), shape).into()),
+                Call::new(global("middle"), vec![]).into(),
+                crate::SetList::new(object, 1, vec![number(1.0)], Some(Call::new(global("tail"), vec![]).into())).into()]);
+            let pass = super::snapshot_open_list_constructors(&mut block).unwrap();
+            assert_eq!(pass.introduced_locals, 3);
+            assert_eq!(pass.ledger.records.len(), 3);
+            let text = block.to_string();
+            let later = later.to_string();
+            let ordered = ["key()", "first()", "object[constructorKey] = constructorValue", &later, "middle()", "tail()"];
+            for pair in ordered.windows(2) {
+                assert!(text.find(pair[0]).unwrap() < text.find(pair[1]).unwrap(), "{text}");
+            }
+            for expression in ["key()", "first()", &later, "middle()", "tail()"] {
+                assert_eq!(text.matches(expression).count(), 1, "{text}");
+            }
+            let tables: Vec<_> = block.0.iter().filter_map(|statement| statement.as_assign())
+                .filter_map(|assign| assign.right.first().and_then(RValue::as_table)).collect();
+            assert_eq!(tables.len(), 2);
+            assert!(tables[0].0.is_empty());
+            assert_eq!(tables[1].2, shape);
+            assert!(super::reserve_unfolded_table_slots(&mut block).is_ok());
+            assert!(super::snapshot_open_list_constructors(&mut block).is_none());
+        }
+    }
+
+    #[test]
+    fn late_list_snapshots_keep_positional_prefixes_and_static_allocation() {
+        for call_tail in [false, true] {
+            for keyed_first in [false, true] {
+                for dynamic_key in [false, true] {
+                    for split in [false, true] {
+                        let object = local("object");
+                        let key = if dynamic_key { Call::new(global("key"), vec![]).into() } else { string("key") };
+                        let mut fields = vec![(None, super::single_value(Call::new(global("first"), vec![]).into())),
+                            (Some(key), Call::new(global("keyed"), vec![]).into())];
+                        if keyed_first { fields.swap(0, 1); }
+                        let shape = crate::TableShape::NewTable { hash: if split { 2 } else { 1 },
+                            array: if call_tail { 3 } else { 2 } };
+                        let mut block = Block(vec![declare(&object, Table(fields, Default::default(), shape).into())]);
+                        if split { block.0.push(assign_field(&object, string("added"), Call::new(global("split"), vec![]).into())); }
+                        block.0.push(Call::new(global("middle"), vec![]).into());
+                        let tail = if call_tail { Call::new(global("tail"), vec![]).into() } else { crate::VarArg {}.into() };
+                        block.0.push(crate::SetList::new(object, 2, vec![number(1.0)], Some(tail)).into());
+                        let pass = super::snapshot_open_list_constructors(&mut block).unwrap();
+                        assert_eq!(pass.introduced_locals, 2 + usize::from(dynamic_key) + usize::from(split));
+                        let text = block.to_string();
+                        assert_eq!(text.matches("first()").count(), 1, "{text}");
+                        assert_eq!(text.matches("keyed()").count(), 1, "{text}");
+                        assert_eq!(text.find("keyed()").unwrap() < text.find("first()").unwrap(), keyed_first, "{text}");
+                        assert!(text.find("first()").unwrap() < text.find("middle()").unwrap(), "{text}");
+                        let final_table = block.0.last().unwrap().as_assign().unwrap().right[0].as_table().unwrap();
+                        assert_eq!(final_table.2, shape);
+                        assert_eq!(final_table.0[usize::from(keyed_first)].0, None);
+                        assert_eq!(final_table.0.iter().filter(|(key, _)| key.is_some()).count(), 1 + usize::from(split));
+                        assert!(super::reserve_unfolded_table_slots(&mut block).is_ok(), "{text}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn late_list_snapshots_reject_positional_resize_and_open_prefixes() {
+        for hazard in 0..5 {
+            let object = local("object");
+            let mut fields = vec![(Some(string("key")), number(1.0)), (None, number(2.0))];
+            let mut array = 2;
+            let mut index = 2;
+            let mut tail = crate::VarArg {}.into();
+            match hazard {
+                0 => array = 1,
+                1 => array = 3,
+                2 => fields[1].1 = Call::new(global("many"), vec![]).into(),
+                3 => tail = number(3.0),
+                4 => index = 3,
+                _ => unreachable!(),
+            }
+            let mut block = Block(vec![declare(&object, Table(fields, Default::default(),
+                crate::TableShape::NewTable { hash: 1, array }).into()), Call::new(global("middle"), vec![]).into(),
+                crate::SetList::new(object, index, vec![number(3.0)], Some(tail)).into()]);
+            let before = block.to_string();
+            assert!(super::snapshot_open_list_constructors(&mut block).is_none(), "hazard {hazard}");
+            assert_eq!(block.to_string(), before);
+        }
+    }
+
+    #[test]
+    fn late_list_snapshots_refuse_self_reads_escape_and_capacity_changes() {
+        for hazard in 0..8 {
+            let object = local("object");
+            let mut fields = vec![(Some(local("key").into()), number(9.0))];
+            let mut middle: crate::Statement = Call::new(global("middle"), vec![]).into();
+            let mut tail = Call::new(global("tail"), vec![]).into();
+            let mut hash = 2;
+            match hazard {
+                0 => fields[0].0 = Some(Index::new(object.clone().into(), string("key")).into()),
+                1 => middle = Call::new(global("observe"), vec![object.clone().into()]).into(),
+                2 => fields.push((Some(string("second")), closure_capturing(&object))),
+                3 => hash = 0,
+                4 => tail = Call::new(global("observe"), vec![object.clone().into()]).into(),
+                5 => middle = Assign::new(vec![crate::Index::new(object.clone().into(), string("second")).into()],
+                    vec![Call::new(global("observe"), vec![object.clone().into()]).into()]).into(),
+                6 => {
+                    hash = 1;
+                    middle = Assign::new(vec![crate::Index::new(object.clone().into(), string("second")).into()],
+                        vec![number(1.0)]).into();
+                }
+                7 => {
+                    fields.clear();
+                    hash = 0;
+                    middle = Assign::new(vec![crate::Index::new(object.clone().into(), number(1.0)).into()],
+                        vec![number(1.0)]).into();
+                }
+                _ => unreachable!(),
+            }
+            let mut block = Block(vec![declare(&object, Table(fields, Default::default(),
+                crate::TableShape::NewTable { hash, array: 2 }).into()), middle,
+                crate::SetList::new(object, 1, vec![number(1.0)], Some(tail)).into()]);
+            let before = block.to_string();
+            assert!(super::snapshot_open_list_constructors(&mut block).is_none(), "hazard {hazard}");
+            assert_eq!(block.to_string(), before);
+        }
+    }
+
+    #[test]
+    fn repeated_keys_preserve_newtable_nil_history_in_both_paths() {
+        for first_value in [nil(), number(0.0)] {
+            let original = Table(vec![(Some(string("first")), first_value.clone()),
+                (Some(string("second")), number(2.0)), (Some(string("first")), number(1.0))],
+                Default::default(), crate::TableShape::NewTable { hash: 4, array: 0 });
+            let mut indexed = original.clone();
+            let mut scanning = original.clone();
+            let changed = super::merge_repeated_keys_indexed(&mut indexed, super::literal_fingerprint);
+            assert_eq!(changed, super::merge_repeated_keys_scanning(&mut scanning));
+            assert_eq!(indexed, scanning);
+            assert_eq!(changed, first_value != nil());
+            if !changed { assert_eq!(indexed, original); }
+            super::reserve_allocation_slots(&mut indexed).unwrap();
+            assert_eq!(indexed.0.len() + indexed.hash_padding().unwrap().0, 3);
+        }
     }
 
     #[test]

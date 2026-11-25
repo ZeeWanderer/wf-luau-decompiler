@@ -230,25 +230,6 @@ fn local_is_conditionally_evaluated(
 /// `name_locals` can give a meaningful name (GetService -> PascalCase service,
 /// require -> module base name). Refusing to inline is always semantics-preserving:
 /// the value is still computed once, read once, in the same position.
-/// Never forward a table constructor into the BASE of an index write
-/// (`local t = {}; t.k = v` -> `({}).k = v`): the write would land on a
-/// temporary nobody can read, deleting the field (a dead `Handlers.Formatter =
-/// function … end` table lost its closures this way). The
-/// `t = {} t.a = 1` -> `t = { a = 1 }` fold reconstructs the constructor instead.
-fn forwards_table_into_index_write(
-    new_rvalue: &ast::RValue,
-    use_stat: &ast::Statement,
-    local: &ast::RcLocal,
-) -> bool {
-    matches!(new_rvalue, ast::RValue::Table(_))
-        && use_stat.as_assign().is_some_and(|a| {
-            a.left.iter().any(|l| {
-                matches!(l, ast::LValue::Index(i)
-                    if matches!(i.left.as_ref(), ast::RValue::Local(x) if x == local))
-            })
-        })
-}
-
 /// Never forward a single-result call into the iterator of generalized
 /// iteration (`local t = f(); for k, v in t do`). The two nils after it are
 /// VM protocol, not source, and are dropped when structuring; `for k, v in
@@ -592,7 +573,7 @@ impl<'a> Inliner<'a> {
                                 if c.function.lock().retain_for_reconstruction)
                         {
                             if let Ok(ast::LValue::Local(local)) = &assign.left.iter().exactly_one()
-                                && !forwards_table_into_index_write(new_rvalue, &block[index], local)
+                                && !ast::inline_temps::forwards_table_into_prefix(new_rvalue, &block[index], local)
                                 && !forwards_call_into_generalized_iteration(new_rvalue, &block[index], local)
                                 && !forwards_cell_into_late_read(new_rvalue, &block[index], local, |cell| {
                                     self.upvalue_to_group.contains_key(cell)
@@ -992,9 +973,9 @@ fn movable_table_declaration(
     block: &ast::Block,
     set_list_index: usize,
     object_local: &ast::RcLocal,
-    cell: impl Fn(&ast::RcLocal) -> bool,
+    cell: impl Fn(&ast::RcLocal) -> Option<u64>,
 ) -> Option<usize> {
-    let mut written_between: Vec<ast::RcLocal> = Vec::new();
+    let mut written_between: Vec<u64> = Vec::new();
     let mut runs_code_between = false;
     for j in (0..set_list_index).rev() {
         let statement = &block[j];
@@ -1003,10 +984,13 @@ fn movable_table_declaration(
         {
             let table = assign.right[0].as_table().unwrap();
             let entries_movable = table.0.iter().all(|(key, value)| {
-                key.iter().chain(std::iter::once(value)).all(|rvalue| {
+                key.as_ref().is_none_or(ast::is_total_table_key)
+                    && key.iter().chain(std::iter::once(value)).all(|rvalue| {
                     ast::is_total_pure(rvalue)
                         && !rvalue.any_local_read(&mut |local| {
-                            written_between.contains(local) || (runs_code_between && cell(local))
+                            let group = cell(local);
+                            written_between.contains(&group.unwrap_or_else(|| local.stable_id()))
+                                || (runs_code_between && group.is_some())
                         })
                 })
             });
@@ -1018,7 +1002,10 @@ fn movable_table_declaration(
             return None;
         }
         runs_code_between |= ast::statement_is_observable(statement);
-        statement.visit_local_writes(&mut |local| { written_between.push(local.clone()); true });
+        // Distinct SSA versions of a captured cell coalesce to the same storage.
+        statement.visit_local_writes(&mut |local| {
+            written_between.push(cell(local).unwrap_or_else(|| local.stable_id())); true
+        });
     }
     None
 }
@@ -1137,23 +1124,24 @@ fn fold_table_constructor_field_assignments(
                 Some(p) if !ast::keeps_listed_key(table.0[p].0.as_ref(), &table.0[p].1, key) => break,
                 Some(p)
                     if ast::is_inert_entry_value(&table.0[p].1)
+                        && ast::table_replaces_entry(table, p, value)
                         && table.0[p..].iter().all(|(key, value)| {
                             key.as_ref().is_some_and(ast::is_total_table_key)
                                 && ast::is_total_pure(value)
                                 && !value.any_local_read(&mut |read| upvalue_to_group.contains_key(read))
                         }) => FieldSlot::Replace(p),
                 // A DUPTABLE copy keeps its template keys in place and its
-                // hash part's size (`ast::template_takes_another_key`): the
+                // hash part's size (`ast::table_takes_another_key`): the
                 // order `pairs` visits keys in depends on both.
                 Some(p) if ast::is_template_placeholder(&table.0[p].1)
                     && ast::is_total_table_key(key)
-                    && !ast::is_template_copy(table) =>
+                    && ast::table_moves_entry_to_end(table, p) =>
                 {
                     FieldSlot::MoveToEnd(p)
                 }
                 Some(_) => break,
                 _ if listed.get_or_insert_with(|| ast::ListedKeys::new(table)).lists(table, key) => break,
-                _ if !ast::template_takes_another_key(table) => break,
+                _ if !ast::table_takes_another_key(table, key) => break,
                 _ => FieldSlot::Append,
             };
 
@@ -1314,11 +1302,11 @@ pub fn inline_with_readonly_captures(
                             let keep_const_table =
                                 matches!(rvalue, ast::RValue::Table(t) if !t.0.is_empty());
                             if !keep_named_closure && !keep_can_raise && !keep_const_table {
-                                // An anonymous function literal capturing nothing that
-                                // Luau inlined everywhere: kept aside for the de-inliner,
+                                // An anonymous function literal Luau inlined everywhere
+                                // (a callback a copy called in place, `activate(key,
+                                // function() ... end)`): kept aside for the de-inliner,
                                 // where it counts as no use (`ast::deinline` orphans).
                                 if let ast::RValue::Closure(closure) = rvalue
-                                    && closure.upvalues.is_empty()
                                     && closure.function.lock().inlined_by_compiler
                                 {
                                     orphans.push((local.clone(), closure.clone()));
@@ -1377,7 +1365,9 @@ pub fn inline_with_readonly_captures(
                         .as_assign()
                         .is_none_or(|assign| assign.left != [object_local.clone().into()])
                         && let Some(decl_index) = movable_table_declaration(block, i, &object_local, |local| {
-                            upvalue_to_group.contains_key(local) && !readonly_capture_ids.contains(&local.stable_id())
+                            upvalue_to_group.get(local)
+                                .filter(|_| !readonly_capture_ids.contains(&local.stable_id()))
+                                .map(ast::RcLocal::stable_id)
                         })
                     {
                         let decl = block.remove(decl_index);
@@ -2365,7 +2355,7 @@ mod set_list_fold_through_tests {
             call_assign(&y, "g", vec![RValue::Local(x.clone())]),
             set_list(&t, vec![RValue::Local(x.clone()), RValue::Local(y.clone())], None),
         ]);
-        assert_eq!(movable_table_declaration(&block, 3, &t, |_| false), Some(0));
+        assert_eq!(movable_table_declaration(&block, 3, &t, |_| None), Some(0));
     }
 
     #[test]
@@ -2377,7 +2367,7 @@ mod set_list_fold_through_tests {
             call_assign(&x, "f", vec![RValue::Local(t.clone())]),
             set_list(&t, vec![RValue::Local(x.clone())], None),
         ]);
-        assert_eq!(movable_table_declaration(&block, 2, &t, |_| false), None);
+        assert_eq!(movable_table_declaration(&block, 2, &t, |_| None), None);
     }
 
     #[test]
@@ -2395,7 +2385,7 @@ mod set_list_fold_through_tests {
             call_assign(&x, "f", Vec::new()),
             set_list(&t, vec![RValue::Local(x.clone())], None),
         ]);
-        assert_eq!(movable_table_declaration(&block, 2, &t, |_| false), None);
+        assert_eq!(movable_table_declaration(&block, 2, &t, |_| None), None);
     }
 
     #[test]
@@ -2413,7 +2403,38 @@ mod set_list_fold_through_tests {
             call_assign(&x, "f", Vec::new()),
             set_list(&t, vec![RValue::Local(x.clone())], Some(Call::new(RValue::Global(Global::from("g")), Vec::new()).into())),
         ]);
-        assert_eq!(movable_table_declaration(&block, 2, &t, |_| false), Some(0));
+        assert_eq!(movable_table_declaration(&block, 2, &t, |_| None), Some(0));
+    }
+
+    #[test]
+    fn declaration_keeps_dynamic_key_errors_before_calls() {
+        let t = local("t");
+        let key = local("key");
+        let x = local("x");
+        let block = Block(vec![
+            table_decl(&t, vec![(Some(key.into()), Literal::Number(9.0).into())]),
+            call_assign(&x, "observe", Vec::new()),
+            set_list(&t, vec![x.into()], None),
+        ]);
+        assert_eq!(movable_table_declaration(&block, 2, &t, |_| None), None);
+    }
+
+    #[test]
+    fn declaration_compares_capture_groups_across_ssa_versions() {
+        let t = local("t");
+        let before = local("before");
+        let after = local("after");
+        let block = Block(vec![
+            table_decl(&t, vec![(Some(Literal::String(b"Value".to_vec()).into()), before.clone().into())]),
+            Assign::new(vec![after.clone().into()], vec![Literal::Number(99.0).into()]).into(),
+            set_list(&t, vec![Literal::Number(1.0).into()], None),
+        ]);
+        for same_cell in [false, true] {
+            let group = |local: &RcLocal| if local == &before { Some(before.stable_id()) }
+                else if local == &after { Some(if same_cell { before.stable_id() } else { after.stable_id() }) }
+                else { None };
+            assert_eq!(movable_table_declaration(&block, 2, &t, group), (!same_cell).then_some(0));
+        }
     }
 
     #[test]

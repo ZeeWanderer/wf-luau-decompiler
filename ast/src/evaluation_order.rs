@@ -24,6 +24,7 @@ pub struct Order {
     pub events: Vec<Event>,
     pub exhausted: bool,
     nodes: usize,
+    literal_numbers: bool,
 }
 
 impl Order {
@@ -36,7 +37,7 @@ impl Order {
         self.nodes += 1;
         if self.exhausted || self.nodes > 4096 || depth >= 128 { self.exhausted = true; return; }
         match value {
-            RValue::Local(local) => self.event(position, effects::intrinsic(value, capture), Some(local.stable_id()), None, conditional),
+            RValue::Local(local) => self.event(position, effects::intrinsic_with_literal_numbers(value, capture, self.literal_numbers), Some(local.stable_id()), None, conditional),
             RValue::Call(call) | RValue::Select(Select::Call(call)) => {
                 self.value(&call.value, Position::Callee, conditional, depth + 1, capture);
                 for (i, arg) in call.arguments.iter().enumerate() {
@@ -60,7 +61,7 @@ impl Order {
                 self.value(&binary.left, position, conditional, depth + 1, capture);
                 let short = matches!(binary.operation, BinaryOperation::And | BinaryOperation::Or);
                 self.value(&binary.right, position, conditional || short, depth + 1, capture);
-                self.event(Position::Operation, effects::intrinsic(value, capture), None, None, conditional);
+                self.event(Position::Operation, effects::intrinsic_with_literal_numbers(value, capture, self.literal_numbers), None, None, conditional);
             }
             RValue::IfExpression(branch) => {
                 self.value(&branch.condition, position, conditional, depth + 1, capture);
@@ -90,7 +91,7 @@ impl Order {
             }
             _ => {
                 value.visit_rvalues(&mut |child| { self.value(child, position, conditional, depth + 1, capture); !self.exhausted });
-                self.event(position, effects::intrinsic(value, capture), None, None, conditional);
+                self.event(position, effects::intrinsic_with_literal_numbers(value, capture, self.literal_numbers), None, None, conditional);
             }
         }
     }
@@ -106,7 +107,12 @@ pub fn statement(statement: &Statement, capture: &impl Fn(&RcLocal) -> bool) -> 
 /// upvalue or any other address is evaluated before them.
 pub fn statement_with_registers(statement: &Statement, capture: &impl Fn(&RcLocal) -> bool,
     register: &impl Fn(&RcLocal) -> bool) -> Order {
-    let mut out = Order::default();
+    statement_with_literal_numbers(statement, capture, register, false)
+}
+
+fn statement_with_literal_numbers(statement: &Statement, capture: &impl Fn(&RcLocal) -> bool,
+    register: &impl Fn(&RcLocal) -> bool, literal_numbers: bool) -> Order {
+    let mut out = Order { literal_numbers, ..Default::default() };
     match statement {
         Statement::Assign(assign) => {
             let late = |value: &RValue| matches!(value, RValue::Local(local) if register(local));
@@ -172,7 +178,7 @@ pub(crate) struct Body<'a> {
     /// The locals the body's function holds in registers, which an operation
     /// reads when it runs; any other is an upvalue, fetched where it stands.
     pub registers: &'a dyn Fn(&RcLocal) -> bool,
-    /// Reads no code can change: a stable local, a constant import.
+    /// Reads no code can change: a stable local or a literal.
     pub unchanged: &'a dyn Fn(&RValue) -> bool,
 }
 
@@ -190,7 +196,7 @@ impl Body<'_> {
 /// call, an index, an operator that may dispatch, a skippable operand) comes
 /// first, `None` when `value` does nothing observable and never reads it.
 /// Literals are not observable, nor reads `body.unchanged` says no code can
-/// change (a stable local, a constant import): a value computed just before
+/// change (a stable local or a literal): a value computed just before
 /// may run code, so any other read it would now precede decides. Unlike the
 /// event order above, this answers one question cheaply: may a value computed
 /// just before `value` move into that read? `register`: the value standing for
@@ -239,19 +245,14 @@ pub(crate) fn reads_first(value: &RValue, local: &RcLocal, register: bool, body:
     }
 }
 
-/// [`reads_first`] of a call: a builtin's FASTCALL takes a register-local
-/// argument as it is, when it runs ([`fastcall_arguments`]); any other call
-/// fetches its callee and copies its arguments in order.
+/// [`reads_first`] of a call: its callee lookup may run before the arguments,
+/// while a builtin (including a local alias) may borrow register arguments
+/// until FASTCALL runs. A motion must be safe under both compilation choices.
 #[cfg(any(test, debug_assertions))]
 fn call_reads_first(call: &crate::Call, local: &RcLocal, register: bool, body: &Body) -> Option<bool> {
-    match fastcall_arguments(call) {
-        // Luau may or may not compile it to FASTCALL: assume the order that
-        // refuses more, early for other locals, late for a register argument
-        // in place of `local`.
-        Some(arguments) => late_operands_read_first(&arguments.iter().collect::<Vec<_>>(), false, local, register, body),
-        None => std::iter::once(&*call.value).chain(&call.arguments)
-            .find_map(|value| reads_first(value, local, register, body)).or(Some(false)),
-    }
+    reads_first(&call.value, local, register, body).or_else(|| {
+        late_operands_read_first(&call.arguments.iter().collect::<Vec<_>>(), false, local, register, body)
+    }).or(Some(false))
 }
 
 /// [`reads_first`] of a method call: NAMECALL reads a register receiver after
@@ -376,6 +377,10 @@ pub(crate) fn block_reads_first(stmts: &[Statement], local: &RcLocal, register: 
             Statement::Call(call) => call_reads_first(call, local, register, body),
             Statement::MethodCall(call) => method_call_reads_first(call, local, register, body),
             Statement::If(branch) => reads_first(&branch.condition, local, register, body).or(Some(false)),
+            // A loop's header values, in order, before it runs anything.
+            Statement::While(node) => reads_first(&node.condition, local, register, body).or(Some(false)),
+            Statement::NumericFor(node) => first_of([&node.initial, &node.limit, &node.step], local, register, body).or(Some(false)),
+            Statement::GenericFor(node) => first_of(&node.right, local, register, body).or(Some(false)),
             Statement::Return(ret) => first_of(&ret.values, local, register, body).or(Some(false)),
             Statement::Empty(_) | Statement::Comment(_) => None,
             _ => Some(false),
@@ -514,15 +519,10 @@ fn leading_reads(value: &RValue, params: &dyn Fn(&RcLocal) -> bool, register: bo
 /// [`call_reads_first`] for a set of locals.
 fn call_leading_reads(call: &crate::Call, params: &dyn Fn(&RcLocal) -> bool, register: bool, body: &Body,
     reads: &mut Vec<RcLocal>) -> bool {
-    match fastcall_arguments(call) {
-        Some(arguments) => {
-            late_operands_leading_reads(&arguments.iter().collect::<Vec<_>>(), false, params, register, body, reads)
-        }
-        None => {
-            std::iter::once(&*call.value).chain(&call.arguments).all(|value| leading_reads(value, params, register, body, reads));
-            false
-        }
+    if leading_reads(&call.value, params, register, body, reads) {
+        late_operands_leading_reads(&call.arguments.iter().collect::<Vec<_>>(), false, params, register, body, reads);
     }
+    false
 }
 
 /// [`method_call_reads_first`] for a set of locals.
@@ -591,6 +591,18 @@ fn block_leading_reads(stmts: &[Statement], params: &dyn Fn(&RcLocal) -> bool, r
                 leading_reads(&branch.condition, params, register, body, reads);
                 false
             }
+            Statement::While(node) => {
+                leading_reads(&node.condition, params, register, body, reads);
+                false
+            }
+            Statement::NumericFor(node) => {
+                [&node.initial, &node.limit, &node.step].into_iter().all(|value| leading_reads(value, params, register, body, reads));
+                false
+            }
+            Statement::GenericFor(node) => {
+                node.right.iter().all(|value| leading_reads(value, params, register, body, reads));
+                false
+            }
             Statement::Return(ret) => {
                 ret.values.iter().all(|value| leading_reads(value, params, register, body, reads));
                 false
@@ -614,11 +626,43 @@ fn is_import_path(value: &RValue) -> bool {
     }
 }
 
+/// Forwarding a builtin import into a call can enable FASTCALL, which fetches
+/// its fallback callee after the arguments. Keep an earlier callee snapshot when
+/// argument evaluation can observe that lookup (including mutable captures).
+fn import_callee_conflict_with_literal_numbers(statement: &Statement, local: &RcLocal, replacement: &RValue,
+    capture: &impl Fn(&RcLocal) -> bool, literal_numbers: bool) -> bool {
+    if !crate::preserve_builtin_calls::fast_builtin_path(replacement) { return false; }
+    let call_conflicts = |call: &crate::Call| {
+        matches!(&*call.value, RValue::Local(read) if read == local)
+            && call.arguments.iter().any(|argument|
+                effects::summarize_with_literal_numbers(argument, capture, literal_numbers).effects.has_order_dependency())
+    };
+    fn in_value(value: &RValue, conflicts: &impl Fn(&crate::Call) -> bool) -> bool {
+        let here = match value {
+            RValue::Call(call) | RValue::Select(Select::Call(call)) => conflicts(call),
+            RValue::Closure(_) => return false,
+            _ => false,
+        };
+        here || !value.visit_rvalues(&mut |child| !in_value(child, conflicts))
+    }
+    matches!(statement, Statement::Call(call) if call_conflicts(call))
+        || !statement.visit_lvalues(&mut |lhs| lhs.visit_rvalues(&mut |value| !in_value(value, &call_conflicts)))
+        || !statement.visit_rvalues(&mut |value| !in_value(value, &call_conflicts))
+}
+
 /// Can an earlier scalar initializer occupy this local's evaluation position?
 /// The caller separately proves one use, scope, intervening statements and arity.
 pub fn can_sink(statement_: &Statement, local: &RcLocal, replacement: &RValue, capture: &impl Fn(&RcLocal) -> bool) -> bool {
     let candidate = effects::summarize(replacement, capture);
     can_sink_with_summary(statement_, local, replacement, capture, &|_| false, candidate)
+}
+
+/// As `can_sink`, with a caller-owned guarantee that numeric literals retain
+/// their literal spellings. No environment, key-error or capture proof is relaxed.
+pub(crate) fn can_sink_with_literal_numbers(statement_: &Statement, local: &RcLocal, replacement: &RValue,
+    capture: &impl Fn(&RcLocal) -> bool) -> bool {
+    let candidate = effects::summarize_with_literal_numbers(replacement, capture, true);
+    can_sink_with_summary_and_literal_numbers(statement_, local, replacement, capture, &|_| false, candidate, true)
 }
 
 /// A captured-cell snapshot can replace every direct read only when no earlier
@@ -652,9 +696,16 @@ pub fn can_reuse_capture(statement_: &Statement, local: &RcLocal, register: bool
 /// late only when that is a register too.
 pub(crate) fn can_sink_with_summary(statement_: &Statement, local: &RcLocal, replacement: &RValue,
     capture: &impl Fn(&RcLocal) -> bool, register: &impl Fn(&RcLocal) -> bool, candidate: effects::Summary) -> bool {
+    can_sink_with_summary_and_literal_numbers(statement_, local, replacement, capture, register, candidate, false)
+}
+
+fn can_sink_with_summary_and_literal_numbers(statement_: &Statement, local: &RcLocal, replacement: &RValue,
+    capture: &impl Fn(&RcLocal) -> bool, register: &impl Fn(&RcLocal) -> bool, candidate: effects::Summary,
+    literal_numbers: bool) -> bool {
+    if import_callee_conflict_with_literal_numbers(statement_, local, replacement, capture, literal_numbers) { return false; }
     let replacement_register = matches!(replacement, RValue::Local(read) if register(read));
-    let order = statement_with_registers(statement_, capture,
-        &|read| if read == local { replacement_register } else { register(read) });
+    let order = statement_with_literal_numbers(statement_, capture,
+        &|read| if read == local { replacement_register } else { register(read) }, literal_numbers);
     if order.exhausted || candidate.exhausted { return false; }
     let reads = replacement.values_read();
     let mut found = false;
@@ -678,7 +729,7 @@ pub(crate) fn can_sink_with_summary(statement_: &Statement, local: &RcLocal, rep
         && matches!(replacement, RValue::Local(_))
         && candidate.effects.contains(Effects::CAPTURE_READ)
         && late_operand_conflict(statement_, local, &|operand| {
-            effects::summarize(operand, capture).effects.contains(Effects::CAPTURE_WRITE)
+            effects::summarize_with_literal_numbers(operand, capture, literal_numbers).effects.contains(Effects::CAPTURE_WRITE)
         })
     {
         return false;
@@ -693,11 +744,11 @@ pub(crate) fn can_sink_with_summary(statement_: &Statement, local: &RcLocal, rep
 /// the arguments of a method call on `local`, a constructor's SETTABLE after
 /// the value of the field `local` keys. A store address is the event order's
 /// ([`statement_with_registers`], [`late_store_conflict`]). Closure bodies are
-/// not entered.
+/// not entered. Calls conservatively include local aliases of builtins.
 pub fn late_operand_conflict(statement: &Statement, local: &RcLocal, conflicts: &impl Fn(&RValue) -> bool) -> bool {
     let is_local = |value: &RValue| matches!(value, RValue::Local(read) if read == local);
     let at_statement = match statement {
-        Statement::Call(call) => fastcall_arguments(call).is_some_and(|arguments| operands_conflict(arguments.iter(), &is_local, conflicts)),
+        Statement::Call(call) => operands_conflict(call.arguments.iter(), &is_local, conflicts),
         Statement::MethodCall(call) => is_local(&call.value) && call.arguments.iter().any(conflicts),
         _ => false,
     };
@@ -713,6 +764,10 @@ pub fn value_late_operand_conflict(value: &RValue, local: &RcLocal, conflicts: &
 
 fn late_operand_conflict_in(value: &RValue, is_local: &impl Fn(&RValue) -> bool, conflicts: &impl Fn(&RValue) -> bool) -> bool {
     let here = match value {
+        // shortcut: any callee may alias a builtin; narrow only with binding provenance proving an ordinary CALL.
+        RValue::Call(call) | RValue::Select(Select::Call(call)) => {
+            operands_conflict(call.arguments.iter(), is_local, conflicts)
+        }
         RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call)) => {
             is_local(&call.value) && call.arguments.iter().any(conflicts)
         }
@@ -726,14 +781,32 @@ fn late_operand_conflict_in(value: &RValue, is_local: &impl Fn(&RValue) -> bool,
 /// Whether `local`, a register local standing as the base or key of a store,
 /// is read after a value `conflicts` holds for: SETTABLE runs after every
 /// other value of its assignment and after the stores before it, which may
-/// run `__newindex` ([`statement_with_registers`]).
+/// run `__newindex` or replace the local ([`statement_with_registers`]).
 pub fn late_store_conflict(statement: &Statement, local: &RcLocal, conflicts: &impl Fn(&RValue) -> bool) -> bool {
     let Statement::Assign(assign) = statement else { return false };
     let is_local = |value: &RValue| matches!(value, RValue::Local(read) if read == local);
     let addresses = || assign.left.iter().filter_map(LValue::as_index).flat_map(|index| [index.left.as_ref(), index.right.as_ref()]);
     addresses().any(is_local)
         && (assign.left.iter().filter(|lhs| !matches!(lhs, LValue::Local(_))).count() > 1
-            || addresses().chain(&assign.right).any(|value| !is_local(value) && conflicts(value)))
+            || addresses().chain(&assign.right).any(|value| !is_local(value) && conflicts(value))
+            || assign.left.iter().enumerate().any(|(position, lhs)|
+                matches!(lhs, LValue::Index(index) if is_local(&index.left) || is_local(&index.right))
+                    && assign.left[..position].iter().any(|prior| matches!(prior, LValue::Local(written) if written == local))))
+}
+
+#[test]
+fn prior_local_store_conflicts_with_a_later_borrowed_address() {
+    let cell = crate::RcLocal::default();
+    let other = crate::RcLocal::default();
+    let address: LValue = crate::Index::new(other.clone().into(), cell.clone().into()).into();
+    for (left, conflict) in [
+        (vec![cell.clone().into(), address.clone()], true),
+        (vec![address.clone(), cell.clone().into()], false),
+        (vec![other.clone().into(), address], false),
+    ] {
+        let statement = crate::Assign::new(left, vec![crate::Literal::Nil.into(), crate::Literal::Nil.into()]).into();
+        assert_eq!(late_store_conflict(&statement, &cell, &effects::may_write_capture), conflict);
+    }
 }
 
 /// Whether code reading `local` from an upvalue would see another value than
@@ -773,6 +846,59 @@ mod tests {
     use crate::{Assign, Call, Index, Literal, Local, MethodCall, Return, Table};
     fn local(name: &str) -> RcLocal { RcLocal::new(Local::new(Some(name.into()))) }
     fn field(base: &RcLocal) -> RValue { Index::new(base.clone().into(), Literal::String(b"field".to_vec()).into()).into() }
+
+    #[test]
+    fn import_callee_snapshot_precedes_observable_arguments() {
+        let callee = local("maximum");
+        let cell = local("cell");
+        let import = Index::new(crate::Global::from("math").into(), Literal::String(b"max".to_vec()).into()).into();
+        for argument in [cell.clone().into(), Call::new(crate::Global::from("change").into(), vec![]).into()] {
+            let call = Call::new(callee.clone().into(), vec![argument, Literal::Number(2.0).into()]);
+            let nested = Call::new(local("consume").into(), vec![call.clone().into()]);
+            for statement in [
+                Statement::from(call.clone()),
+                Return::new(vec![call.clone().into()]).into(),
+                Return::new(vec![Select::Call(call).into()]).into(),
+                Return::new(vec![nested.into()]).into(),
+            ] {
+                assert!(!can_sink(&statement, &callee, &import, &|read| read == &cell));
+            }
+        }
+        let stable = Return::new(vec![Call::new(callee.clone().into(), vec![cell.clone().into(), Literal::Number(2.0).into()]).into()]).into();
+        assert!(can_sink(&stable, &callee, &import, &|_| false));
+        assert!(can_sink(&stable, &callee, &local("already_read").into(), &|read| read == &cell));
+    }
+
+    #[test]
+    fn literal_number_motion_keeps_lookup_capture_and_key_error_order() {
+        // A fast-call builtin: its FASTCALL fallback fetches the callee after the arguments.
+        let callee = local("maximum");
+        let path = Index::new(crate::Global::from("math").into(), Literal::String(b"max".to_vec()).into()).into();
+        let call = |argument| RValue::Call(Call::new(callee.clone().into(), vec![argument]));
+        for number in [std::f64::consts::PI, -std::f64::consts::PI, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+            for statement in [
+                Return::new(vec![call(Literal::Number(number).into())]).into(),
+                Return::new(vec![Literal::Number(number).into(), call(Literal::String(b"value".to_vec()).into())]).into(),
+            ] {
+                assert!(!can_sink(&statement, &callee, &path, &|_| false));
+                assert!(can_sink_with_literal_numbers(&statement, &callee, &path, &|_| false));
+            }
+        }
+        let cell = local("captured");
+        for value in [
+            RValue::Local(cell.clone()),
+            Index::new(crate::Global::from("math").into(), Literal::String(b"pi".to_vec()).into()).into(),
+            Call::new(crate::Global::from("change").into(), vec![]).into(),
+            Table::new(vec![(Some(Literal::Number(f64::NAN).into()), Literal::Nil.into())]).into(),
+        ] {
+            for statement in [
+                Return::new(vec![call(value.clone())]).into(),
+                Return::new(vec![value, call(Literal::Number(std::f64::consts::PI).into())]).into(),
+            ] {
+                assert!(!can_sink_with_literal_numbers(&statement, &callee, &path, &|read| read == &cell));
+            }
+        }
+    }
 
     #[test]
     fn capture_alias_checks_every_read_but_not_effects_after_the_last() {
@@ -815,11 +941,17 @@ mod tests {
             Statement::Call(Call::new(path("table", "insert"), vec![cell.clone().into(), last]))
         };
         assert!(late_operand_conflict(&insert(change()), &cell, writes));
-        assert!(!late_operand_conflict(&insert(method(&other, vec![])), &cell, writes));
+        assert!(late_operand_conflict(&insert(method(&other, vec![])), &cell, writes));
         let fmod = Call::new(path("math", "fmod"), vec![cell.clone().into(), method(&other, vec![])]).into();
         assert!(late_operand_conflict(&returns(fmod), &cell, writes));
         let wide = Call::new(path("math", "max"), vec![cell.clone().into(), change(), Literal::Number(1.0).into(), Literal::Number(2.0).into()]).into();
-        assert!(!late_operand_conflict(&returns(wide), &cell, writes));
+        // The rejection guard is deliberately broader than the positive order proof.
+        assert!(late_operands(&wide).is_none());
+        assert!(late_operand_conflict(&returns(wide), &cell, writes));
+        let alias = Call::new(other.clone().into(), vec![cell.clone().into(), change()]);
+        assert!(late_operand_conflict(&alias.clone().into(), &cell, writes));
+        assert!(late_operand_conflict(&returns(Select::Call(alias.clone()).into()), &cell, writes));
+        assert!(late_operands(&alias.into()).is_none());
         // As the base or key of a store, after the values and earlier stores.
         let store = |lhs: Vec<LValue>, rhs: Vec<RValue>| -> Statement { Assign::new(lhs, rhs).into() };
         let at = |base: &RcLocal, key: RValue| -> LValue { Index::new(base.clone().into(), key).into() };
@@ -950,6 +1082,28 @@ mod tests {
         let ordered = leading(&all);
         assert!(ordered.admits([(&a, false), (&c, false)]));
         assert!(!ordered.admits([(&a, false), (&b, true)]), "one kind at a time");
+    }
+
+    #[test]
+    fn call_leading_reads_preserve_callee_lookup_and_builtin_alias_timing() {
+        let (param, alias) = (local("param"), local("max"));
+        let params = [param.clone()];
+        let facts = Body { registers: &|_| true, unchanged: &|value| matches!(value, RValue::Local(_) | RValue::Literal(_)) };
+        let path: RValue = Index::new(crate::Global::from("math").into(), Literal::String(b"max".to_vec()).into()).into();
+        let later_call = || Call::new(alias.clone().into(), vec![]).into();
+        for callee in [path, alias.clone().into()] {
+            for effect in [false, true] {
+                let second = if effect { later_call() } else { Literal::Number(2.0).into() };
+                let stmt: Statement = Return::new(vec![Call::new(callee.clone(), vec![param.clone().into(), second]).into()]).into();
+                let expected_value = matches!(callee, RValue::Local(_));
+                let expected_register = expected_value && !effect;
+                let leading = LeadingReads::new(std::slice::from_ref(&stmt), &params, |_| true, &facts);
+                assert_eq!(leading.admits([(&param, false)]), expected_value);
+                assert_eq!(leading.admits([(&param, true)]), expected_register);
+                assert_eq!(block_reads_first(std::slice::from_ref(&stmt), &param, false, &facts), expected_value);
+                assert_eq!(block_reads_first(std::slice::from_ref(&stmt), &param, true, &facts), expected_register);
+            }
+        }
     }
 
     #[test]

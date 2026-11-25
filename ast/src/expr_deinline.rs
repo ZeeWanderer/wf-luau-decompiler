@@ -81,7 +81,7 @@ use crate::deinline::{
     Bindings, MatchCtx, anchors_in_rvalue, body_unsafe, canon, each_closure_decl,
     is_scalar_return_value, visit_stmt_rvalues, visit_stmt_rvalues_mut, unify_rvalue,
 };
-use crate::{Block, Call, Function, LValue, LocalRw, RValue, RcLocal, Statement, Traverse};
+use crate::{Block, Call, Function, LValue, LocalRw, RValue, RcLocal, Select, Statement, Traverse};
 
 type FnPtr = *const Mutex<Function>;
 
@@ -141,12 +141,12 @@ struct ExprTarget {
 }
 
 impl ExprTarget {
-    fn ctx(&self) -> MatchCtx<'_> {
+    fn ctx<'a>(&'a self, fold: &'a crate::deinline::fold::PureHelpers) -> MatchCtx<'a> {
         MatchCtx {
             params: &self.params,
             locals: &self.locals,
             captures: None,
-            fold: None,
+            fold: Some(fold),
         }
     }
 }
@@ -174,7 +174,7 @@ fn run(body: &mut Block, arithmetic_only: bool) {
     }
     // What each literal captures, so no rewrite changes whether Luau shares
     // it (`literal_sharing`).
-    let _sharing = crate::literal_sharing::enter(body);
+    let _sharing = crate::literal_sharing::enter(body, &[]);
     // f_local -> its targets' indices (a helper and its evidence twin sit
     // side by side), so we recognise each helper's declaration during the
     // scan and only activate it for sites in its lexical scope.
@@ -390,10 +390,21 @@ impl Walk<'_> {
         }
     }
 
+    /// Whether line info shows none of target `idx`'s helper code in
+    /// `function`: a match there is code written out, not a copy
+    /// (`clampUnit`'s own bounds checks are no copy of `clamp`).
+    fn absent(&self, idx: usize, function: Option<FnPtr>) -> bool {
+        matches!((&self.copies, self.caller(function), self.targets[idx].proto),
+            (Some(copies), Some(caller), Some(helper)) if !copies.present(Some(caller), helper))
+    }
+
     /// How target `idx` takes part at a site in `function`: whether it may
     /// be rebuilt there, and whether it is tried at all (as a rival).
     fn role(&self, idx: usize, function: Option<FnPtr>) -> (bool, bool) {
         let t = &self.targets[idx];
+        if self.absent(idx, function) {
+            return (false, false);
+        }
         match &self.round {
             Round::Normal => (!t.evidence, !t.evidence),
             Round::Probe => {
@@ -516,8 +527,19 @@ fn helper_candidates(body: &Block, arithmetic_only: bool, copies: Option<&crate:
         };
         // Root must yield a single value (not Call/MethodCall/VarArg/Select — those
         // have unprovable arity in a multi-value slot). Nested calls like `typeof`
-        // inside `E` are fine; only the ROOT is constrained.
+        // inside `E` are fine; only the ROOT is constrained. A call root is
+        // the exception where line info shows copies: `return f(x)` hands back
+        // every value of `f(x)`, so `helper(x)` is `f(x)` in any slot, and the
+        // count oracle keeps hand-written `f(x)` out
+        // (`vec(nextNumber(-2, 2), nextNumber(-2, 2), nextNumber(-2, 2))`).
         if !is_scalar_return_value(&expr) {
+            let call_root = matches!(
+                expr,
+                RValue::Call(_) | RValue::MethodCall(_) | RValue::Select(Select::Call(_) | Select::MethodCall(_))
+            );
+            if call_root && inlined && !expr.any_local_read(&mut |rl| rl == l) {
+                candidates.push(candidate(expr, false, true));
+            }
             return;
         }
         // Recursion guard: a body that reads its own binder would emit a call to
@@ -579,6 +601,7 @@ fn collect_expr_targets(body: &Block, arithmetic_only: bool, copies: Option<&cra
         // decl), and one whose expression reads call frames, which runs a
         // frame deeper inside the helper.
         if write_counts.get(&candidate.f_local).copied().unwrap_or(0) != 1
+            || !captures.copies_unchanged(candidate.func_ptr as usize)
             || captures.value_reads_frames(&candidate.expr)
         {
             continue;
@@ -782,17 +805,19 @@ fn walk_block(
             crate::deinline::count_rebuilt_calls(stmts, &binders, current_func, &mut w.rebuilt);
         }
     }
+    // The targets line info allows here, kept with `active`.
+    let mut present: Vec<usize> = active.iter().copied().filter(|&idx| !w.absent(idx, current_func)).collect();
     let mut index = 0;
     while index < stmts.len() {
         // A bounded terminal scalar region has no live continuation. Normalize
         // its lets/guard returns before comparing with named helper patterns.
         // (Not in evidence rounds.)
         if matches!(w.round, Round::Normal) {
-            if try_rewrite_region(&mut stmts[index..], w.targets, &active, current_func) {
+            if try_rewrite_region(&mut stmts[index..], w.targets, &present, current_func) {
                 stmts.truncate(index + 1);
                 break;
             }
-            try_rewrite_select(stmts, index, w.targets, &active, current_func);
+            try_rewrite_select(stmts, index, w.targets, &present, current_func);
         }
         let s = &mut stmts[index];
         index += 1;
@@ -805,6 +830,7 @@ fn walk_block(
             });
         }
         if let Some(range) = target_decl_index(s, w) {
+            present.extend(range.clone().filter(|&idx| !w.absent(idx, current_func)));
             active.extend(range);
         }
     }
@@ -945,48 +971,18 @@ fn try_rewrite(
     // Outermost-first: try to match the WHOLE node before descending, so the
     // largest equivalent subtree is collapsed into one call.
     if let Some(cands) = w.by_root.get(&std::mem::discriminant(&*rv)) {
-        let mut pick = Pick::default();
-        let mut ambiguous = false;
-        let mut ordered = crate::reconstruction_search::prioritize(cands, current_func.map(|p| p as usize), |i| targets[i].func_ptr as usize);
-        // In an evidence round the targets that may be rebuilt here come
-        // first, and the rivals are tried only where one of them matches.
-        let rivals_from = if matches!(w.round, Round::Normal) {
-            ordered.len()
-        } else {
-            ordered.retain(|&idx| active.contains(&idx) && w.role(idx, current_func).1);
-            ordered.sort_by_key(|&idx| !w.role(idx, current_func).0);
-            ordered.iter().position(|&idx| !w.role(idx, current_func).0).unwrap_or(ordered.len())
-        };
-        for (at, &idx) in ordered.iter().enumerate() {
-            if at == rivals_from && pick.is_empty() {
-                break; // no target that may be rebuilt here matched
-            }
-            if !active.contains(&idx) {
-                continue; // helper not yet in lexical scope here
-            }
-            if !w.role(idx, current_func).1 {
-                continue; // not tried in this round
-            }
-            let t = &targets[idx];
-            if current_func == Some(t.func_ptr) {
-                continue; // never match a helper against its own body
-            }
-            if !t.search.spend(2048) { ambiguous = true; break; }
-            if let Some(safety) = &t.arithmetic {
-                if !safety.spend_attempt() {
-                    ambiguous = true;
-                    break;
-                }
-            }
-            if let Some(found) = try_match(t, rv, current_func) {
-                pick.offer(idx, found);
-                if pick.settled() {
-                    break;
-                }
-            }
+        // `not f(x)` Luau folded into the comparison `f` returns (`not
+        // isWordChar(c)` as `c:match("[%w_]") == nil`): the comparison turned
+        // over is `f`'s, and `not` of the call gives the copy's boolean.
+        let (mut found, mut negated) = (pick_target(rv, cands, w, active, current_func, false), false);
+        if matches!(found, Some(None))
+            && let Some(turned) = turned_comparison(rv)
+        {
+            found = pick_target(&turned, cands, w, active, current_func, true);
+            negated = true;
         }
-        if !ambiguous {
-            if let Some((idx, args)) = pick.take() {
+        if let Some(found) = found {
+            if let Some((idx, args)) = found {
                 let t = &targets[idx];
                 // In an evidence round only an admitted helper is rebuilt;
                 // a match counts (probe), and any other one keeps its node
@@ -1003,7 +999,11 @@ fn try_rewrite(
                 let call = Call::new(RValue::Local(t.f_local.clone()), args).reconstructed(
                     if t.arithmetic.is_some() { crate::call_origins::Kind::ArithmeticDeinline }
                     else { crate::call_origins::Kind::ExpressionDeinline });
-                let call = RValue::Call(call);
+                let call = if negated {
+                    RValue::Unary(crate::Unary::new(RValue::Call(call), crate::UnaryOperation::Not))
+                } else {
+                    RValue::Call(call)
+                };
                 // The call must leave every literal around it as Luau shares it.
                 if current_func.is_some() {
                     let (mut gone, mut new) = (Vec::new(), Vec::new());
@@ -1028,6 +1028,65 @@ fn try_rewrite(
         try_rewrite(child, w, active, current_func);
         true
     });
+}
+
+/// The target standing for `rv` among `cands` and its arguments: `None` where
+/// the search is ambiguous or out of budget, `Some(None)` where none matches.
+/// `comparison`: `rv` is a comparison turned over, which no arithmetic
+/// helper returns.
+fn pick_target(rv: &RValue, cands: &[usize], w: &Walk, active: &[usize], current_func: Option<FnPtr>, comparison: bool) -> Option<Option<(usize, Vec<RValue>)>> {
+    let targets = w.targets;
+    let mut pick = Pick::default();
+    let mut ordered = crate::reconstruction_search::prioritize(cands, current_func.map(|p| p as usize), |i| targets[i].func_ptr as usize);
+    // In an evidence round the targets that may be rebuilt here come
+    // first, and the rivals are tried only where one of them matches.
+    let rivals_from = if matches!(w.round, Round::Normal) {
+        ordered.len()
+    } else {
+        ordered.retain(|&idx| active.contains(&idx) && w.role(idx, current_func).1);
+        ordered.sort_by_key(|&idx| !w.role(idx, current_func).0);
+        ordered.iter().position(|&idx| !w.role(idx, current_func).0).unwrap_or(ordered.len())
+    };
+    for (at, &idx) in ordered.iter().enumerate() {
+        if at == rivals_from && pick.is_empty() {
+            break; // no target that may be rebuilt here matched
+        }
+        if !active.contains(&idx) {
+            continue; // helper not yet in lexical scope here
+        }
+        if !w.role(idx, current_func).1 {
+            continue; // not tried in this round
+        }
+        let t = &targets[idx];
+        if current_func == Some(t.func_ptr) || (comparison && t.arithmetic.is_some()) {
+            continue; // never match a helper against its own body
+        }
+        if !t.search.spend(2048) {
+            return None;
+        }
+        if let Some(safety) = &t.arithmetic
+            && !safety.spend_attempt()
+        {
+            return None;
+        }
+        if let Some(found) = try_match(t, rv, current_func) {
+            pick.offer(idx, found);
+            if pick.settled() {
+                break;
+            }
+        }
+    }
+    Some(pick.take())
+}
+
+/// `a == b` as `a ~= b` and the other way round.
+fn turned_comparison(rv: &RValue) -> Option<RValue> {
+    match rv {
+        RValue::Binary(binary) if matches!(binary.operation, crate::BinaryOperation::Equal | crate::BinaryOperation::NotEqual) => {
+            Some(crate::flatten_guards::negate(rv.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// Attempt to unify target `t`'s body `E` against the candidate subtree `rv` and,
@@ -1082,14 +1141,24 @@ fn is_register(arg: &RValue, upvalues: &FunctionUpvalues, current_func: Option<F
 }
 
 fn try_match(t: &ExprTarget, rv: &RValue, current_func: Option<FnPtr>) -> Option<(Vec<RValue>, Hoist)> {
+    let fold = crate::deinline::fold::PureHelpers::default();
     let mut b = Bindings::default();
     let matched = if t.arithmetic.is_some() {
-        arithmetic::unify(&t.ctx(), &t.expr, rv, &mut b)
+        arithmetic::unify(&t.ctx(&fold), &t.expr, rv, &mut b)
     } else {
-        unify_rvalue(&t.ctx(), &t.expr, rv, &mut b).is_ok()
+        unify_rvalue(&t.ctx(&fold), &t.expr, rv, &mut b).is_ok()
     };
     if !matched {
         return None;
+    }
+    // Only forward proof of arguments already bound by the structural match;
+    // no inverse guesses or evaluation of mutable library calls.
+    for (pattern, literal) in &b.equations {
+        let value = crate::deinline::fold::evaluate(pattern, &|param| {
+            let RValue::Literal(literal) = b.params.get(param)? else { return None; };
+            crate::deinline::fold::Value::of(literal)
+        }, &fold)?;
+        if !value.same(&crate::deinline::fold::Value::of(literal)?) { return None; }
     }
     // Every parameter must have bound to an argument (an unread parameter cannot be
     // reconstructed) — refuse otherwise.
@@ -1357,6 +1426,23 @@ mod tests {
         match s {
             Statement::Assign(a) => &a.right[0],
             _ => panic!("expected assign"),
+        }
+    }
+
+    #[test]
+    fn expression_helpers_do_not_confuse_copied_and_current_upvalues() {
+        let cell = local("cell");
+        let helper = local("helper");
+        for (copy, reassign) in [(true, false), (true, true), (false, true)] {
+            let mut declaration = helper_decl(&helper, "helper", vec![],
+                vec![Return::new(vec![num_positive(&lv(&cell))]).into()]);
+            let Statement::Assign(assign) = &mut declaration else { unreachable!() };
+            let RValue::Closure(closure) = &mut assign.right[0] else { unreachable!() };
+            closure.upvalues.push(if copy { crate::Upvalue::Copy(cell.clone()) } else { crate::Upvalue::Ref(cell.clone()) });
+            let mut statements = vec![local_decl(&cell, number(1.0)), declaration];
+            if reassign { statements.push(Assign::new(vec![cell.clone().into()], vec![number(2.0)]).into()); }
+            let targets = collect_expr_targets(&Block(statements), false, None);
+            assert_eq!(targets.len(), usize::from(!copy || !reassign));
         }
     }
 
@@ -1904,6 +1990,38 @@ mod tests {
                 bias,
             ),
         )
+    }
+
+    #[test]
+    fn folded_vector_components_require_exact_bound_arguments() {
+        use BinaryOperation::{Add, Mul, Sub};
+        let f = local("reflect");
+        let value = local("value");
+        let normal = local("normal");
+        let input = local("input");
+        let output = local("output");
+        let component = |value: RValue, axis| Index::new(value, string(axis)).into();
+        let reflected = |value: RValue, normal: RValue, xyz: [RValue; 3]| {
+            let dot = bin(bin(bin(component(value.clone(), "X"), Mul, xyz[0].clone()), Add,
+                bin(component(value.clone(), "Y"), Mul, xyz[1].clone())), Add,
+                bin(component(value.clone(), "Z"), Mul, xyz[2].clone()));
+            bin(value, Sub, bin(normal, Mul, bin(number(2.0), Mul, dot)))
+        };
+        let body = reflected(lv(&value), lv(&normal),
+            ["X", "Y", "Z"].map(|axis| component(lv(&normal), axis)));
+        for (normal_arg, y, expected) in [
+            (Literal::Vector(0.0, 1.0, 0.0).into(), 1.0, true),
+            (Literal::Vector(0.0, 1.0, 0.0).into(), 2.0, false),
+            (Literal::Vector(0.0, -0.0, 0.0).into(), 0.0, false),
+            (lv(&normal), 1.0, false),
+            (call(global("makeNormal"), vec![]), 1.0, false),
+        ] {
+            let mut block = Block(vec![helper_decl(&f, "reflect", vec![value.clone(), normal.clone()],
+                vec![Return::new(vec![body.clone()]).into()]),
+                local_decl(&output, reflected(lv(&input), normal_arg, [number(0.0), number(y), number(0.0)]))]);
+            expr_deinline(&mut block);
+            assert_eq!(is_call_to(rhs_of(&block.0[1]), &f), expected, "{block}");
+        }
     }
 
     #[test]

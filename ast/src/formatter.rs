@@ -66,6 +66,19 @@ fn compound_assign_target_matches(target: &LValue, binary_left: &RValue) -> bool
     }
 }
 
+/// Whether `assign` prints as `target op= value` (see `format_assign`).
+pub(crate) fn prints_as_compound(assign: &Assign) -> bool {
+    !assign.prefix
+        && !assign.parallel
+        && assign.left.len() == 1
+        && assign.right.len() == 1
+        && matches!(&assign.right[0], RValue::Binary(binary)
+            if compound_assignment_operator(binary.operation).is_some()
+                // A `compound` assignment's base is evaluated once and must
+                // never be expanded (`compound_bases`).
+                && (assign.compound || compound_assign_target_matches(&assign.left[0], binary.left.as_ref())))
+}
+
 /// Whether an index base/key can be repeated without observing any operation
 /// between its evaluations. A field read can invoke __index; arithmetic, length
 /// and unary operators can invoke metamethods or throw. Bytecode type hints are
@@ -934,7 +947,7 @@ mod tests {
 
         assert_eq!(
             block.to_string(),
-            "function Collision.DisableCollision(_, folder)\n\tif true then\n\t\treturn _\n\tend\nend\n\nCollision:DisableCollision(target)"
+            "function Collision.DisableCollision(_, folder)\n\tdo\n\t\treturn _\n\tend\nend\n\nCollision:DisableCollision(target)"
         );
     }
 
@@ -1189,6 +1202,28 @@ mod tests {
             block.to_string(),
             "loadAfkRewards() -- inlined by Luau -O2 (UNHOOKABLE)"
         );
+    }
+
+    #[test]
+    fn source_gaps_keep_comments_and_merged_function_boundaries() {
+        use crate::source_lines::{SourceLines, seed_statement};
+        let call = |name, line| {
+            let mut statement: Statement = Call::new(global(name), vec![]).into();
+            seed_statement(&mut statement, SourceLines::at(line));
+            statement
+        };
+        let helper = local("helper");
+        let mut declaration = Assign::new(vec![helper.clone().into()], vec![]);
+        declaration.prefix = true;
+        declaration.node_origin.1 = SourceLines::at(6);
+        let function = Function { source_lines: SourceLines::of([8, 9]), ..Default::default() };
+        let definition = Assign::new(vec![helper.into()], vec![Closure {
+            node_origin: Default::default(), function: ByAddress(Arc::new(Mutex::new(function))), upvalues: vec![],
+        }.into()]);
+        let block = Block(vec![call("first", 1), crate::Comment::trailing("tail".into()).into(),
+            call("second", 2), crate::Comment::new("note".into()).into(), call("third", 5),
+            declaration.into(), definition.into(), call("last", 10), call("unknown", 0), call("far", 20)]);
+        assert_eq!(block.to_string(), "first() -- tail\nsecond()\n\n-- note\nthird()\nlocal function helper() end\nlast()\nunknown()\nfar()");
     }
 
     #[test]
@@ -1564,6 +1599,46 @@ end");
         assert_eq!(Call::new(global("f"), vec![number(1.0), number(2.0)]).to_string(), "f(1, 2)");
         let table = Table::new(vec![(Some(string("field")), number(1.0))]);
         assert_eq!(Call::new(global("f"), vec![table.into()]).to_string(), "f({ field = 1 })");
+    }
+
+    #[test]
+    fn new_table_preserves_runtime_nil_but_proven_values_keep_record_spelling() {
+        let table = |value| Table(
+            vec![(Some(string("first")), number(1.0)), (Some(string("second")), value),
+                (Some(string("last")), number(3.0))],
+            Default::default(), crate::TableShape::NewTable { hash: 4, array: 0 },
+        );
+        for value in [local_value(&local("value")), Call::new(global("get"), vec![]).into(),
+            Binary::new(global("left"), global("right"), BinaryOperation::Add).into(), Literal::Nil.into()] {
+            assert!(table(value).to_string().contains("[\"second\"] ="));
+        }
+        for value in [boolean(false), number(0.0), string(""), Table::default().into(),
+            Binary::new(global("left"), global("right"), BinaryOperation::LessThan).into(),
+            Binary::new(number(1.0), number(2.0), BinaryOperation::Add).into()] {
+            assert!(!table(value).to_string().contains("[\"second\"] ="));
+        }
+        let mut template = table(local_value(&local("value")));
+        template.2 = crate::TableShape::Template { keys: 2 };
+        assert!(!template.to_string().contains("[\"second\"] ="));
+        let mut last_only = table(local_value(&local("value")));
+        last_only.0.pop();
+        assert!(!last_only.to_string().contains("[\"second\"] ="));
+    }
+
+    #[test]
+    fn new_table_duplicate_record_keys_keep_the_original_allocation() {
+        let table = Table(vec![(Some(string("a")), number(1.0)),
+            (Some(string("b")), number(2.0)), (Some(string("a")), number(3.0))],
+            Default::default(), crate::TableShape::NewTable { hash: 4, array: 0 });
+        assert_eq!(table.to_string(), "{ [\"a\"] = 1, b = 2, a = 3 }");
+    }
+
+    #[test]
+    fn new_table_numeric_hash_fields_do_not_become_an_array() {
+        let table = Table(vec![(Some(number(1.0)), Literal::Nil.into()),
+            (Some(number(2.0)), number(2.0)), (Some(number(3.0)), number(3.0))],
+            Default::default(), crate::TableShape::NewTable { hash: 4, array: 0 });
+        assert_eq!(table.to_string(), "{ [1] = nil, [2] = 2, [3] = 3 }");
     }
 
     #[test]
@@ -1999,7 +2074,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             || match value {
                 RValue::Index(index) => Self::prefix_starts_with_parenthesis(&index.left),
                 RValue::Call(call) | RValue::Select(Select::Call(call)) => {
-                    Self::prefix_starts_with_parenthesis(&call.value)
+                    call.group_callee || Self::prefix_starts_with_parenthesis(&call.value)
                 }
                 RValue::MethodCall(method_call) | RValue::Select(Select::MethodCall(method_call)) => {
                     Self::prefix_starts_with_parenthesis(&method_call.value)
@@ -2010,7 +2085,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
 
     fn statement_starts_with_parenthesis(statement: &Statement) -> bool {
         match statement {
-            Statement::Call(call) => Self::prefix_starts_with_parenthesis(&call.value),
+            Statement::Call(call) => call.group_callee || Self::prefix_starts_with_parenthesis(&call.value),
             Statement::MethodCall(method_call) => Self::prefix_starts_with_parenthesis(&method_call.value),
             Statement::Assign(assign) if !assign.prefix => assign
                 .left
@@ -2048,7 +2123,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     // keep comments attached to the statement they document: a leading
     // comment takes the blank line that statement would get, and nothing
     // separates it from the statement.
-    fn wants_blank_line(block: &Block, index: usize) -> bool {
+    fn wants_blank_line(block: &Block, index: usize, cached: &mut Option<(usize, crate::source_lines::SourceLines)>) -> bool {
         // A trailing comment sits on the line of the statement before it.
         let mut at = index - 1;
         while at > 0 && matches!(&block[at], Statement::Comment(comment) if comment.trailing) {
@@ -2058,13 +2133,22 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         if matches!(prev, Statement::Comment(_)) {
             return false;
         }
-        let next = block.0[index..].iter().find(|s| !matches!(s, Statement::Comment(_)));
-        next.is_some_and(|next| Self::is_block_statement(prev) || Self::is_block_statement(next))
+        let next = block.iter().enumerate().skip(index).find(|(_, s)| !matches!(s, Statement::Comment(_)));
+        next.is_some_and(|(next_index, next)| {
+            let previous_lines = cached.filter(|(index, _)| *index == at)
+                .map_or_else(|| crate::source_lines::statement(prev), |(_, lines)| lines);
+            let next_lines = crate::source_lines::statement(next);
+            *cached = Some((next_index, next_lines));
+            next_lines.gap_after(previous_lines)
+                .unwrap_or_else(|| Self::is_block_statement(prev) || Self::is_block_statement(next))
+        })
     }
 
     fn format_block_no_indent(&mut self, block: &Block) -> fmt::Result {
         let mut next_non_comment = 0;
         let mut defined = None;
+        // Adjacent boundaries share one immutable statement's line census.
+        let mut cached_lines = None;
         for (i, statement) in block.iter().enumerate() {
             if defined == Some(i) {
                 continue;
@@ -2085,7 +2169,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             }
             if i != 0 {
                 writeln!(self.output)?;
-                if Self::wants_blank_line(block, i) {
+                if Self::wants_blank_line(block, i, &mut cached_lines) {
                     writeln!(self.output)?;
                 }
             }
@@ -2272,6 +2356,11 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         if table.0.iter().any(|(k, _)| k.is_none()) {
             return false; // mixed positional + keyed — must render keys
         }
+        // Explicit numeric stores into a hash part can visit 3 before 2;
+        // positional syntax allocates an array and visits its indices in order.
+        if matches!(table.2, crate::TableShape::NewTable { .. }) {
+            return false;
+        }
         // all entries keyed: require keys to be exactly 1..n, integral, in order
         table.0.iter().enumerate().all(|(i, (k, _))| {
             matches!(k, Some(RValue::Literal(Literal::Number(x)))
@@ -2303,14 +2392,12 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
     /// table the bytecode built with NEWTABLE and stores compiles that way
     /// again. Printed with record fields only (at most 32), Luau compiles it
     /// as a DUPTABLE template, whose keys all exist before any store: a key
-    /// stored `nil`, which a NEWTABLE never gets, keeps its node, and `pairs`
+    /// stored `nil` can have its node reused during NEWTABLE stores, and `pairs`
     /// visits the other keys in another order (fr-t1110 F1: `Parent =
     /// visible and "p" or nil`). A bracketed key keeps the constructor a
-    /// NEWTABLE of the same size, filled in the same order. Only for a value
-    /// spelling `nil` (a `nil` literal, an `and`/`or`/`if` with a `nil`
-    /// arm): any local or call may hold `nil` too, but bracketing every such
-    /// table (most of an older compiler's constructors are NEWTABLE) would
-    /// cost more than the order of a key `pairs` skips.
+    /// NEWTABLE of the same size, filled in the same order. Locals, calls and
+    /// metamethod results can be nil too; only proven non-nil values may use
+    /// a template's pre-existing nodes without changing collision placement.
     fn keeps_new_table_at(table: &Table) -> Option<usize> {
         if !matches!(table.2, crate::TableShape::NewTable { .. }) || table.0.is_empty() || table.0.len() > 32 {
             return None;
@@ -2321,22 +2408,18 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         if !records {
             return None;
         }
-        fn spells_nil(value: &RValue) -> bool {
-            match value {
-                RValue::Literal(Literal::Nil) => true,
-                RValue::Binary(binary) if matches!(binary.operation, crate::BinaryOperation::And | crate::BinaryOperation::Or) => {
-                    spells_nil(&binary.left) || spells_nil(&binary.right)
-                }
-                RValue::IfExpression(node) => spells_nil(&node.then_value) || spells_nil(&node.else_value),
-                _ => false,
-            }
+        // DUPTABLE deduplicates record keys, which can shrink the hash part.
+        if table.0.iter().enumerate().any(|(index, (key, _))| table.0[..index].iter().any(|(earlier, _)| earlier == key)) {
+            return Some(0);
         }
-        table.0.iter().position(|(_, value)| spells_nil(value))
+        // With non-nil earlier values, the last key gets the template's layout.
+        table.0[..table.0.len() - 1].iter().position(|(_, value)| !crate::return_types::is_proven_non_nil(value))
     }
 
     /// `should_format`: one entry per line.
     fn format_table_as(&mut self, table: &Table, sequential_keys: bool, should_format: bool) -> fmt::Result {
-        let bracketed = if sequential_keys { None } else { Self::keeps_new_table_at(table) };
+        let (padding, padding_key) = table.hash_padding().map_err(|_| fmt::Error)?;
+        let bracketed = if sequential_keys || padding > 0 { None } else { Self::keeps_new_table_at(table) };
         let should_space = !table.0.is_empty();
         write!(self.output, "{{")?;
         if should_format {
@@ -2345,6 +2428,15 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             write!(self.output, " ")?;
         }
         self.indentation_level += 1;
+        // Repeating the first hash key (or an allocated array slot) changes
+        // capacity without introducing a different key into collision chains.
+        for _ in 0..padding {
+            if should_format { self.indent()?; }
+            if let Some(key) = padding_key { self.format_bracketed_key(key)?; }
+            else { write!(self.output, "[1]")?; }
+            write!(self.output, " = nil,")?;
+            if should_format { self.line_break()?; } else { write!(self.output, " ")?; }
+        }
         for (index, (key, value)) in table.0.iter().enumerate() {
             if should_format {
                 self.indent()?;
@@ -2483,6 +2575,14 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         self.format_closure_parameters_from(closure, 0)
     }
 
+    fn format_closure_parameter_end(&mut self, closure: &Closure) -> fmt::Result {
+        write!(self.output, ")")?;
+        if let Some(annotation) = &closure.function.lock().return_annotation {
+            write!(self.output, ": {annotation}")?;
+        }
+        Ok(())
+    }
+
     fn format_closure_body(&mut self, closure: &Closure) -> fmt::Result {
         let function = closure.function.lock();
         if !function.body.is_empty() {
@@ -2528,7 +2628,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
         write!(self.output, "function(")?;
         self.format_closure_parameters(closure)?;
-        write!(self.output, ")")?;
+        self.format_closure_parameter_end(closure)?;
         self.format_closure_body(closure)?;
         write!(self.output, "end")?;
         self.record_closure(closure, start, syntax_kind, display_name);
@@ -2564,7 +2664,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
                 self.format_rvalue(receiver)?;
                 write!(self.output, ":{}(", method)?;
                 self.format_closure_parameters_from(closure, 1)?;
-                write!(self.output, ")")?;
+                self.format_closure_parameter_end(closure)?;
                 self.format_closure_body(closure)?;
                 write!(self.output, "end")?;
                 return Ok((ClosureSyntaxKind::MethodFunction, display_name));
@@ -2582,7 +2682,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         }
         write!(self.output, "(")?;
         self.format_closure_parameters(closure)?;
-        write!(self.output, ")")?;
+        self.format_closure_parameter_end(closure)?;
         // The count ends the header line, or the line of an empty body's `end`.
         let empty = closure.function.lock().body.is_empty();
         if let Some(text) = definition_comment.as_ref().filter(|_| !empty) {
@@ -3127,7 +3227,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
             self.inferred_calls.call_printed();
         }
         let start = self.current_position();
-        let wrap = Self::should_wrap_left_rvalue(&call.value);
+        let wrap = call.group_callee || Self::should_wrap_left_rvalue(&call.value);
         if wrap {
             write!(self.output, "(")?;
         }
@@ -3403,7 +3503,11 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
 
     pub(crate) fn format_if(&mut self, r#if: &If) -> fmt::Result {
         let outer = self.begin_header_site(r#if);
-        self.format_condition_header("if", &r#if.condition, Some("then"))?;
+        if r#if.is_scope() {
+            write!(self.output, "do")?;
+        } else {
+            self.format_condition_header("if", &r#if.condition, Some("then"))?;
+        }
         self.end_site(outer)?;
         writeln!(self.output)?;
 
@@ -3419,7 +3523,7 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         let else_block = r#if.else_block.lock();
         if !else_block.is_empty() {
             self.indent()?;
-            if let Some(else_if) = else_block.iter().exactly_one().ok().and_then(|s| s.as_if()) {
+            if let Some(else_if) = else_block.iter().exactly_one().ok().and_then(|s| s.as_if()).filter(|r#if| !r#if.is_scope()) {
                 write!(self.output, "else")?;
                 return self.format_if(else_if);
             }
@@ -3508,15 +3612,9 @@ impl<'a, W: fmt::Write> Formatter<'a, W> {
         // The whole binary RHS is grouped by `<op>=`, so the right operand is
         // emitted as a standalone expression (`format_rvalue`) with no extra
         // parentheses — `x -= a - b` means `x = x - (a - b)`, exactly the AST.
-        if !assign.prefix
-            && !assign.parallel
-            && assign.left.len() == 1
-            && assign.right.len() == 1
+        if prints_as_compound(assign)
             && let RValue::Binary(binary) = &assign.right[0]
             && let Some(op) = compound_assignment_operator(binary.operation)
-            // A `compound` assignment's base is evaluated once and must never
-            // be expanded (`compound_bases`).
-            && (assign.compound || compound_assign_target_matches(&assign.left[0], binary.left.as_ref()))
         {
             self.format_lvalue(&assign.left[0])?;
             write!(self.output, " {} ", op)?;

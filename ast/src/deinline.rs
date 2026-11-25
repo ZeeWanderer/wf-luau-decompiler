@@ -22,6 +22,7 @@
 //! operators, node kinds) to match exactly.
 
 mod constant_copies;
+mod local_queries;
 pub mod evidence;
 pub(crate) mod fold;
 mod statement_values;
@@ -271,10 +272,15 @@ struct Target {
     /// ([`crate::evaluation_order::region_late_read_conflict`]). Read off
     /// the pattern the first time a site needs it ([`Target::free_cells`]).
     free_cells: std::cell::OnceCell<Vec<RcLocal>>,
-    /// At least one branch condition reads a parameter.  Only such targets can
-    /// change statement shape after constant argument propagation, so this is a
+    /// A parameter-dependent branch or eligible leading concat snapshot can
+    /// change statement shape after constant argument propagation. This is the
     /// cold precomputed gate for the Tier-B partial-evaluation fallback.
     specializable: bool,
+    /// The fewest top-level statements a specialized copy keeps: the
+    /// pattern's, less those only its declarations from parameters let
+    /// constants fold away ([`foldable_statements`]); none where a branch,
+    /// a concat or a truth reads a parameter itself.
+    specialized_floor: usize,
     /// Parameters read where only their truth matters
     /// ([`truth_tested_params`]), in parameter order. Luau folds such a read
     /// of a constant argument away, so a copy may keep no trace of it; Tier B
@@ -381,6 +387,14 @@ struct Target {
     /// What line info says of the module's inlined copies, when it has
     /// line info.
     lines: Option<std::rc::Rc<Evidence>>,
+    /// The source lines of the helper's own code ([`written_elsewhere`]).
+    own_lines: crate::source_lines::SourceLines,
+    /// For a select's twin ([`select_return`]): the parameters its `c and p
+    /// or q` needs truthy, which a copy's arguments must be.
+    select_truthy: Vec<RcLocal>,
+    /// For a fold variant: its pattern has a select a constant truth decides
+    /// ([`parameter_select`]), whose copies load no constant.
+    folds_truth: bool,
     captures: std::rc::Rc<crate::deinline_safety::CaptureSafety>,
     search: std::rc::Rc<crate::deinline_safety::SearchBudget>,
 }
@@ -413,10 +427,25 @@ impl Evidence {
         }
     }
 
+    /// The copies of the helper of prototype `helper` inside copies of other
+    /// helpers in `function`'s code.
+    fn nested_copies(&self, function: Option<FnPtr>, helper: Option<usize>) -> u32 {
+        match (self.caller(function), helper) {
+            (Some(caller), Some(helper)) => self.copies.nested_copies.get(&(caller as u32, helper as u32)).copied().unwrap_or(0),
+            _ => 0,
+        }
+    }
+
+    /// [`Self::copies`] with [`Self::nested_copies`], which an evidence
+    /// round also counts ([`evidence::counts_agree`]).
+    fn copies_at_any_depth(&self, function: Option<FnPtr>, helper: Option<usize>) -> u32 {
+        self.copies(function, helper) + self.nested_copies(function, helper)
+    }
+
     /// Honesty refusal, part (b): line info shows none of `helper`'s code
-    /// in `function`, so a match there specialized for constants is code
-    /// of something else (`table.clone(tbl)` in `DeepCopy`'s body is no
-    /// copy of `Copy(t, false)`). Unknown prototypes say nothing.
+    /// in `function`, at any depth of copies, so a match there is code of
+    /// something else (`table.clone(tbl)` in `DeepCopy`'s body is no copy of
+    /// `Copy(t, false)`). Unknown prototypes say nothing.
     fn absent(&self, function: Option<FnPtr>, helper: Option<usize>) -> bool {
         match (self.caller(function), helper) {
             (Some(caller), Some(helper)) => !self.copies.present(Some(caller), helper),
@@ -443,6 +472,8 @@ pub(crate) struct Bindings {
     /// The site returns the helper's value itself: each `return X` of the
     /// pattern stands for a `return X` of the site ([`match_returned_value`]).
     returning: bool,
+    /// The site's loop exits were given back as returns ([`exit_result_loops`]).
+    loop_exits: bool,
     /// `result` is a local the site declared without a value and that only
     /// the leaves store into: a pattern block that only returns `nil`
     /// stands for an empty site block, on whose path the result keeps that
@@ -452,6 +483,16 @@ pub(crate) struct Bindings {
     /// pattern computed from parameters, and the literal of the site it
     /// must fold to.
     pub(crate) equations: Vec<(RValue, Literal)>,
+    /// A select a constant truth decided ([`parameter_select`]): a fold the
+    /// base target does not stand for, as an equation.
+    truth_folded: bool,
+    /// Parameters an aligned seeding gave a constant for its truth alone
+    /// ([`seed_aligned`]), in that order: the call stands for them as an
+    /// inferred match does.
+    truths: Vec<RcLocal>,
+    /// Those of them given `nil`: left out of the call when last, as a call
+    /// leaves out an argument.
+    left_out: Vec<RcLocal>,
 }
 
 impl Bindings {
@@ -512,14 +553,17 @@ impl Target {
     /// The body's own locals are its registers; an outer local is its
     /// upvalue, fetched where it stands.
     fn leading(&self) -> &crate::evaluation_order::LeadingReads {
-        self.leading.get_or_init(|| {
-            let facts = crate::evaluation_order::Body {
-                registers: &|local| self.params.contains(local) || self.locals.contains(local),
-                unchanged: &|value| self.captures.unchanged_by_calls(value),
-            };
-            let unwritten: Vec<RcLocal> = self.param_order.iter().filter(|p| self.params.contains(*p)).cloned().collect();
-            crate::evaluation_order::LeadingReads::new(&self.pat, &unwritten, |p| count_local_reads(&self.pat, p) == 1, &facts)
-        })
+        self.leading.get_or_init(|| self.leading_reads_of(&self.pat))
+    }
+
+    /// [`Self::leading`] of `pat`, the body or a specialization of it.
+    fn leading_reads_of(&self, pat: &[Statement]) -> crate::evaluation_order::LeadingReads {
+        let facts = crate::evaluation_order::Body {
+            registers: &|local| self.params.contains(local) || self.locals.contains(local),
+            unchanged: &|value| self.captures.unchanged_by_calls(value),
+        };
+        let unwritten: Vec<RcLocal> = self.param_order.iter().filter(|p| self.params.contains(*p)).cloned().collect();
+        crate::evaluation_order::LeadingReads::new(pat, &unwritten, |p| count_local_reads(pat, p) == 1, &facts)
     }
 
     /// How many leading parameters reach the last one the body reads: a
@@ -593,8 +637,16 @@ struct Progress {
     /// The orphans' targets active in each function body ([`Orphan`]),
     /// by the body (`None`: the chunk).
     orphan_scopes: FxHashMap<Option<FnPtr>, Vec<usize>>,
+    /// Each orphan's twin class ([`Orphan::twin`]), by its binder.
+    orphan_twins: std::rc::Rc<FxHashMap<RcLocal, usize>>,
     /// The evidence round this iteration is ([`EvidenceRound`]).
     evidence: EvidenceRound,
+    /// The evidence rounds count copies inside copies of other helpers too,
+    /// for these pairs of a function's prototype and a helper
+    /// ([`nested_pending`]): once those of the outermost ones admitted
+    /// nothing more, so that an outer copy is a call before the copies it
+    /// holds are tried.
+    evidence_nested: Option<std::rc::Rc<FxHashSet<(u32, u32)>>>,
     /// The module's line evidence, where the scan records the prototype of
     /// each body it enters.
     lines: Option<std::rc::Rc<Evidence>>,
@@ -644,18 +696,23 @@ fn admitted_pairs(progress: &Progress) -> FxHashSet<(Option<FnPtr>, RcLocal)> {
     let admit = evidence::admitted(&lines.copies, &counts);
     let mut admitted = FxHashSet::default();
     for (((function, binder), _), (count, admit)) in pairs.into_iter().zip(counts.iter().zip(admit)) {
-        let copies = match (count.caller, count.helper) {
-            (Some(caller), Some(helper)) => lines.copies.copies(Some(caller), helper) as usize,
-            _ => 0,
+        let (copies, nested) = match (count.caller, count.helper) {
+            (Some(caller), Some(helper)) => (
+                lines.copies.copies(Some(caller), helper) as usize,
+                lines.copies.nested_copies.get(&(caller as u32, helper as u32)).copied().unwrap_or(0),
+            ),
+            _ => (0, 0),
         };
-        let agrees = count.hits > 0 && count.folded_left == 0 && count.hits + count.rebuilt == copies;
+        let agrees = count.hits > 0
+            && count.folded_left == 0
+            && count.caller.zip(count.helper).is_some_and(|(caller, helper)| evidence::counts_agree(&lines.copies, caller, helper, count.hits + count.rebuilt));
         crate::telemetry::count(if agrees { "evidence_admitted_pairs" } else { "evidence_refused_pairs" }, 1);
         if !agrees {
             crate::reconstruction_stats::refuse_site("evidence_count_mismatch");
         }
         if crate::env_flag!("MEDAL_TRACE_EVIDENCE") {
             eprintln!(
-                "EVIDENCE caller=p{:?} helper={} proto=p{:?} hits={} rebuilt={} copies={copies} folded_left={} admit={admit}",
+                "EVIDENCE caller=p{:?} helper={} proto=p{:?} hits={} rebuilt={} copies={copies}+{nested} folded_left={} admit={admit}",
                 count.caller, binder, count.helper, count.hits, count.rebuilt, count.folded_left
             );
         }
@@ -706,6 +763,61 @@ pub(crate) fn count_rebuilt_calls(
     }
 }
 
+/// The pairs of a function's prototype and an evidence helper whose copies
+/// there sit inside copies of other helpers still in its code, helpers
+/// calling it: such an outer copy is a call only once the copies it holds
+/// are (`findChild` calling `warnMissing`). An outer copy rebuilt as a call
+/// took the copies it held into its helper's body.
+fn nested_pending(body: &Block, lines: &Evidence, targets: &[Target]) -> FxHashSet<(u32, u32)> {
+    type Rebuilt = FxHashMap<(Option<FnPtr>, RcLocal), usize>;
+    fn closures(value: &RValue, binders: &FxHashSet<RcLocal>, rebuilt: &mut Rebuilt) {
+        if let RValue::Closure(closure) = value {
+            walk(&closure.function.0.lock().body.0, Some(Arc::as_ptr(&closure.function.0)), binders, rebuilt);
+            return;
+        }
+        value.visit_rvalues(&mut |child| {
+            closures(child, binders, rebuilt);
+            true
+        });
+    }
+    fn walk(stmts: &[Statement], function: Option<FnPtr>, binders: &FxHashSet<RcLocal>, rebuilt: &mut Rebuilt) {
+        count_rebuilt_calls(stmts, binders, function, rebuilt);
+        for statement in stmts {
+            for block in nested_blocks(statement) {
+                walk(&block.lock().0, function, binders, rebuilt);
+            }
+            visit_stmt_rvalues(statement, &mut |value| {
+                closures(value, binders, rebuilt);
+                true
+            });
+        }
+    }
+    let copies = &lines.copies;
+    let evidence: FxHashSet<u32> = targets.iter().filter(|target| target.evidence).filter_map(|target| target.proto).map(|proto| proto as u32).collect();
+    let candidates: Vec<(u32, u32, u32)> = copies.nested.iter().copied().filter(|(_, _, inner)| evidence.contains(inner)).collect();
+    if candidates.is_empty() {
+        return FxHashSet::default();
+    }
+    let target_of: FxHashMap<u32, &Target> = targets.iter().filter_map(|target| Some((target.proto? as u32, target))).collect();
+    let candidates: Vec<(u32, u32, u32)> = candidates.into_iter().filter(|(_, outer, inner)| {
+        target_of.get(outer).zip(target_of.get(inner)).is_some_and(|(outer, inner)| block_reads_local(&outer.pat, &inner.f_local))
+    }).collect();
+    let binders: FxHashSet<RcLocal> = candidates.iter().filter_map(|(_, outer, _)| target_of.get(outer).map(|target| target.f_local.clone())).collect();
+    let mut rebuilt = FxHashMap::default();
+    walk(&body.0, None, &binders, &mut rebuilt);
+    let function_of: FxHashMap<u32, Option<FnPtr>> = lines.protos.borrow().iter()
+        .filter_map(|(&function, proto)| Some((proto.as_ref().copied()? as u32, Some(function))))
+        .chain(std::iter::once((copies.main as u32, None)))
+        .collect();
+    candidates.into_iter().filter(|&(caller, outer, _)| {
+        let binder = &target_of[&outer].f_local;
+        let Some(&function) = function_of.get(&caller) else { return true };
+        let left = copies.copies(Some(caller as usize), outer as usize)
+            + copies.nested_copies.get(&(caller, outer)).copied().unwrap_or(0);
+        rebuilt.get(&(function, binder.clone())).copied().unwrap_or(0) < left as usize
+    }).map(|(caller, _, inner)| (caller, inner)).collect()
+}
+
 /// The local a wrapper pattern calls: a body that is one call of another
 /// local, as a statement or returned (`updateChildren(node, parent,
 /// children)`). Its copy is that call, which a call written by hand is too;
@@ -741,6 +853,154 @@ fn holds_rebuilt_call(stmts: &[Statement], callee: &RcLocal) -> bool {
     })
 }
 
+/// Whether line info shows `window` holds none of the helper's code (its
+/// lines `helper`): Luau `-O2` keeps the callee's lines on a copy, so a
+/// window whose nodes carry lines, none of them the helper's, is code
+/// written out (`a + (b - a) * t` beside a copy of `lerp`).
+fn written_elsewhere(window: &[Statement], helper: crate::source_lines::SourceLines) -> bool {
+    use crate::source_lines::{SourceLines, statement, value};
+    // Whether a node of `stmts` carries the helper's lines; `known`: any lines.
+    fn walk(stmts: &[Statement], helper: SourceLines, known: &mut bool) -> bool {
+        stmts.iter().any(|node| {
+            let mut lines = statement(node);
+            node.visit_rvalues(&mut |item| {
+                lines.merge(value(item));
+                true
+            });
+            *known |= lines.known();
+            lines.overlaps(helper) || nested_blocks(node).iter().any(|block| walk(&block.lock().0, helper, known))
+        })
+    }
+    let mut known = false;
+    helper.known() && !walk(window, helper, &mut known) && known
+}
+
+/// The stores a helper's body opens with into a table parameter
+/// (`data.Name = name`), which in a copy the SSA fold took into the
+/// argument's constructor (`local data = {..., Name = "Honey"}` for
+/// `pushSet("Honey", {...})`): a constructor's trailing entries with those
+/// keys become stores again, so the copy unifies. Where no call is
+/// rebuilt, [`refold_entry_stores`] folds them back. The keys taken out of
+/// each table.
+fn unfold_helper_entry_stores(body: &mut Block) -> FxHashMap<RcLocal, FxHashSet<Vec<u8>>> {
+    fn each_block(stmts: &[Statement], visit: &mut impl FnMut(&[Statement])) {
+        visit(stmts);
+        for statement in stmts {
+            for block in nested_blocks(statement) {
+                each_block(&block.lock().0, visit);
+            }
+            statement.traverse_rvalues_ref(&mut |value| {
+                if let RValue::Closure(closure) = value {
+                    each_block(&closure.function.0.lock().body.0, visit);
+                }
+            });
+        }
+    }
+    let field_store = |statement: &Statement| match statement {
+        Statement::Assign(store) if !store.prefix && store.left.len() == 1 && store.right.len() == 1 => match &store.left[0] {
+            LValue::Index(index) => match (index.left.as_ref(), index.right.as_ref()) {
+                (RValue::Local(base), RValue::Literal(Literal::String(key))) => Some((base.clone(), key.clone())),
+                _ => None,
+            },
+            _ => None,
+        },
+        _ => None,
+    };
+    let mut keys: FxHashSet<Vec<u8>> = FxHashSet::default();
+    each_block(&body.0, &mut |stmts| {
+        for statement in stmts {
+            if let Statement::Assign(declaration) = statement
+                && declaration.prefix
+                && let [RValue::Closure(closure)] = declaration.right.as_slice()
+            {
+                let function = closure.function.0.lock();
+                let mut leading = function.body.0.iter().map_while(|statement| field_store(statement));
+                if let Some((base, key)) = leading.next()
+                    && function.parameters.contains(&base)
+                {
+                    keys.insert(key);
+                    keys.extend(leading.take_while(|(other, _)| *other == base).map(|(_, key)| key));
+                }
+            }
+        }
+    });
+    let mut unfolded = FxHashMap::default();
+    if keys.is_empty() {
+        return unfolded;
+    }
+    fn unfold(stmts: &mut Vec<Statement>, keys: &FxHashSet<Vec<u8>>, unfolded: &mut FxHashMap<RcLocal, FxHashSet<Vec<u8>>>) {
+        let mut index = 0;
+        while index < stmts.len() {
+            if let Statement::Assign(declaration) = &mut stmts[index]
+                && declaration.prefix
+                && let [LValue::Local(object)] = declaration.left.as_slice()
+                && let [RValue::Table(table)] = declaration.right.as_mut_slice()
+            {
+                let object = object.clone();
+                let kept = table.0.len()
+                    - table.0.iter().rev().take_while(|(key, _)| matches!(key, Some(RValue::Literal(Literal::String(key))) if keys.contains(key))).count();
+                let stores: Vec<Statement> = table.0.split_off(kept).into_iter().map(|(key, value)| {
+                    if let Some(RValue::Literal(Literal::String(key))) = &key {
+                        unfolded.entry(object.clone()).or_insert_with(FxHashSet::default).insert(key.clone());
+                    }
+                    Assign::new(vec![LValue::Index(crate::Index::new(RValue::Local(object.clone()), key.unwrap()))], vec![value]).into()
+                }).collect();
+                let after = index + 1;
+                index += stores.len();
+                stmts.splice(after..after, stores);
+            }
+            for block in nested_blocks(&stmts[index]) {
+                unfold(&mut block.lock().0, keys, unfolded);
+            }
+            stmts[index].traverse_rvalues(&mut |value| {
+                if let RValue::Closure(closure) = value {
+                    unfold(&mut closure.function.0.lock().body.0, keys, unfolded);
+                }
+            });
+            index += 1;
+        }
+    }
+    unfold(&mut body.0, &keys, &mut unfolded);
+    unfolded
+}
+
+/// The stores [`unfold_helper_entry_stores`] took out of a constructor that
+/// still follow it: entries again.
+fn refold_entry_stores(stmts: &mut Vec<Statement>, unfolded: &FxHashMap<RcLocal, FxHashSet<Vec<u8>>>) {
+    let mut index = 0;
+    while index < stmts.len() {
+        if let Statement::Assign(declaration) = &stmts[index]
+            && declaration.prefix
+            && let [LValue::Local(object)] = declaration.left.as_slice()
+            && let [RValue::Table(_)] = declaration.right.as_slice()
+            && let Some(keys) = unfolded.get(object)
+        {
+            let object = object.clone();
+            while let Some(Statement::Assign(store)) = stmts.get(index + 1)
+                && !store.prefix
+                && let ([LValue::Index(target)], [_]) = (store.left.as_slice(), store.right.as_slice())
+                && matches!(target.left.as_ref(), RValue::Local(base) if *base == object)
+                && matches!(target.right.as_ref(), RValue::Literal(Literal::String(key)) if keys.contains(key))
+            {
+                let Statement::Assign(store) = stmts.remove(index + 1) else { unreachable!() };
+                let Some(LValue::Index(target)) = store.left.into_iter().next() else { unreachable!() };
+                let Statement::Assign(declaration) = &mut stmts[index] else { unreachable!() };
+                let RValue::Table(table) = &mut declaration.right[0] else { unreachable!() };
+                table.0.push((Some(*target.right), store.right.into_iter().next().unwrap()));
+            }
+        }
+        for block in nested_blocks(&stmts[index]) {
+            refold_entry_stores(&mut block.lock().0, unfolded);
+        }
+        stmts[index].traverse_rvalues(&mut |value| {
+            if let RValue::Closure(closure) = value {
+                refold_entry_stores(&mut closure.function.0.lock().body.0, unfolded);
+            }
+        });
+        index += 1;
+    }
+}
+
 /// The statement blocks `statement` holds, function bodies aside.
 fn nested_blocks(statement: &Statement) -> Vec<Arc<Mutex<Block>>> {
     match statement {
@@ -771,23 +1031,33 @@ struct Orphan {
     /// The function whose body held the declaration, `None` for the chunk.
     scope: Option<FnPtr>,
     scope_function: Option<Arc<Mutex<Function>>>,
+    /// The first orphan it is a twin of ([`twins`]), in any function: a
+    /// function's own one stands for its code ([`function_scope`]).
+    twin: usize,
 }
 
 /// The orphans kept aside by `body`'s functions, nested ones included,
 /// those of the chunk first (`chunk`).
 fn collect_orphans(body: &Block, chunk: &[(RcLocal, Closure)], nested: bool) -> Vec<Orphan> {
-    fn walk(stmts: &[Statement], out: &mut Vec<Orphan>) {
+    fn walk(stmts: &[Statement], out: &mut Vec<(Orphan, Closure)>) {
         for statement in stmts {
             statement.traverse_rvalues_ref(&mut |value| {
                 if let RValue::Closure(closure) = value {
                     let function = closure.function.0.lock();
-                    for (binder, orphan) in &function.orphans {
-                        out.push(Orphan {
-                            binder: binder.clone(),
-                            function: orphan.function.0.clone(),
-                            scope: Some(Arc::as_ptr(&closure.function.0)),
-                            scope_function: Some(closure.function.0.clone()),
-                        });
+                    for (index, (binder, orphan)) in function.orphans.iter().enumerate() {
+                        if function.orphans[..index].iter().any(|(_, earlier)| twins(earlier, orphan)) {
+                            continue;
+                        }
+                        out.push((
+                            Orphan {
+                                binder: binder.clone(),
+                                function: orphan.function.0.clone(),
+                                scope: Some(Arc::as_ptr(&closure.function.0)),
+                                scope_function: Some(closure.function.0.clone()),
+                                twin: 0,
+                            },
+                            orphan.clone(),
+                        ));
                     }
                     walk(&function.body.0, out);
                 }
@@ -805,20 +1075,55 @@ fn collect_orphans(body: &Block, chunk: &[(RcLocal, Closure)], nested: bool) -> 
             }
         }
     }
-    let mut orphans: Vec<Orphan> = chunk
+    let mut found: Vec<(Orphan, Closure)> = chunk
         .iter()
-        .map(|(binder, closure)| Orphan { binder: binder.clone(), function: closure.function.0.clone(), scope: None, scope_function: None })
+        .enumerate()
+        .filter(|&(index, (_, closure))| !chunk[..index].iter().any(|(_, earlier)| twins(earlier, closure)))
+        .map(|(_, (binder, closure))| {
+            let orphan = Orphan { binder: binder.clone(), function: closure.function.0.clone(), scope: None, scope_function: None, twin: 0 };
+            (orphan, closure.clone())
+        })
         .collect();
     if nested {
-        walk(&body.0, &mut orphans);
+        walk(&body.0, &mut found);
     }
-    orphans
+    // The twin classes across functions, by prototype: the same locals
+    // captured, a function's own by value or its upvalue's cell alike.
+    let captured = |literal: &Closure| literal.upvalues.iter().map(|(Upvalue::Copy(local) | Upvalue::Ref(local))| local.clone()).collect::<Vec<_>>();
+    let mut classes: FxHashMap<usize, Vec<usize>> = FxHashMap::default();
+    for index in 0..found.len() {
+        let literal = &found[index].1;
+        let proto = literal.function.0.lock().bytecode_proto_id;
+        let first = proto
+            .and_then(|proto| classes.get(&proto))
+            .and_then(|class| class.iter().copied().find(|&first| captured(&found[first].1) == captured(literal)));
+        found[index].0.twin = first.unwrap_or_else(|| {
+            if let Some(proto) = proto {
+                classes.entry(proto).or_default().push(index);
+            }
+            index
+        });
+    }
+    found.into_iter().map(|(orphan, _)| orphan).collect()
+}
+
+/// Two literals one function kept aside alike: the same prototype with the
+/// same captures (each copy of a caller inlined there made its own, `local
+/// a = run(function() ... end)` twice). Only ever called, they are one
+/// target; each call rebuilt takes one of them.
+fn twins(a: &Closure, b: &Closure) -> bool {
+    a.upvalues == b.upvalues
+        && (Arc::ptr_eq(&a.function.0, &b.function.0) || {
+            let proto = a.function.0.lock().bytecode_proto_id;
+            proto.is_some() && proto == b.function.0.lock().bytecode_proto_id
+        })
 }
 
 /// Each orphan a call of which was rebuilt goes back into its body
 /// ([`Orphan`]), right before the first top-level statement reading it,
-/// and leaves the side table.
-fn materialize_orphans(body: &mut Block, chunk: &mut Vec<(RcLocal, Closure)>, orphans: &[Orphan], used: &FxHashSet<RcLocal>) {
+/// and leaves the side table; whether one did.
+fn materialize_orphans(body: &mut Block, chunk: &mut Vec<(RcLocal, Closure)>, orphans: &[Orphan], used: &FxHashSet<RcLocal>) -> bool {
+    let mut materialized = false;
     for orphan in orphans.iter().filter(|orphan| used.contains(&orphan.binder)) {
         let mut scope_function = orphan.scope_function.as_ref().map(|function| function.lock());
         let (stmts, table) = match &mut scope_function {
@@ -830,15 +1135,72 @@ fn materialize_orphans(body: &mut Block, chunk: &mut Vec<(RcLocal, Closure)>, or
         };
         let Some(at) = table.iter().position(|(binder, _)| *binder == orphan.binder) else { continue };
         let (binder, closure) = table.remove(at);
-        let Some(first) = stmts.iter().position(|statement| count_local_reads(std::slice::from_ref(statement), &binder) > 0) else {
+        let reads = count_local_reads(stmts, &binder);
+        if reads == 0 {
             // Its calls went with a later rewrite: it stays aside.
             table.insert(at, (binder, closure));
+            continue;
+        }
+        // Read as the argument of a call (the callback a copy called in
+        // place, `activate("Garden", function() ... end)`), once for it and
+        // each twin: the literal goes back there, where Luau evaluated it.
+        let literals: Vec<Closure> = std::iter::once(closure.clone())
+            .chain(table.iter().filter(|(_, other)| twins(other, &closure)).map(|(_, twin)| twin.clone()))
+            .collect();
+        materialized = true;
+        if reads <= literals.len()
+            && literals[..reads].iter().all(|literal| stmts.iter_mut().any(|statement| pass_as_argument(statement, &binder, literal)))
+        {
+            table.retain(|(_, other)| !twins(other, &closure));
+            continue;
+        }
+        let Some(first) = stmts.iter().position(|statement| count_local_reads(std::slice::from_ref(statement), &binder) > 0) else {
             continue;
         };
         let mut declaration = Assign::new(vec![LValue::Local(binder)], vec![RValue::Closure(closure)]);
         declaration.prefix = true;
         stmts.insert(first, declaration.into());
     }
+    materialized
+}
+
+/// Puts `closure` in place of the read of `binder` that is an argument of a
+/// call in `statement`, outside any function literal; whether there was one.
+fn pass_as_argument(statement: &mut Statement, binder: &RcLocal, closure: &Closure) -> bool {
+    fn in_value(value: &mut RValue, binder: &RcLocal, closure: &Closure) -> bool {
+        if let RValue::Closure(_) = value {
+            return false;
+        }
+        if let RValue::Call(call) | RValue::Select(Select::Call(call)) = value {
+            for argument in &mut call.arguments {
+                if matches!(argument, RValue::Local(read) if read == binder) {
+                    *argument = RValue::Closure(closure.clone());
+                    return true;
+                }
+            }
+        }
+        let mut done = false;
+        value.visit_rvalues_mut(&mut |child| {
+            done = in_value(child, binder, closure);
+            !done
+        });
+        done
+    }
+    let mut done = false;
+    statement.visit_rvalues_mut(&mut |value| {
+        done = in_value(value, binder, closure);
+        !done
+    });
+    if !done {
+        for block in nested_blocks(statement) {
+            for inner in block.lock().0.iter_mut() {
+                if pass_as_argument(inner, binder, closure) {
+                    return true;
+                }
+            }
+        }
+    }
+    done
 }
 
 /// The scan of an iteration that rewrote nothing, as the next one, which
@@ -867,9 +1229,102 @@ pub fn deinline_with_orphans(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal,
     deinline_orphans_in(body, chunk_orphans, true);
 }
 
+/// SSA cannot prove that an incoming cell is immutable across other functions,
+/// so helpers can retain `local snapshot = captured` where their inlined copies
+/// read `captured` directly. Normalize only that proved-stable scalar shape,
+/// before helper patterns and site windows are cached. A single-use closure
+/// snapshot can move to an adjacent argument only when all its captures stay fixed.
+fn normalize_stable_capture_snapshots(body: &mut Block, captures: &crate::deinline_safety::CaptureSafety) -> bool {
+    if !captures.unique_function_bodies() { return false; }
+    let usage = crate::inline_temps::collect_usage(body);
+    let mut aliases = FxHashMap::default();
+    fn walk(body: &mut Block, captures: &crate::deinline_safety::CaptureSafety,
+        usage: &FxHashMap<RcLocal, crate::inline_temps::Usage>, aliases: &mut FxHashMap<RcLocal, RcLocal>,
+        visited: &mut FxHashSet<FnPtr>) -> bool {
+        body.0.retain(|statement| {
+            let Statement::Assign(assign) = statement else { return true };
+            let ([LValue::Local(snapshot)], [RValue::Local(source)]) =
+                (assign.left.as_slice(), assign.right.as_slice()) else { return true };
+            let named = snapshot.0.0.lock().0.is_some();
+            if !assign.prefix || assign.parallel || assign.compound || snapshot == source
+                || snapshot.preserve_binding()
+                || (named && !crate::inline_temps::is_generated_temp(snapshot))
+                || !captures.uncaptured(snapshot) || captures.uncaptured(source)
+                || !captures.never_reassigned(source)
+                || !usage.get(snapshot).is_some_and(|u| u.writes == 1 && u.reads == 1 && !u.captured)
+                || !usage.get(source).is_some_and(|u| u.writes <= 1)
+            { return true; }
+            aliases.insert(snapshot.clone(), source.clone());
+            false
+        });
+        let mut changed = false;
+        let mut at = 0;
+        while at + 1 < body.len() {
+            let argument = (|| {
+                let (snapshot, value, argument) = leading_scalar_snapshot(&body.0[at..])?;
+                let RValue::Closure(closure) = value else { return None };
+                if !captures.uncaptured(snapshot) || !captures.never_reassigned(snapshot)
+                    || !usage.get(snapshot).is_some_and(|u| u.writes == 1 && u.reads == 1 && !u.captured)
+                    || closure.upvalues.iter().any(|capture| {
+                        let (Upvalue::Copy(local) | Upvalue::Ref(local)) = capture;
+                        local == snapshot || !captures.never_reassigned(local)
+                    })
+                { return None; }
+                // Keep prospective helper binders available to target discovery.
+                let function = closure.function.lock();
+                if function.name.is_some() || function.retain_for_reconstruction || function.inlined_by_compiler {
+                    return None;
+                }
+                drop(function);
+                let mutable = |local: &RcLocal| !captures.never_reassigned(local);
+                crate::evaluation_order::can_sink_with_summary(&body[at + 1], snapshot, value,
+                    &mutable, &|_| false, crate::effects::summarize(value, &mutable)).then_some(argument)
+            })();
+            if let Some(argument) = argument {
+                let Statement::Assign(mut declaration) = std::mem::replace(&mut body[at], Statement::Empty(crate::Empty {}))
+                    else { unreachable!() };
+                let Statement::Call(call) = &mut body[at + 1] else { unreachable!() };
+                call.arguments[argument] = declaration.right.pop().unwrap();
+                crate::node_origins::inlined(&mut call.arguments[argument]);
+                changed = true;
+            }
+            at += 1;
+        }
+        if changed { body.0.retain(|statement| !matches!(statement, Statement::Empty(_))); }
+        for statement in &mut body.0 {
+            crate::inline_temps::collect_closures_in_statement(statement, &mut |closure| {
+                if visited.insert(Arc::as_ptr(&closure.function.0)) {
+                    changed |= walk(&mut closure.function.lock().body, captures, usage, aliases, visited);
+                }
+            });
+            for nested in nested_blocks(statement) {
+                changed |= walk(&mut nested.lock(), captures, usage, aliases, visited);
+            }
+        }
+        changed
+    }
+    let changed = walk(body, captures, &usage, &mut aliases, &mut FxHashSet::default());
+    if aliases.is_empty() { return changed; }
+    // Sources are captured and destinations are not, so this map has no chains
+    // and cannot redirect a write or alter a closure's Copy/Ref capture list.
+    crate::replace_locals::replace_locals(body, &aliases);
+    true
+}
+
 /// [`deinline_with_orphans`], where `nested` says whether a function of
 /// the chunk may hold orphans of its own (else none is looked for).
 pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, Closure)>, nested: bool) {
+    while deinline_orphans_in_with_literal_numbers(body, chunk_orphans, nested, false) {}
+}
+
+/// `literal_numbers` requires number constants to retain their literal spelling,
+/// rather than becoming optional environment reads such as `math.pi`.
+///
+/// Whether a function literal kept aside went back into the tree: its body
+/// is scanned as any function's on the next pass, with the helpers in scope
+/// where it now stands.
+pub fn deinline_orphans_in_with_literal_numbers(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, Closure)>,
+    nested: bool, literal_numbers: bool) -> bool {
     let orphans = if nested || !chunk_orphans.is_empty() { collect_orphans(body, chunk_orphans, nested) } else { Vec::new() };
     // What line info shows of the inlined copies (E1), if the chunk has any.
     let copies = evidence::current();
@@ -877,16 +1332,32 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
     // worth building when some helper passes the per-declaration gates.
     if !any_structural_target(body, copies.as_deref()) && orphans.is_empty() {
         crate::telemetry::count("skipped_without_targets", 1);
-        return;
+        return false;
     }
-    let captures = crate::deinline_safety::CaptureSafety::new(body);
+    let census = |body: &Block| crate::deinline_safety::CaptureSafety::new(body).with_literal_numbers(literal_numbers);
+    let mut captures = census(body);
     if !captures.complete() || captures.dynamic_environment() || captures.call_frames_untracked() {
         crate::telemetry::count("skipped_without_targets", 1);
-        return;
+        return false;
+    }
+    // Detached orphan bodies are not part of this census's capture inventory.
+    if orphans.is_empty() {
+        if normalize_stable_capture_snapshots(body, &captures) {
+            captures = census(body);
+        }
+        if crate::fold_import_callees::fold_literal_number_import_callees(body, &captures) {
+            captures = census(body);
+        }
+    }
+    // Stores taken out of constructors for copies to unify, folded back
+    // below where no call took them.
+    let unfolded = if orphans.is_empty() { unfold_helper_entry_stores(body) } else { FxHashMap::default() };
+    if !unfolded.is_empty() {
+        captures = census(body);
     }
     // What each literal captures, so no rewrite changes whether Luau shares
     // it (`literal_sharing`).
-    let _sharing = crate::literal_sharing::enter(body);
+    let _sharing = crate::literal_sharing::enter(body, chunk_orphans);
     // Helpers every call of which returns exactly one value, read off the
     // declarations before any rewrite can replace one (`local f = factory()`
     // no longer shows `f`'s body). Only their calls may move into a place
@@ -902,6 +1373,7 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
             single_valued.insert(orphan.binder.clone());
         }
     }
+    let orphan_twins = std::rc::Rc::new(orphans.iter().map(|orphan| (orphan.binder.clone(), orphan.twin)).collect::<FxHashMap<_, _>>());
     // The entry budget census describes the unchanged first iteration too.
     // Later iterations rebuild it after rewriting; no mutable-tree facts are
     // retained across a revision, and this summary owns only numeric IDs.
@@ -912,6 +1384,7 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
     // above the floor search as they would without line evidence.
     let evidence_search = std::rc::Rc::new(crate::deinline_safety::SearchBudget::default());
     let mut evidence_round = EvidenceRound::Off;
+    let mut evidence_nested: Option<std::rc::Rc<FxHashSet<(u32, u32)>>> = None;
     let mut converted: FxHashSet<RcLocal> = FxHashSet::default();
     // P4 perf: the write-once census is INVARIANT across fixed-point iterations for
     // the only thing we query — TARGET BINDERS (a `local f = function…end` local,
@@ -987,8 +1460,10 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
                     targets
                 }
                 None => {
-                    let captures = initial_captures.take().unwrap_or_else(||
-                        std::rc::Rc::new(crate::deinline_safety::CaptureSafety::new(body)));
+                    let captures = initial_captures.take().unwrap_or_else(|| {
+                        let _span = crate::telemetry::Span::new("D_ROUND_CENSUS");
+                        std::rc::Rc::new(census(body))
+                    });
                     current_captures = Some(captures.clone());
                     if let Some(last) = last_targets.take() {
                         helper_cache.keep_targets(last);
@@ -1056,7 +1531,9 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
             revisit: previous.as_ref().map(|previous| previous.bodies.clone()).unwrap_or_default(),
             rescan,
             evidence: evidence_round.clone(),
+            evidence_nested: evidence_nested.clone(),
             lines: lines.clone(),
+            orphan_twins: orphan_twins.clone(),
             ..Progress::default()
         };
         for (index, target) in targets.iter().enumerate() {
@@ -1067,6 +1544,12 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
         let chunk_orphans_active = newly.orphan_scopes.get(&None).cloned().unwrap_or_default();
         {
             let _span = crate::telemetry::Span::new("D_SCAN");
+            let _round = crate::telemetry::Span::new(match (&evidence_round, assign_phase) {
+                (EvidenceRound::Probe, _) => "D_SCAN_PROBE",
+                (EvidenceRound::Admit(_), _) => "D_SCAN_ADMIT",
+                (EvidenceRound::Off, true) => "D_SCAN_ASSIGN",
+                (EvidenceRound::Off, false) => "D_SCAN_PLAIN",
+            });
             deinline_block(
                 &mut body.0,
                 &targets,
@@ -1080,6 +1563,7 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
                 false,
                 &mut newly,
             );
+            scan_orphan_bodies(chunk_orphans, &targets, &decl_map, &chunk_orphans_active, &mut newly);
             crate::telemetry::count("converted_binders", newly.binders.len() as u64);
         }
         // Fixed point is reached when an iteration rewrites NOTHING. `newly` gains a
@@ -1112,6 +1596,17 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
             EvidenceRound::Probe if newly.binders.is_empty() => {
                 let admitted = admitted_pairs(&newly);
                 if admitted.is_empty() {
+                    let pending = match (&evidence_nested, &lines) {
+                        (None, Some(lines)) => nested_pending(body, lines, &targets),
+                        _ => FxHashSet::default(),
+                    };
+                    if !pending.is_empty() {
+                        evidence_nested = Some(std::rc::Rc::new(pending));
+                        evidence_round = EvidenceRound::Probe;
+                        unchanged_targets = Some(targets);
+                        previous = Some(newly);
+                        continue;
+                    }
                     break;
                 }
                 evidence_round = EvidenceRound::Admit(std::rc::Rc::new(admitted));
@@ -1170,8 +1665,9 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
     if search.exhausted() {
         crate::reconstruction_stats::refuse_site("search_budget_exhausted");
     }
-    if !orphans.is_empty() {
-        materialize_orphans(body, chunk_orphans, &orphans, &converted);
+    let materialized = !orphans.is_empty() && materialize_orphans(body, chunk_orphans, &orphans, &converted);
+    if !unfolded.is_empty() {
+        refold_entry_stores(&mut body.0, &unfolded);
     }
     if !converted.is_empty() {
         {
@@ -1179,12 +1675,13 @@ pub fn deinline_orphans_in(body: &mut Block, chunk_orphans: &mut Vec<(RcLocal, C
             let _span = crate::telemetry::Span::new("D_COLLAPSE_RESULTS");
             // The collapse reads the final tree's registers and stable values.
             let captures = current_captures
-                .unwrap_or_else(|| std::rc::Rc::new(crate::deinline_safety::CaptureSafety::new(body)));
+                .unwrap_or_else(|| std::rc::Rc::new(census(body)));
             let facts = Collapse { single_valued: &single_valued, captures: &captures, function: None };
             collapse_value_results(&mut body.0, &facts, &FxHashSet::default());
         }
     }
     dprof::dump();
+    materialized
 }
 
 // ===================================================================
@@ -1409,8 +1906,14 @@ fn collapse_value_results(stmts: &mut Vec<Statement>, facts: &Collapse, live_out
     // b)` is `h(f(), g())`). `kept` holds the statements kept so far, last
     // first, each with the last original statement it covers.
     let mut kept: Vec<(Statement, usize)> = Vec::with_capacity(n);
+    // A literal's declaration between the call and its use runs nothing the
+    // call could see or change (`local v2 = f(x); local v3 = nil; g(v2, v3)`).
+    let inert = |statement: &Statement| is_match_trivia(statement) || matches!(statement, Statement::Assign(a)
+        if a.prefix && !a.parallel && a.left.len() == 1 && matches!(a.right.as_slice(), [RValue::Literal(_)]));
     for (i, statement) in taken.into_iter().enumerate().rev() {
-        if let Some((next, covers)) = kept.last()
+        let at = kept.iter().rposition(|(kept, _)| !inert(kept));
+        if let Some(at) = at
+            && let Some((next, covers)) = kept.get(at)
             && let Statement::Assign(a) = &statement
             && let Some((v, call)) = value_call_decl(a)
             && count_local_reads(std::slice::from_ref(next), &v) == 1
@@ -1424,9 +1927,7 @@ fn collapse_value_results(stmts: &mut Vec<Statement>, facts: &Collapse, live_out
         {
             // The rebuilt call now lives inside `collapsed`, still carrying
             // its `rebuilt` attribute for the formatter's site comment.
-            let covers = *covers;
-            kept.pop();
-            kept.push((collapsed, covers));
+            kept[at] = (collapsed, *covers);
         } else {
             kept.push((statement, i));
         }
@@ -1610,7 +2111,7 @@ fn call_callee_local(call: &RValue) -> Option<&RcLocal> {
 /// Whether every call of a function with this body returns exactly one
 /// value: each `return` lists one value that is not a call's or `...`'s
 /// results, and no path runs off the end of the body.
-fn returns_exactly_one(body: &[Statement]) -> bool {
+pub(crate) fn returns_exactly_one(body: &[Statement]) -> bool {
     fn one_value_returns(stmts: &[Statement]) -> bool {
         stmts.iter().all(|statement| match statement {
             Statement::Return(ret) => {
@@ -1629,6 +2130,11 @@ fn returns_exactly_one(body: &[Statement]) -> bool {
         match stmts.iter().rev().find(|statement| !is_match_trivia(statement)) {
             Some(Statement::Return(_)) => true,
             Some(Statement::If(f)) => always_returns(&f.then_block.lock().0) && always_returns(&f.else_block.lock().0),
+            // A loop nothing but a `return` leaves never runs past its end.
+            Some(Statement::While(w)) => matches!(w.condition, RValue::Literal(Literal::Boolean(true)))
+                && !has_owned_break(&w.block.lock().0),
+            Some(Statement::Repeat(r)) => matches!(r.condition, RValue::Literal(Literal::Boolean(false)))
+                && !has_owned_break(&r.block.lock().0),
             _ => false,
         }
     }
@@ -1844,6 +2350,8 @@ struct Enclosing<'a> {
     parent: Option<&'a Enclosing<'a>>,
     /// A function body's parameters.
     params: &'a [RcLocal],
+    /// The condition of the `if` this block is the `then` arm of.
+    guard: Option<&'a RValue>,
 }
 
 impl<'a> Enclosing<'a> {
@@ -2093,8 +2601,15 @@ impl std::ops::Deref for Window {
 struct CanonCache {
     windows: FxHashMap<(usize, usize), Window>,
     middle: Option<std::rc::Rc<Vec<Statement>>>,
-    last: Vec<Option<Statement>>,
+    last: Vec<Option<Window>>,
     nodes: Vec<usize>,
+    /// Return-mode windows always end at the block's end. They used to be
+    /// rebuilt for every target, even at the same position. Their fuel is
+    /// still charged for every attempt; these caches only save tree copies.
+    returned: Option<Window>,
+    returned_shape: Option<Option<usize>>,
+    returned_nodes: Option<usize>,
+    returned_prefix: Option<Option<std::rc::Rc<(Vec<Statement>, Vec<RValue>)>>>,
     /// Whether the block returns on every path ([`block_always_returns`]),
     /// which every return-mode window, running to its end, needs.
     returns: Option<bool>,
@@ -2107,6 +2622,10 @@ impl CanonCache {
     /// A new position: its windows start elsewhere.
     fn clear(&mut self) {
         self.windows.clear();
+        self.returned = None;
+        self.returned_shape = None;
+        self.returned_nodes = None;
+        self.returned_prefix = None;
         self.kinds = None;
     }
 
@@ -2137,7 +2656,7 @@ impl CanonCache {
     /// `stmts[start..start + added]` replaced `removed` statements at
     /// `start`: the canonical forms of the others stay as they are.
     fn spliced(&mut self, stmts: &[Statement], start: usize, removed: usize, added: usize) {
-        self.windows.clear();
+        self.clear();
         match self.middle.as_mut().map(std::rc::Rc::get_mut) {
             Some(Some(middle)) => {
                 middle.splice(
@@ -2158,6 +2677,41 @@ impl CanonCache {
         self.middle.get_or_insert_with(|| {
             std::rc::Rc::new(stmts.iter().map(|statement| canon_statement(statement.clone(), false)).collect())
         })
+    }
+
+    fn last(&mut self, stmts: &[Statement], at: usize) -> Window {
+        if self.last.is_empty() {
+            self.last.resize(stmts.len(), None);
+        }
+        self.last[at].get_or_insert_with(|| {
+            Window::owned(vec![canon_statement(stmts[at].clone(), true)])
+        }).clone()
+    }
+
+    fn returned(&mut self, stmts: &[Statement], start: usize) -> Window {
+        if let Some(window) = &self.returned {
+            return window.clone();
+        }
+        // Return-mode windows may be the first match tried near the end of
+        // a large block. Do not initialize `middle` for its unrelated prefix.
+        let window = Window::owned(canon_recurse(canon_top(&stmts[start..], true), true));
+        self.returned = Some(window.clone());
+        window
+    }
+
+    fn returned_shape(&mut self, window: &[Statement]) -> Option<usize> {
+        *self.returned_shape.get_or_insert_with(|| {
+            (!block_has_void_return(window) && !has_depth_zero_loop_control(window, 0))
+                .then(|| canon_top_len(window, true))
+        })
+    }
+
+    fn returned_nodes(&mut self, window: &[Statement]) -> usize {
+        *self.returned_nodes.get_or_insert_with(|| window.iter().map(dbg_stmt_node_count).sum())
+    }
+
+    fn returned_prefix(&mut self, stmts: &[Statement], start: usize) -> Option<std::rc::Rc<(Vec<Statement>, Vec<RValue>)>> {
+        self.returned_prefix.get_or_insert_with(|| returned_before(&stmts[start..]).map(std::rc::Rc::new)).clone()
     }
 
     /// The node count of `stmts[start..start + w]`, what [`charge_window`]
@@ -2189,17 +2743,20 @@ impl CanonCache {
         if distributed || body.iter().any(|&k| is_foldable_guard(&stmts[k])) {
             return Window::owned(canon_recurse(canon_top(&stmts[start..start + w], true), true));
         }
+        // A single statement needs only its tail form. Building `middle`
+        // here used to canonicalize the entire block, including all the
+        // unrelated branches, even when no multi-statement window was tried.
+        if body.is_empty() {
+            return self.last(stmts, tail);
+        }
         let middle = self.middle(stmts).clone();
         let contiguous = tail + 1 - first == real.len();
         if contiguous && !matches!(stmts[tail], Statement::If(_)) {
             return Window { statements: middle, range: first..tail + 1 };
         }
-        if self.last.is_empty() {
-            self.last.resize(stmts.len(), None);
-        }
         let mut out = Vec::with_capacity(real.len());
         out.extend(body.iter().map(|&k| middle[k].clone()));
-        out.push(self.last[tail].get_or_insert_with(|| canon_statement(stmts[tail].clone(), true)).clone());
+        out.push(self.last(stmts, tail)[0].clone());
         Window::owned(out)
     }
 }
@@ -2325,6 +2882,203 @@ fn canon_top(stmts: &[Statement], tail: bool) -> Vec<Statement> {
         s = unguard(s);
     }
     s
+}
+
+/// The bodies of the function literals a function kept aside ([`Orphan`]),
+/// scanned as any function's: the helpers copied into them become calls
+/// there too, so the literal reads as its copies do once those are calls.
+fn scan_orphan_bodies(
+    orphans: &[(RcLocal, Closure)],
+    targets: &[Target],
+    decl_map: &FxHashMap<RcLocal, std::ops::Range<usize>>,
+    active: &[usize],
+    newly: &mut Progress,
+) {
+    for (_, closure) in orphans {
+        let fp = Arc::as_ptr(&closure.function.0);
+        let active = function_scope(active, targets, fp, newly);
+        let mut function = closure.function.0.lock();
+        let function = &mut *function;
+        if let Some(lines) = &newly.lines {
+            lines.protos.borrow_mut().insert(fp, function.bytecode_proto_id);
+        }
+        deinline_block(
+            &mut function.body.0,
+            targets,
+            decl_map,
+            &active,
+            &[],
+            &Enclosing::function(&function.parameters),
+            Some(fp),
+            true,
+            true,
+            false,
+            newly,
+        );
+    }
+}
+
+/// The targets in scope in the body of function `fp`, nested where `active`
+/// are, with its own orphans, which stand for its code in place of their
+/// twins around it (`onShop`'s literal, and the chunk's made by its copies
+/// inlined there). An orphan around it stays: Luau may have inlined a
+/// local function's every call in functions nested in its own.
+fn function_scope<'a>(active: &'a [usize], targets: &[Target], fp: FnPtr, newly: &Progress) -> std::borrow::Cow<'a, [usize]> {
+    let Some(own) = newly.orphan_scopes.get(&Some(fp)) else { return std::borrow::Cow::Borrowed(active) };
+    let twin = |index: usize| newly.orphan_twins.get(&targets[index].f_local);
+    let shadowed = |index: usize| twin(index).is_some_and(|class| own.iter().any(|&mine| twin(mine) == Some(class)));
+    std::borrow::Cow::Owned(active.iter().copied().filter(|&index| !shadowed(index)).chain(own.iter().copied()).collect())
+}
+
+/// A declaration of one local that runs no code and reads nothing: `local
+/// y = <literal>` (or `nil`, or none), or a table of such values (`local
+/// list = { {1, 2}, {60} }`). Evaluated earlier, it gives the same. (An
+/// empty table, the most common declaration, is left out: no copy was seen
+/// to hold one, and each would cost a retry.)
+fn inert_declaration(statement: &Statement) -> bool {
+    fn inert(value: &RValue) -> bool {
+        match value {
+            RValue::Literal(_) => true,
+            RValue::Table(table) => table.0.iter().all(|(key, item)| key.as_ref().is_none_or(|key| matches!(key, RValue::Literal(_))) && inert(item)),
+            _ => false,
+        }
+    }
+    matches!(statement, Statement::Assign(declaration)
+        if declaration.prefix
+            && !declaration.parallel
+            && matches!(declaration.left.as_slice(), [LValue::Local(_)])
+            && match declaration.right.as_slice() {
+                [] => true,
+                [RValue::Table(table)] => !table.0.is_empty() && inert(&declaration.right[0]),
+                [value] => inert(value),
+                _ => false,
+            })
+}
+
+/// Whether an `if` of `pattern` (at any depth) tests parameter `param` with
+/// a condition that unifies with `guard`, the parameter standing for a
+/// local of the site: the argument the guard tests.
+fn tests_like(t: &Target, pattern: &[Statement], guard: &RValue, param: &RcLocal) -> bool {
+    pattern.iter().any(|statement| {
+        let tests = |condition: &RValue| {
+            let mut b = Bindings::default();
+            unify_rvalue(&t.ctx(), condition, guard, &mut b).is_ok() && matches!(b.params.get(param), Some(RValue::Local(_)))
+        };
+        matches!(statement, Statement::If(branch) if tests(&branch.condition))
+            || nested_blocks(statement).iter().any(|block| tests_like(t, &block.lock().0, guard, param))
+    })
+}
+
+/// An [`inert_declaration`] right after `stmts[i]`, or one further: one a
+/// copy starting at `i` may hold although it is the caller's.
+fn interleaved_declaration(stmts: &[Statement], i: usize) -> Option<usize> {
+    stmts.get(i)?;
+    (i + 1..=(i + 2).min(stmts.len().saturating_sub(2))).find(|&at| inert_declaration(&stmts[at]))
+}
+
+/// The most statements past a copy a literal result of it may be declared
+/// ([`distant_literal_results`]).
+const LITERAL_RESULT_DISTANCE: usize = 16;
+
+/// For each target in `ordered` whose pattern ends declaring a returned
+/// local with a literal, where its copy starting at `i` would end without
+/// that declaration: the index right after the copy and a later `local y
+/// = <that literal>` no statement between reads.
+fn distant_literal_results(stmts: &[Statement], i: usize, ordered: &[usize], targets: &[Target]) -> Vec<(usize, usize)> {
+    let mut found: Vec<(usize, usize)> = Vec::new();
+    for &index in ordered {
+        let t = &targets[index];
+        let Some(Statement::Assign(last)) = t.pat.last() else { continue };
+        let ([LValue::Local(result)], [RValue::Literal(literal)]) = (last.left.as_slice(), last.right.as_slice()) else { continue };
+        if !last.prefix || !t.returns.contains(result) {
+            continue;
+        }
+        // Right after the copy's statements before that declaration.
+        let mut end = i;
+        let mut left = t.pat.len() - 1;
+        while left > 0 && end < stmts.len() {
+            if !is_match_trivia(&stmts[end]) {
+                left -= 1;
+            }
+            end += 1;
+        }
+        if left > 0 || end >= stmts.len() {
+            continue;
+        }
+        let declares = |statement: &Statement| {
+            matches!(statement, Statement::Assign(declaration)
+                if declaration.prefix
+                    && !declaration.parallel
+                    && matches!(declaration.left.as_slice(), [LValue::Local(_)])
+                    && matches!(declaration.right.as_slice(), [RValue::Literal(value)] if value == literal))
+        };
+        if declares(&stmts[end]) {
+            continue;
+        }
+        let Some(at) = (end + 1..stmts.len().min(end + 1 + LITERAL_RESULT_DISTANCE)).find(|&at| declares(&stmts[at])) else { continue };
+        let Statement::Assign(declaration) = &stmts[at] else { unreachable!() };
+        let LValue::Local(local) = &declaration.left[0] else { unreachable!() };
+        if count_local_reads(&stmts[end..at], local) == 0 && !found.contains(&(end, at)) {
+            found.push((end, at));
+        }
+    }
+    found
+}
+
+/// The reads of `local` inside `value` below its root.
+fn arg_nested_reads(value: &RValue, local: &RcLocal) -> usize {
+    let mut count = 0;
+    value.visit_rvalues(&mut |child| {
+        count += usize::from(matches!(child, RValue::Local(read) if read == local)) + arg_nested_reads(child, local);
+        true
+    });
+    count
+}
+
+/// `local z = <value>` of one local.
+fn is_initialized_declaration(statement: &Statement) -> bool {
+    matches!(statement, Statement::Assign(declaration)
+        if declaration.prefix && !declaration.parallel && declaration.left.len() == 1 && declaration.right.len() == 1)
+}
+
+/// For an `if` with no `else` whose condition is `and`ed (`a and b and c`):
+/// each split into the first conditions and the `if` of the others with its
+/// block, the latter widest first (`(a, if b and c then S end)`, `(a and b,
+/// if c then S end)`).
+fn joined_guard_splits(statement: &Statement) -> Vec<(RValue, Statement)> {
+    fn conjuncts(condition: &RValue, out: &mut Vec<RValue>) {
+        match condition {
+            RValue::Binary(Binary { operation: BinaryOperation::And, left, right, .. }) => {
+                conjuncts(left, out);
+                conjuncts(right, out);
+            }
+            other => out.push(other.clone()),
+        }
+    }
+    let joined = |parts: &[RValue]| {
+        parts.iter().cloned().reduce(|left, right| Binary::new(left, right, BinaryOperation::And).into()).expect("a condition")
+    };
+    let Statement::If(node) = statement else { return Vec::new() };
+    if !matches!(node.condition, RValue::Binary(Binary { operation: BinaryOperation::And, .. })) || !node.else_block.lock().0.is_empty() {
+        return Vec::new();
+    }
+    let mut parts = Vec::new();
+    conjuncts(&node.condition, &mut parts);
+    let block = node.then_block.lock().0.clone();
+    // The others nested one per `if` too, as a helper's guards un-guard
+    // (`if p ~= nil then if not seen[p] then S end end`).
+    let nested = |parts: &[RValue]| {
+        parts.iter().rev().fold(block.clone(), |inner, part| vec![If::new(part.clone(), Block(inner), Block::default()).into()])
+    };
+    let mut splits = Vec::new();
+    for k in 1..parts.len() {
+        let outer = joined(&parts[..k]);
+        splits.push((outer.clone(), If::new(joined(&parts[k..]), Block(block.clone()), Block::default()).into()));
+        if parts.len() - k > 1 {
+            splits.push((outer, nested(&parts[k..]).remove(0)));
+        }
+    }
+    splits
 }
 
 /// Replace `if c then x = a else x = b end` with `x = <select_value(c, a, b)>`,
@@ -2808,6 +3562,9 @@ fn unify_block(
     b: &mut Bindings,
 ) -> Result<(), ()> {
     if pat.len() != cand.len() {
+        if unify_guarded_select(t, pat, cand, b).is_ok() {
+            return Ok(());
+        }
         // Leaf elision: a block ending `return x` against the same block
         // without it, where `x` is what the result local already holds on
         // this path ([`is_elided_leaf`]): the identity parameter pre-bound
@@ -2821,13 +3578,370 @@ fn unify_block(
                 }
                 Ok(())
             }
+            // `return result` where the copy keeps the helper's `result` in
+            // the result local itself (`local ok, result = invoke()`): no
+            // store on that path.
+            Some((last, rest)) if rest.len() == cand.len() && t.kind == TKind::Value && let Some(kept) = returned_local(last, b) => {
+                for (p, c) in rest.iter().zip(cand) {
+                    unify_stmt(t, p, c, b)?;
+                }
+                match &b.result {
+                    Some(result) if *result != kept => Err(()),
+                    Some(_) => Ok(()),
+                    None => {
+                        b.result = Some(kept);
+                        Ok(())
+                    }
+                }
+            }
+            // `local v = E; S; return v` where the copy computed `v` in the
+            // result itself (`r = E; S`): `S` neither reads nor writes `v`,
+            // so `E` is what the helper returns, stored where it is made.
+            Some((Statement::Return(ret), rest)) if rest.len() == cand.len() && t.kind == TKind::Value
+                && let Some((at, store)) = returned_declaration(ret, rest) =>
+            {
+                let mut trial = b.clone();
+                for (index, (p, c)) in rest.iter().zip(cand).enumerate() {
+                    unify_stmt(t, if index == at { &store } else { p }, c, &mut trial)?;
+                }
+                *b = trial;
+                Ok(())
+            }
+            // A value the copy computed into a temp its next statement reads
+            // once (`local t = data and data.alive; r = not t`), where the
+            // helper reads it in place.
+            _ if cand.len() > pat.len() && let Some(folded) = fold_site_temps(t, cand) && folded.len() == pat.len() => {
+                let folded = order_stores_like(pat, &folded, b).into_owned();
+                unify_statements(t, pat, &folded, b)
+            }
             _ => Err(()),
         };
     }
-    for (p, c) in pat.iter().zip(cand) {
+    let cand = order_stores_like(pat, cand, b);
+    unify_statements(t, pat, &cand, b)
+}
+
+/// The most locals a declaration bound as a set may have ([`unify_statements`]).
+const MAX_JOINT_DECLARATION: usize = 4;
+
+/// [`unify_block`]'s pairwise walk. A declaration of several locals
+/// without values binds them as a set, in the order the rest of the block
+/// unifies with: the copy's declarer orders them its own way (`local err,
+/// count` for a helper's `count, err`).
+fn unify_statements(t: &Target, pat: &[Statement], cand: &[Statement], b: &mut Bindings) -> Result<(), ()> {
+    for (index, (p, c)) in pat.iter().zip(cand).enumerate() {
+        if let (Some(pattern), Some(site)) = (bare_declaration(p), bare_declaration(c))
+            && pattern.len() > 1
+            && pattern.len() == site.len()
+            && pattern.len() <= MAX_JOINT_DECLARATION
+        {
+            let ctx = t.ctx();
+            let (pattern, site): (Vec<&RcLocal>, Vec<&RcLocal>) =
+                (pattern.iter().filter_map(LValue::as_local).collect(), site.iter().filter_map(LValue::as_local).collect());
+            for order in permutations(site.len()) {
+                let mut trial = b.clone();
+                if pattern.iter().zip(&order).all(|(local, &at)| unify_local(&ctx, local, site[at], &mut trial).is_ok()) {
+                    let rest = order_stores_like(&pat[index + 1..], &cand[index + 1..], &trial);
+                    if unify_statements(t, &pat[index + 1..], &rest, &mut trial).is_ok() {
+                        *b = trial;
+                        return Ok(());
+                    }
+                }
+            }
+            return Err(());
+        }
         unify_stmt(t, p, c, b)?;
     }
     Ok(())
+}
+
+/// Every order of `0..n`, the identity first.
+fn permutations(n: usize) -> Vec<Vec<usize>> {
+    if n == 0 {
+        return vec![Vec::new()];
+    }
+    let mut out = Vec::new();
+    for rest in permutations(n - 1) {
+        for at in (0..=rest.len()).rev() {
+            let mut order = rest.clone();
+            order.insert(at, n - 1);
+            out.push(order);
+        }
+    }
+    out
+}
+
+/// `cand` with each run of stores into locals put in the order the
+/// pattern's run stores into the locals bound to its own: the copy stores
+/// a helper's results in its own order (`return nil, nil`), which nothing
+/// tells apart where every value is a literal or a local no store of the
+/// run writes.
+fn order_stores_like<'a>(pat: &[Statement], cand: &'a [Statement], b: &Bindings) -> std::borrow::Cow<'a, [Statement]> {
+    fn store(statement: &Statement) -> Option<(&RcLocal, &RValue)> {
+        match statement {
+            Statement::Assign(store) if !store.prefix && !store.parallel && !store.compound => match (store.left.as_slice(), store.right.as_slice()) {
+                ([LValue::Local(local)], [value]) => Some((local, value)),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let mut out: Option<Vec<Statement>> = None;
+    let mut start = 0;
+    while start < pat.len().min(cand.len()) {
+        let mut end = start;
+        while end < pat.len().min(cand.len()) && store(&pat[end]).is_some() && store(&cand[end]).is_some() {
+            end += 1;
+        }
+        if end - start >= 2 {
+            let targets: Vec<&RcLocal> = cand[start..end].iter().filter_map(|statement| store(statement).map(|(local, _)| local)).collect();
+            let independent = cand[start..end].iter().all(|statement| {
+                let (_, value) = store(statement).unwrap();
+                match value {
+                    RValue::Literal(_) => true,
+                    RValue::Local(read) => !targets.contains(&read),
+                    _ => false,
+                }
+            });
+            let order: Option<Vec<usize>> = pat[start..end]
+                .iter()
+                .map(|statement| {
+                    let (local, _) = store(statement).unwrap();
+                    let bound = b.locals.get(local)?;
+                    targets.iter().position(|target| *target == bound)
+                })
+                .collect();
+            if independent
+                && let Some(order) = order
+                && order.iter().collect::<FxHashSet<_>>().len() == order.len()
+                && order.iter().enumerate().any(|(at, &from)| at != from)
+            {
+                let reordered = out.get_or_insert_with(|| cand.to_vec());
+                for (at, &from) in order.iter().enumerate() {
+                    reordered[start + at] = cand[start + from].clone();
+                }
+            }
+        }
+        start = end + 1;
+    }
+    match out {
+        Some(reordered) => std::borrow::Cow::Owned(reordered),
+        None => std::borrow::Cow::Borrowed(cand),
+    }
+}
+
+/// `cand` with each `local t = v` the next statement reads once, and
+/// nothing after, put in place of that read where it may be evaluated
+/// there (`can_sink`); `None` where there is none. `v` is one value (no
+/// call or `...` a store could spread).
+fn fold_site_temps(t: &Target, cand: &[Statement]) -> Option<Vec<Statement>> {
+    fn replace_read(value: &mut RValue, local: &RcLocal, with: &RValue) -> bool {
+        if matches!(value, RValue::Local(read) if read == local) {
+            *value = with.clone();
+            return true;
+        }
+        if matches!(value, RValue::Closure(_)) {
+            return false;
+        }
+        let mut done = false;
+        value.visit_rvalues_mut(&mut |child| {
+            done = replace_read(child, local, with);
+            !done
+        });
+        done
+    }
+    let mut out = cand.to_vec();
+    let mut folded = false;
+    let mut k = 0;
+    while k + 1 < out.len() {
+        let temp = match &out[k] {
+            Statement::Assign(declaration)
+                if declaration.prefix
+                    && !declaration.parallel
+                    && let ([LValue::Local(local)], [value]) = (declaration.left.as_slice(), declaration.right.as_slice())
+                    && !matches!(value, RValue::Call(_) | RValue::MethodCall(_) | RValue::VarArg(_) | RValue::Closure(_)) =>
+            {
+                Some((local.clone(), value.clone()))
+            }
+            _ => None,
+        };
+        if let Some((local, value)) = temp
+            && matches!(out[k + 1], Statement::Assign(_) | Statement::Call(_) | Statement::MethodCall(_) | Statement::Return(_))
+            && count_local_reads(&out[k + 1..], &local) == 1
+            && crate::evaluation_order::can_sink(&out[k + 1], &local, &value, &|read| !t.captures.uncaptured(read))
+        {
+            let mut done = false;
+            out[k + 1].visit_rvalues_mut(&mut |child| {
+                done = replace_read(child, &local, &value);
+                !done
+            });
+            if done {
+                out.remove(k);
+                folded = true;
+                continue;
+            }
+        }
+        k += 1;
+    }
+    folded.then_some(out)
+}
+
+/// `stmts` with each `return x` a store of `x` into `result`; `None` where a
+/// `return` gives another number of values or is inside a loop.
+fn returns_as_stores(stmts: &[Statement], result: &RcLocal) -> Option<Vec<Statement>> {
+    stmts
+        .iter()
+        .map(|statement| match statement {
+            Statement::Return(ret) => match ret.values.as_slice() {
+                [value] => Some(Assign::new(vec![LValue::Local(result.clone())], vec![value.clone()]).into()),
+                _ => None,
+            },
+            Statement::If(branch) => Some(
+                If::new(
+                    branch.condition.clone(),
+                    Block(returns_as_stores(&branch.then_block.lock().0, result)?),
+                    Block(returns_as_stores(&branch.else_block.lock().0, result)?),
+                )
+                .into(),
+            ),
+            other if statement_has_return(other) => None,
+            other => Some(other.clone()),
+        })
+        .collect()
+}
+
+/// The most statements before the guard a copy holding it may start with
+/// ([`guarded_tail`]).
+const GUARDED_TAIL_LEAD: usize = 4;
+
+/// For `stmts[i..]` = `P; if c then A; return x end; B; return x` (`P` a
+/// few statements without an `if`, the same `x` last in the block, reading
+/// nothing declared before it from `P` on): `P; if c then A else B end`,
+/// the same control before that `return x`, and the return.
+fn guarded_tail(stmts: &[Statement], i: usize) -> Option<(Vec<Statement>, Return)> {
+    let at = (i..stmts.len().min(i + 1 + GUARDED_TAIL_LEAD)).find(|&at| matches!(stmts[at], Statement::If(_)))?;
+    let Statement::If(branch) = &stmts[at] else { return None };
+    let Some(Statement::Return(last)) = stmts.last() else { return None };
+    if stmts.len() < at + 3 || !branch.else_block.lock().0.is_empty() {
+        return None;
+    }
+    let then_block = branch.then_block.lock().0.clone();
+    let Some((Statement::Return(guard), arm)) = then_block.split_last() else { return None };
+    if guard.values.len() != last.values.len() || !guard.values.iter().zip(&last.values).all(|(a, b)| rvalue_exact_eq(a, b)) {
+        return None;
+    }
+    let rest = stmts[at + 1..stmts.len() - 1].to_vec();
+    let mut window = stmts[i..at].to_vec();
+    window.push(If::new(branch.condition.clone(), Block(arm.to_vec()), Block(rest)).into());
+    let mut declared = FxHashSet::default();
+    collect_declared_locals(&window, &mut declared);
+    if last.values.iter().any(|value| value.values_read().iter().any(|read| declared.contains(*read))) {
+        return None;
+    }
+    Some((window, last.clone()))
+}
+
+/// A constructor of literal keys and `stable` values (`{}`, `{ minutes =
+/// minutes }`): made anywhere, it reads what is the same there and runs
+/// nothing, a fresh table no code holds yet. No list part: its items are
+/// stored by a `SETLIST` of their own.
+fn stable_table(value: &RValue, stable: &dyn Fn(&RValue) -> bool) -> bool {
+    match value {
+        RValue::Table(table) => table.0.iter().all(|(key, value)| {
+            matches!(key, Some(RValue::Literal(_))) && (stable(value) || stable_table(value, stable))
+        }),
+        _ => false,
+    }
+}
+
+/// The locals `local a, b` declares without values.
+fn bare_declaration(statement: &Statement) -> Option<&[LValue]> {
+    match statement {
+        Statement::Assign(declaration)
+            if declaration.prefix && declaration.right.is_empty() && declaration.left.iter().all(|left| matches!(left, LValue::Local(_))) =>
+        {
+            Some(&declaration.left)
+        }
+        _ => None,
+    }
+}
+
+/// Match a private `local m = P and E; if m then T else return K end`
+/// against its explicit P guard; all paths return, so m has no live-out scope.
+fn unify_guarded_select(t: &Target, pat: &[Statement], cand: &[Statement], b: &mut Bindings) -> Result<(), ()> {
+    let ([Statement::Assign(declaration), guard @ Statement::If(branch)], [Statement::If(site)]) = (pat, cand) else {
+        return Err(());
+    };
+    let ([LValue::Local(local)], [RValue::Binary(select)]) = (declaration.left.as_slice(), declaration.right.as_slice()) else {
+        return Err(());
+    };
+    if t.kind != TKind::Value || !t.single_valued || t.orphan.is_some()
+        || !declaration.prefix || declaration.parallel || declaration.compound
+        || select.operation != BinaryOperation::And || !t.locals.contains(local)
+        || !matches!(&branch.condition, RValue::Local(read) if read == local)
+        || !t.captures.unique_function_bodies() || !t.captures.uncaptured(local)
+        || !t.captures.never_reassigned(local)
+    { return Err(()); }
+    if !charge_window(t, cand) || !t.search.spend(t.pat_nodes)
+        || !value_leaf_shape(pat)
+        || reads_local(&select.left, local) || reads_local(&select.right, local)
+    { return Err(()); }
+    let then = site.then_block.lock();
+    let [Statement::Assign(site_declaration), site_guard @ Statement::If(site_branch)] = then.0.as_slice() else {
+        return Err(());
+    };
+    let ([LValue::Local(site_local)], [site_value]) = (site_declaration.left.as_slice(), site_declaration.right.as_slice()) else {
+        return Err(());
+    };
+    if !site_declaration.prefix || site_declaration.parallel || site_declaration.compound
+        || !matches!(&site_branch.condition, RValue::Local(read) if read == site_local)
+        || !t.captures.uncaptured(site_local) || !t.captures.never_reassigned(site_local)
+        || reads_local(&site.condition, site_local) || reads_local(site_value, site_local)
+    { return Err(()); }
+    {
+        let otherwise = branch.else_block.lock();
+        if !matches!(otherwise.0.as_slice(), [Statement::Return(ret)] if matches!(ret.values.as_slice(), [RValue::Literal(_)])) {
+            return Err(());
+        }
+    }
+    let mut trial = b.clone();
+    let ctx = t.ctx();
+    unify_rvalue(&ctx, &select.left, &site.condition, &mut trial)?;
+    let declaration = Statement::Assign(Assign { right: vec![select.right.as_ref().clone()], ..declaration.clone() });
+    unify_assignment(t, &ctx, &declaration, site_declaration, true, &mut trial)?;
+    unify_stmt(t, guard, site_guard, &mut trial)?;
+    unify_block(t, &branch.else_block.lock().0, &site.else_block.lock().0, &mut trial)?;
+    *b = trial;
+    Ok(())
+}
+
+/// The site's local a `return l` of a pattern local already bound returns.
+fn returned_local(statement: &Statement, b: &Bindings) -> Option<RcLocal> {
+    match statement {
+        Statement::Return(ret) => match ret.values.as_slice() {
+            [RValue::Local(local)] => b.locals.get(local).cloned(),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// For `return v` ending a block of `rest` and that, the position of
+/// `local v = E` in `rest` and the `return E` it stands for where nothing
+/// after it reads or writes `v` or returns.
+fn returned_declaration(ret: &Return, rest: &[Statement]) -> Option<(usize, Statement)> {
+    let [RValue::Local(returned)] = ret.values.as_slice() else { return None };
+    let at = rest.iter().position(|statement| {
+        matches!(statement, Statement::Assign(declaration) if declaration.prefix && matches!(declaration.left.as_slice(), [LValue::Local(local)] if local == returned))
+    })?;
+    let Statement::Assign(declaration) = &rest[at] else { unreachable!() };
+    let after = &rest[at + 1..];
+    if declaration.parallel || declaration.compound || declaration.right.len() != 1
+        || local_queries::reads(after, returned) || local_queries::writes(after, returned) || block_has_return(after)
+    {
+        return None;
+    }
+    Some((at, Return::new(declaration.right.clone()).into()))
 }
 
 /// A pattern block that only returns the parameter `b` elides
@@ -2850,11 +3964,12 @@ fn unify_stmt(t: &Target, p: &Statement, c: &Statement, b: &mut Bindings) -> Res
         (Statement::Assign(_) | Statement::Return(_), Statement::Assign(ca)) => unify_assignment(t, &ctx, p, ca, ca.prefix, b),
         (Statement::Call(pc), Statement::Call(cc)) => unify_call(&ctx, pc, cc, b),
         (Statement::MethodCall(pm), Statement::MethodCall(cm)) => unify_method(&ctx, pm, cm, b),
-        // §8 guard-polarity flip (Value targets only). The call-site value
-        // lowering keeps a guard's if/else in POSITIVE polarity
-        // (`if C then RESULT=early else REST`), whereas `canon` un-guards the
-        // callee body into the NEGATED form (`if not C then REST else return
-        // early`). These are the exact Lua identity `if C then A else B ≡
+        // §8 guard-polarity flip. The call-site value lowering keeps a
+        // guard's if/else in POSITIVE polarity (`if C then RESULT=early else
+        // REST`), as a void copy keeps `if C then A elseif ...` where the
+        // helper returned early (`if C then A; return end`), whereas `canon`
+        // un-guards the callee body into the NEGATED form (`if not C then REST
+        // else return early`). These are the exact Lua identity `if C then A else B ≡
         // if not C then B else A`. Try a DIRECT unify first (on a clone, so a
         // partial failure does not pollute `b`); on failure, retry with the
         // condition negated and the then/else branches swapped. P9: this is now
@@ -2863,10 +3978,8 @@ fn unify_stmt(t: &Target, p: &Statement, c: &Statement, b: &mut Bindings) -> Res
         // and the pattern side is already wrapped the same way by `unguard`, so the
         // wrapped candidate condition unifies EXACTLY. Value-exact and NaN-safe for
         // all conditions; `cond_exact_invertible` (now always true) is kept as the
-        // documented gate point. Gated to Value targets so the void matches keep
-        // their original clone-free path.
-        // A discard target keeps its value helper's guards (`discard_body`).
-        (Statement::If(pf), Statement::If(cf)) if t.kind == TKind::Value || t.discarded => {
+        // documented gate point.
+        (Statement::If(pf), Statement::If(cf)) => {
             let mut bd = b.clone();
             let direct = unify_rvalue(&ctx, &pf.condition, &cf.condition, &mut bd)
                 .and_then(|_| {
@@ -2880,17 +3993,49 @@ fn unify_stmt(t: &Target, p: &Statement, c: &Statement, b: &mut Bindings) -> Res
                 return Ok(());
             }
             if cond_exact_invertible(&cf.condition) {
-                unify_rvalue(&ctx, &pf.condition, &negate_canon(cf.condition.clone()), b)?;
-                unify_block(t, &pf.then_block.lock().0, &cf.else_block.lock().0, b)?;
-                unify_block(t, &pf.else_block.lock().0, &cf.then_block.lock().0, b)
-            } else {
-                Err(())
+                let mut bf = b.clone();
+                let flipped = unify_rvalue(&ctx, &pf.condition, &negate_canon(cf.condition.clone()), &mut bf)
+                    .and_then(|_| unify_block(t, &pf.then_block.lock().0, &cf.else_block.lock().0, &mut bf))
+                    .and_then(|_| unify_block(t, &pf.else_block.lock().0, &cf.then_block.lock().0, &mut bf));
+                if flipped.is_ok() {
+                    *b = bf;
+                    return Ok(());
+                }
             }
-        }
-        (Statement::If(pf), Statement::If(cf)) => {
-            unify_rvalue(&ctx, &pf.condition, &cf.condition, b)?;
-            unify_block(t, &pf.then_block.lock().0, &cf.then_block.lock().0, b)?;
-            unify_block(t, &pf.else_block.lock().0, &cf.else_block.lock().0, b)
+            // The two conditions in one reduced form (`not (v and v.P == c)`
+            // as `not v or v.P ~= c`, as SSA leaves a copy's): truthiness is
+            // all a condition gives, and the reduction keeps it (NaN-safe).
+            let reduced = pf.condition.clone().reduce_condition();
+            let mut br = b.clone();
+            let direct = unify_rvalue(&ctx, &reduced, &cf.condition.clone().reduce_condition(), &mut br)
+                .and_then(|_| unify_block(t, &pf.then_block.lock().0, &cf.then_block.lock().0, &mut br))
+                .and_then(|_| unify_block(t, &pf.else_block.lock().0, &cf.else_block.lock().0, &mut br));
+            if direct.is_ok() {
+                *b = br;
+                return Ok(());
+            }
+            let negated = Unary::new(cf.condition.clone(), UnaryOperation::Not).reduce_condition();
+            // Guards nested with one other arm (`if a then if b then S else
+            // E end else E end`) the copy joined (`if not a or not b then E
+            // else S end`): `a and b` reads them in the same order, and each
+            // arm unifies with the site's one.
+            if let Some((joined, inner, others)) = guard_chain(pf) {
+                let joined = joined.reduce_condition();
+                let site_condition = cf.condition.clone().reduce_condition();
+                for (condition, then_block, else_block) in [(&site_condition, &cf.then_block, &cf.else_block), (&negated, &cf.else_block, &cf.then_block)] {
+                    let mut bg = b.clone();
+                    let joined_ok = unify_rvalue(&ctx, &joined, condition, &mut bg)
+                        .and_then(|_| unify_block(t, &inner, &then_block.lock().0, &mut bg))
+                        .and_then(|_| others.iter().try_for_each(|other| unify_block(t, other, &else_block.lock().0, &mut bg)));
+                    if joined_ok.is_ok() {
+                        *b = bg;
+                        return Ok(());
+                    }
+                }
+            }
+            unify_rvalue(&ctx, &reduced, &negated, b)?;
+            unify_block(t, &pf.then_block.lock().0, &cf.else_block.lock().0, b)?;
+            unify_block(t, &pf.else_block.lock().0, &cf.then_block.lock().0, b)
         }
         (Statement::While(pw), Statement::While(cw)) => {
             unify_rvalue(&ctx, &pw.condition, &cw.condition, b)?;
@@ -2924,7 +4069,7 @@ fn unify_stmt(t: &Target, p: &Statement, c: &Statement, b: &mut Bindings) -> Res
             // A value helper's `return x` from inside its loop, which
             // `unflag_value_loop` gives back from the site's `r = x; flag =
             // false; break` (a site window has no `return` of its own).
-            ([pattern], [site]) if t.loop_exit_at.is_some() => unify_returned_value(&ctx, pattern, site, b),
+            ([pattern], [site]) if t.loop_exit_at.is_some() || b.loop_exits => unify_returned_value(&ctx, pattern, site, b),
             // A copy returning the helper's value from the caller: the same
             // value, taken the same way.
             ([pattern], [site]) if b.returning => unify_rvalue(&ctx, pattern, site, b),
@@ -2982,8 +4127,16 @@ fn unify_assignment(t: &Target, ctx: &MatchCtx, p: &Statement, ca: &Assign, pref
             {
                 return unify_closure(ctx, pattern, site, true, b);
             }
-            for (pr, cr) in pa.right.iter().zip(&ca.right) {
-                unify_rvalue(ctx, pr, cr, b)?;
+            // A value the assignment takes one value of (every one but a last
+            // spreading over more targets) is a call kept to one result or
+            // not alike (`local ok = callback()` against `local ok = f()`).
+            let spread = pa.left.len() > pa.right.len();
+            for (index, (pr, cr)) in pa.right.iter().zip(&ca.right).enumerate() {
+                if spread && index + 1 == pa.right.len() {
+                    unify_rvalue(ctx, pr, cr, b)?;
+                } else {
+                    unify_returned_value(ctx, pr, cr, b)?;
+                }
             }
             Ok(())
         }
@@ -3062,6 +4215,37 @@ pub(crate) fn unify_lvalue(
     }
 }
 
+/// An `if` whose then arm is one `if`, and so on (two at least): their
+/// conditions joined by `and`, the innermost then arm, and every else arm.
+fn guard_chain(branch: &If) -> Option<(RValue, Vec<Statement>, Vec<Vec<Statement>>)> {
+    let mut conditions = vec![branch.condition.clone()];
+    let mut others = vec![branch.else_block.lock().0.clone()];
+    let mut inner = branch.then_block.lock().0.clone();
+    while let [Statement::If(nested)] = inner.as_slice() {
+        conditions.push(nested.condition.clone());
+        others.push(nested.else_block.lock().0.clone());
+        let next = nested.then_block.lock().0.clone();
+        inner = next;
+    }
+    if conditions.len() < 2 {
+        return None;
+    }
+    let last = conditions.pop().unwrap();
+    let joined = conditions.into_iter().rev().fold(last, |right, left| RValue::Binary(Binary::new(left, right, BinaryOperation::And)));
+    Some((joined, inner, others))
+}
+
+/// `x` of `x and true or false`, the truth of `x` as a boolean.
+fn truth_select(value: &RValue) -> Option<&RValue> {
+    let RValue::Binary(or) = value else { return None };
+    let RValue::Binary(and) = or.left.as_ref() else { return None };
+    (or.operation == BinaryOperation::Or
+        && and.operation == BinaryOperation::And
+        && matches!(and.right.as_ref(), RValue::Literal(Literal::Boolean(true)))
+        && matches!(or.right.as_ref(), RValue::Literal(Literal::Boolean(false))))
+    .then_some(and.left.as_ref())
+}
+
 /// Structural expression unifier. Treats `ctx.params` as bind-once holes
 /// (mapping each callee parameter to one caller argument expression) and
 /// `ctx.locals` as an injective callee-local renaming; everything else (globals,
@@ -3112,6 +4296,56 @@ pub(crate) fn unify_rvalue(
             _ => Err(()),
         };
     }
+    // A select on a bare parameter whose copy kept one arm: Luau folded it
+    // for a constant truth (`flag and A or B` as `B`; as `A or B` for a
+    // truthy one). The parameter takes that truth, the site's arm the
+    // pattern's.
+    if ctx.fold.is_some()
+        && let Some((param, positive, then_arm, else_arm)) = parameter_select(p, ctx.params)
+        && !matches!(c, RValue::Binary(or) if or.operation == BinaryOperation::Or
+            && matches!(or.left.as_ref(), RValue::Binary(and) if and.operation == BinaryOperation::And))
+    {
+        let mut trial = b.clone();
+        // An arm takes one value: a call there is the site's one-value call.
+        let taken = if unify_returned_value(ctx, else_arm, c, &mut trial).is_ok() {
+            false
+        } else if let RValue::Binary(or) = c
+            && or.operation == BinaryOperation::Or
+            && {
+                trial = b.clone();
+                unify_returned_value(ctx, then_arm, &or.left, &mut trial).is_ok()
+                    && unify_returned_value(ctx, else_arm, &or.right, &mut trial).is_ok()
+            }
+        {
+            true
+        } else {
+            return Err(());
+        };
+        let truth = taken == positive;
+        match trial.params.get(param) {
+            Some(RValue::Literal(literal)) if crate::select_value::known_truthy(&RValue::Literal(literal.clone())) == truth => {}
+            Some(_) => return Err(()),
+            None => {
+                trial.params.insert(param.clone(), RValue::Literal(if truth { Literal::Boolean(true) } else { Literal::Nil }));
+                trial.truths.push(param.clone());
+            }
+        }
+        trial.truth_folded = true;
+        *b = trial;
+        return Ok(());
+    }
+    // A negation the copy gives as its truth (`not (a and b and not c)`
+    // as `(not a or not b or c) and true or false`): both in one reduced
+    // form, which keeps the truth and the order operands are read in.
+    match (p, c) {
+        (RValue::Unary(not), site) if not.operation == UnaryOperation::Not && let Some(truth) = truth_select(site) => {
+            return unify_rvalue(ctx, &p.clone().reduce_condition(), &truth.clone().reduce_condition(), b);
+        }
+        (pattern, RValue::Unary(not)) if not.operation == UnaryOperation::Not && let Some(truth) = truth_select(pattern) => {
+            return unify_rvalue(ctx, &truth.clone().reduce_condition(), &c.clone().reduce_condition(), b);
+        }
+        _ => {}
+    }
     // A value computed from parameters only, where the site has a number:
     // Luau folded it for constant arguments (`1 - k` as 0.5). The site's
     // number may be a call of a pure helper on constants a rebuild put
@@ -3124,6 +4358,17 @@ pub(crate) fn unify_rvalue(
         && ctx.params.iter().any(|param| fold::reads(p, param) > 0)
     {
         b.equations.push((p.clone(), Literal::Number(value)));
+        return Ok(());
+    }
+    // The same of a text the copy holds where the helper concatenates a
+    // parameter with text of its own (`"Gold is not a number"`).
+    if ctx.fold.is_some()
+        && text_concat(p)
+        && let RValue::Literal(text @ Literal::String(_)) = c
+        && fold::foldable(p, &|local| ctx.params.contains(local), ctx.fold.unwrap())
+        && ctx.params.iter().any(|param| fold::reads(p, param) > 0)
+    {
+        b.equations.push((p.clone(), text.clone()));
         return Ok(());
     }
     match (p, c) {
@@ -3153,9 +4398,19 @@ pub(crate) fn unify_rvalue(
             }
         }
         (RValue::Binary(a), RValue::Binary(d)) => {
+            use BinaryOperation::*;
+            let simple = |value: &RValue| matches!(value, RValue::Local(_) | RValue::Literal(_));
             if a.operation == d.operation {
                 unify_rvalue(ctx, &a.left, &d.left, b)?;
                 unify_rvalue(ctx, &a.right, &d.right, b)
+            } else if matches!((a.operation, d.operation), (LessThan, GreaterThan) | (GreaterThan, LessThan)
+                | (LessThanOrEqual, GreaterThanOrEqual) | (GreaterThanOrEqual, LessThanOrEqual))
+                && [&a.left, &a.right, &d.left, &d.right].into_iter().all(|operand| simple(operand))
+            {
+                // `a < b` is `b > a`: Luau compares the same operands, and
+                // reading locals and constants has no order.
+                unify_rvalue(ctx, &a.left, &d.right, b)?;
+                unify_rvalue(ctx, &a.right, &d.left, b)
             } else {
                 Err(())
             }
@@ -3186,7 +4441,9 @@ pub(crate) fn unify_rvalue(
 fn site_number(value: &RValue, helpers: &fold::PureHelpers) -> Option<f64> {
     match value {
         RValue::Literal(Literal::Number(number)) => Some(*number),
-        RValue::Call(_) | RValue::Select(Select::Call(_)) if fold::foldable(value, &|_| false, helpers) => {
+        RValue::Call(call) | RValue::Select(Select::Call(call))
+            if matches!(call.value.as_ref(), RValue::Local(_)) && fold::foldable(value, &|_| false, helpers) =>
+        {
             match fold::evaluate(value, &|_| None, helpers)? {
                 fold::Value::Number(number) => Some(number),
                 _ => None,
@@ -3279,8 +4536,16 @@ fn spreads_into_parameter(ctx: &MatchCtx, pattern: Option<&RValue>, candidate: O
         && matches!(candidate, Some(RValue::Call(_) | RValue::MethodCall(_) | RValue::VarArg(_)))
 }
 
-fn unify_call(ctx: &MatchCtx, a: &Call, d: &Call, b: &mut Bindings) -> Result<(), ()> {
-    if a.arguments.len() != d.arguments.len() || spreads_into_parameter(ctx, a.arguments.last(), d.arguments.last()) {
+pub(crate) fn unify_call(ctx: &MatchCtx, a: &Call, d: &Call, b: &mut Bindings) -> Result<(), ()> {
+    if !a.same_execution(d) || a.arguments.len() != d.arguments.len()
+        || spreads_into_parameter(ctx, a.arguments.last(), d.arguments.last()) {
+        return Err(());
+    }
+    // A copy calling a builtin specialization folds, with constants where
+    // the helper reads more: Luau saw no constants there (`math.pow(10,
+    // id(2))`), and a rebuilt call passing them would fold the call away.
+    let literal = |value: &RValue| matches!(value, RValue::Literal(_));
+    if fold::specialization_folds(d) && d.arguments.iter().all(literal) && !a.arguments.iter().all(literal) {
         return Err(());
     }
     unify_rvalue(ctx, &a.value, &d.value, b)?;
@@ -3327,7 +4592,7 @@ fn unify_table(ctx: &MatchCtx, a: &Table, d: &Table, b: &mut Bindings) -> Result
         }
         unify_rvalue(ctx, av, dv, b)?;
     }
-    Ok(())
+    crate::compatible_table_layouts(a, d).then_some(()).ok_or(())
 }
 
 fn unify_select(ctx: &MatchCtx, a: &Select, d: &Select, b: &mut Bindings) -> Result<(), ()> {
@@ -3390,13 +4655,13 @@ pub(crate) fn rvalue_exact_eq(a: &RValue, b: &RValue) -> bool {
                 && rvalue_exact_eq(&x.else_value, &y.else_value)
         }
         (RValue::Call(x), RValue::Call(y)) => {
-            call_exact_eq(&x.value, &x.arguments, &y.value, &y.arguments)
+            x.same_execution(y) && call_exact_eq(&x.value, &x.arguments, &y.value, &y.arguments)
         }
         (RValue::MethodCall(x), RValue::MethodCall(y)) => {
             x.method == y.method && call_exact_eq(&x.value, &x.arguments, &y.value, &y.arguments)
         }
         (RValue::Table(x), RValue::Table(y)) => {
-            x.0.len() == y.0.len()
+            crate::compatible_table_layouts(x, y) && x.0.len() == y.0.len()
                 && x.0.iter().zip(&y.0).all(|((kx, vx), (ky, vy))| {
                     (match (kx, ky) {
                         (Some(kx), Some(ky)) => rvalue_exact_eq(kx, ky),
@@ -3413,7 +4678,7 @@ pub(crate) fn rvalue_exact_eq(a: &RValue, b: &RValue) -> bool {
         // still compares by identity.
         (RValue::Select(x), RValue::Select(y)) => match (x, y) {
             (Select::Call(x), Select::Call(y)) => {
-                call_exact_eq(&x.value, &x.arguments, &y.value, &y.arguments)
+                x.same_execution(y) && call_exact_eq(&x.value, &x.arguments, &y.value, &y.arguments)
             }
             (Select::MethodCall(x), Select::MethodCall(y)) => {
                 x.method == y.method
@@ -3532,14 +4797,14 @@ fn deinline_block(
             let arm_loop_tail = loop_tail && Some(j) == last_statement;
             match s {
                 Statement::If(f) => {
-                    for arm in [&f.then_block, &f.else_block] {
+                    for (arm, guard) in [(&f.then_block, Some(&f.condition)), (&f.else_block, None)] {
                         deinline_block(
                             &mut arm.lock().0,
                             targets,
                             decl_map,
                             &active,
                             &continuation,
-                            &nested,
+                            &Enclosing { guard, ..nested },
                             current_func,
                             child_tail,
                             false,
@@ -3640,13 +4905,26 @@ fn deinline_block(
     // agreed, the other ones still rivals as in the probe.
     let round = newly.evidence.clone();
     let lines = newly.lines.clone();
+    let nested = newly.evidence_nested.clone();
     // A fold variant only where its helper's copies here refer to number
-    // constants, which its equations need.
+    // constants, which its equations need, or where a constant truth may
+    // decide a select of its pattern.
     let copies_here = |i: usize| match &lines {
         Some(lines) if targets[i].fold.is_none()
+            || targets[i].folds_truth
             || targets[i].proto.zip(lines.caller(current_func)).is_some_and(|(proto, caller)| lines.copies.constants_in_copies(Some(caller), proto)) =>
         {
-            lines.copies(current_func, targets[i].proto)
+            // A nested round tries a helper only where copies of it sit in
+            // others' copies: elsewhere the tree is as the last probe saw it.
+            match &nested {
+                None => lines.copies(current_func, targets[i].proto),
+                Some(pending) if lines.caller(current_func).zip(targets[i].proto)
+                    .is_some_and(|(caller, helper)| pending.contains(&(caller as u32, helper as u32))) =>
+                {
+                    lines.copies_at_any_depth(current_func, targets[i].proto)
+                }
+                Some(_) => 0,
+            }
         }
         _ => 0,
     };
@@ -3654,6 +4932,16 @@ fn deinline_block(
         EvidenceRound::Admit(admitted) => admitted.contains(&(current_func, targets[i].f_local.clone())),
         _ => false,
     };
+    // An evidence round tries nothing in a function where no evidence
+    // target may be tried, whichever targets are active.
+    let tried_here = |i: usize| targets[i].evidence && match &round {
+        EvidenceRound::Off => false,
+        EvidenceRound::Probe => copies_here(i) > 0,
+        EvidenceRound::Admit(_) => admitted_here(i),
+    };
+    if !matches!(round, EvidenceRound::Off) && !(0..targets.len()).any(tried_here) {
+        return;
+    }
     // `reconstruction_search::prioritize` of the focused targets: a stable
     // partition by the body's keys.
     let prioritize = |active: &[usize]| {
@@ -3702,6 +4990,11 @@ fn deinline_block(
             count_rebuilt_calls(stmts, &binders, current_func, &mut newly.rebuilt);
         }
     }
+    // Whether line info shows copies in this function: only there may a
+    // caller's declaration stand inside one.
+    let holds_copies = lines.as_ref().is_some_and(|lines| {
+        lines.caller(current_func).is_some_and(|caller| lines.copies.present.iter().any(|&(at, _)| at as usize == caller))
+    });
     let mut i = 0;
     let mut anchor = 0;
     // Tail-liveness index, replacing the per-window O(N) `any_local_live` rescan
@@ -3724,7 +5017,7 @@ fn deinline_block(
         while anchor < stmts.len() && matches!(stmts[anchor], Statement::Empty(_)) {
             anchor += 1;
         }
-        if let Some(hit) = try_match_at(
+        let mut found = try_match_at(
             stmts,
             i,
             anchor,
@@ -3740,11 +5033,291 @@ fn deinline_block(
             loop_tail,
             &mut last_occ,
             &mut canon_cache,
-        ) {
+        )
+        .map(|hit| (hit, None));
+        // A constant inferred from a branch's truth (`value` nil, as
+        // `typeof(value) ~= "table"` holds) for a copy that is a whole `then`
+        // arm of an `if` testing what an `if` of the helper tests: that `if`
+        // is the helper's, run on the actual argument, and the copy is the
+        // whole `if` (`assertSignalLike(value)`), not its arm with a guessed
+        // argument (`if ... then assertSignalLike() end`).
+        if let Some((hit, _)) = &found
+            && let Some(inferred) = &hit.inferred
+            && let Some(guard) = around.guard
+            && stmts[..i].iter().all(is_match_trivia)
+            && stmts[i + hit.consume..].iter().all(is_match_trivia)
+            && targets.iter().filter(|t| t.f_local == hit.f_local).any(|t| tests_like(t, &t.pat, guard, inferred))
+        {
+            found = None;
+        }
+        // A caller's `local y = <literal>` (or `nil`) Luau set inside a copy,
+        // where its register is written (`local h = 2166136302; local color
+        // = nil; for ...` of `hashInt`, or the `0` loaded for `Vector3.new(x,
+        // 0, hashInt(id, 7) % 1)` before the copy runs): the copy is tried
+        // with the declaration before it, which moves there only with the
+        // call. `y` is in scope from its declaration only, so nothing before
+        // reads it. At a function body's top, a call that would be the rest of
+        // the body passes the whole-body gate ([`match_void`]) only where line
+        // info shows a copy of its helper there.
+        if found.is_none()
+            && holds_copies
+            && let Some(at) = interleaved_declaration(stmts, i)
+        {
+            // Above the temps of the arguments the copy takes in too (`local
+            // id = record.Id`): declarations right before it.
+            let mut to = i;
+            while to > 0 && i - to < 3 && is_initialized_declaration(&stmts[to - 1]) {
+                to -= 1;
+            }
+            let declaration = stmts.remove(at);
+            stmts.insert(to, declaration);
+            last_occ.index = None;
+            canon_cache.spliced(stmts, to, at + 1 - to, at + 1 - to);
+            let next = (i + 1..stmts.len()).find(|&k| !matches!(stmts[k], Statement::Empty(_))).unwrap_or(stmts.len());
+            let retried = try_match_at(
+                stmts,
+                i + 1,
+                next,
+                targets,
+                &ordered,
+                &rivals,
+                newly,
+                splices_before,
+                current_func,
+                is_func_tail,
+                false,
+                outer_continuation,
+                loop_tail,
+                &mut last_occ,
+                &mut canon_cache,
+            );
+            let whole_body = |hit: &Hit| is_func_body_top && i == 0 && i + 1 + hit.consume >= stmts.len()
+                && !lines.as_ref().is_some_and(|lines| lines.copies(current_func, hit.proto) > 0);
+            match retried.filter(|hit| !whole_body(hit)) {
+                Some(hit) if !(hit.evidence && matches!(round, EvidenceRound::Probe)) => {
+                    // Right before the temps the call takes in, no higher.
+                    let below = i - hit.absorbed.min(i - to);
+                    if below > to {
+                        let declaration = stmts.remove(to);
+                        stmts.insert(below, declaration);
+                        canon_cache.spliced(stmts, to, below + 1 - to, below + 1 - to);
+                    }
+                    i += 1;
+                    anchor = next;
+                    found = Some((hit, None));
+                }
+                other => {
+                    let declaration = stmts.remove(to);
+                    stmts.insert(at, declaration);
+                    last_occ.index = None;
+                    canon_cache.spliced(stmts, to, at + 1 - to, at + 1 - to);
+                    if let Some(hit) = other {
+                        newly.probed.entry((current_func, hit.f_local.clone())).or_insert((0, hit.proto)).0 += hit.shaped;
+                        i += hit.consume + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Such declarations right before a copy whose argument temps are
+        // above them (`local p = root; local list = { {1, 2} }; for _, key
+        // in keys do p = p[key] ...`: an inlined caller evaluated its next
+        // argument between them): the copy is tried with the declarations
+        // above the temps, where they stay only with the call, right before
+        // the temps the call takes in.
+        // The last `inert` of them, fewest first: the temps may be such
+        // declarations too (`report({ {1} }, { {2} })`). Only tables: an
+        // inlined caller's literal argument takes no register.
+        let table = |statement: &Statement| inert_declaration(statement)
+            && matches!(statement, Statement::Assign(declaration) if matches!(declaration.right.as_slice(), [RValue::Table(_)]));
+        let most = (1..=3usize.min(i.saturating_sub(1))).take_while(|&k| table(&stmts[i - k])).last().unwrap_or(0);
+        let mut probed_past = None;
+        for inert in 1..=most {
+            // The temp right above them is an argument the copy reads.
+            let read_temp = match &stmts[i - inert - 1] {
+                Statement::Assign(temp) if is_initialized_declaration(&stmts[i - inert - 1]) => {
+                    temp.left[0].as_local().is_some_and(|temp| block_reads_local(std::slice::from_ref(&stmts[i]), temp))
+                }
+                _ => false,
+            };
+            if found.is_some() || !holds_copies || !read_temp {
+                continue;
+            }
+            let at = i - inert;
+            let mut to = at;
+            while to > 0 && at - to < 3 && is_initialized_declaration(&stmts[to - 1]) {
+                to -= 1;
+            }
+            let moved: Vec<Statement> = stmts.drain(at..i).collect();
+            stmts.splice(to..to, moved);
+            last_occ.index = None;
+            canon_cache.spliced(stmts, to, i - to, i - to);
+            let retried = try_match_at(
+                stmts,
+                i,
+                anchor,
+                targets,
+                &ordered,
+                &rivals,
+                newly,
+                splices_before,
+                current_func,
+                is_func_tail,
+                is_func_body_top,
+                outer_continuation,
+                loop_tail,
+                &mut last_occ,
+                &mut canon_cache,
+            );
+            // The temps end right before `i`; the declarations sit at `to`.
+            let temps = at - to;
+            match retried {
+                Some(hit) if hit.absorbed > 0 && !(hit.evidence && matches!(round, EvidenceRound::Probe)) => {
+                    let below = to + temps - hit.absorbed.min(temps);
+                    if below > to {
+                        let moved: Vec<Statement> = stmts.drain(to..to + inert).collect();
+                        stmts.splice(below..below, moved);
+                        canon_cache.spliced(stmts, to, i - to, i - to);
+                    }
+                    found = Some((hit, None));
+                }
+                other => {
+                    let moved: Vec<Statement> = stmts.drain(to..to + inert).collect();
+                    stmts.splice(at..at, moved);
+                    last_occ.index = None;
+                    canon_cache.spliced(stmts, to, i - to, i - to);
+                    if let Some(hit) = other.filter(|hit| hit.absorbed > 0) {
+                        newly.probed.entry((current_func, hit.f_local.clone())).or_insert((0, hit.proto)).0 += hit.shaped;
+                        probed_past = Some(hit.consume);
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(consume) = probed_past {
+            i += consume;
+            continue;
+        }
+        // A helper's literal result the SSA declared further down (`local
+        // size, cframe, depth = setupFlag(flags1)` whose `0.745` is declared
+        // after the next copy): the declaration is tried right after the
+        // copy, where it stays only with the call. Nothing between reads it.
+        if found.is_none() && holds_copies {
+            for (end, at) in distant_literal_results(stmts, i, &ordered, targets) {
+                let declaration = stmts.remove(at);
+                stmts.insert(end, declaration);
+                last_occ.index = None;
+                canon_cache.spliced(stmts, end, at + 1 - end, at + 1 - end);
+                let retried = try_match_at(
+                    stmts,
+                    i,
+                    anchor,
+                    targets,
+                    &ordered,
+                    &rivals,
+                    newly,
+                    splices_before,
+                    current_func,
+                    is_func_tail,
+                    is_func_body_top,
+                    outer_continuation,
+                    loop_tail,
+                    &mut last_occ,
+                    &mut canon_cache,
+                );
+                if let Some(hit) = retried
+                    && !(hit.evidence && matches!(round, EvidenceRound::Probe))
+                {
+                    found = Some((hit, None));
+                    break;
+                }
+                let declaration = stmts.remove(end);
+                stmts.insert(at, declaration);
+                last_occ.index = None;
+                canon_cache.spliced(stmts, end, at + 1 - end, at + 1 - end);
+            }
+        }
+        // Guards SSA joined: a copy's own may be the last ones (`if c and c ~=
+        // nil and not p.seen[c]` of `addContentId` holding `addTarget`). The
+        // `if` of those, with the block, matched alone, is the call inside
+        // an `if` of the others: `if a and b then S end` is `if a then if b
+        // then S end end`.
+        if found.is_none() {
+            for (outer, inner) in joined_guard_splits(&stmts[i]) {
+                let window = [inner];
+                let (mut liveness, mut cache) = (Liveness::default(), CanonCache::default());
+                if let Some(hit) = try_match_at(
+                    &window,
+                    0,
+                    0,
+                    targets,
+                    &ordered,
+                    &rivals,
+                    newly,
+                    splices_before,
+                    current_func,
+                    false,
+                    false,
+                    &[],
+                    false,
+                    &mut liveness,
+                    &mut cache,
+                ) && hit.consume == 1
+                    && hit.absorbed == 0
+                    && hit.results.is_empty()
+                    && hit.host.is_none()
+                    && hit.tail_ret.is_none()
+                    && !hit.returns_value
+                {
+                    found = Some((hit, Some(outer)));
+                    break;
+                }
+            }
+        }
+        // A copy whose tail Luau's return duplicated into a guard (`if s then
+        // set(s) return r end; set(nil) return r`, a void helper's copy
+        // before the caller's `return r`): matched as `if s then set(s) else
+        // set(nil) end`, the same control, the call followed by the return.
+        let mut joined_tail: Option<Return> = None;
+        if found.is_none()
+            && holds_copies
+            && let Some((window, tail)) = guarded_tail(stmts, i)
+        {
+            let (mut liveness, mut cache) = (Liveness::default(), CanonCache::default());
+            if let Some(hit) = try_match_at(
+                &window,
+                0,
+                0,
+                targets,
+                &ordered,
+                &rivals,
+                newly,
+                splices_before,
+                current_func,
+                false,
+                false,
+                &[],
+                false,
+                &mut liveness,
+                &mut cache,
+            ) && hit.consume == window.len()
+                && hit.absorbed == 0
+                && hit.results.is_empty()
+                && hit.host.is_none()
+                && hit.tail_ret.is_none()
+                && !hit.returns_value
+            {
+                found = Some((hit, None));
+                joined_tail = Some(tail);
+            }
+        }
+        if let Some((hit, guard)) = found {
             if hit.evidence && matches!(round, EvidenceRound::Probe) {
                 // Counted, not rewritten: the oracle needs every count first.
                 newly.probed.entry((current_func, hit.f_local.clone())).or_insert((0, hit.proto)).0 += hit.shaped;
-                i += hit.consume.max(1);
+                // The statement a copy's value is embedded in may open
+                // another copy (`NormalizeAngle(a + NormalizeAngle(b - a) / 2)`).
+                i += if hit.mode == "site_embedded" { hit.consume - 1 } else { hit.consume }.max(1);
                 continue;
             }
             // Another copy may stand in the statement a rebuilt one stays in.
@@ -3784,10 +5357,17 @@ fn deinline_block(
             if let Some(ret) = hit.tail_ret {
                 replacement.push(Statement::Return(Return { node_origin: Default::default(), values: vec![ret] }));
             }
+            if let Some(guard) = guard {
+                replacement = vec![If::new(guard, Block(replacement), Block::default()).into()];
+            }
             let advance = replacement.len();
             // The absorbed argument temps and copies right before `i` go too.
             let start = i - hit.absorbed;
-            let removed = i + hit.consume - start;
+            let mut removed = i + hit.consume - start;
+            if let Some(tail) = joined_tail {
+                replacement.push(Statement::Return(tail));
+                removed = stmts.len() - start;
+            }
             // The call must leave every literal around it as Luau shares it.
             if current_func.is_some() {
                 let (mut gone, mut new) = (Vec::new(), Vec::new());
@@ -3832,6 +5412,7 @@ fn deinline_block(
     }
 }
 
+#[cfg(test)]
 pub(crate) fn stmt_rvalues_mut(s: &mut Statement) -> Vec<&mut RValue> {
     match s {
         Statement::Assign(a) => {
@@ -3920,20 +5501,17 @@ fn recurse_into_closures(
     match rv {
         RValue::Closure(c) => {
             let fp = Arc::as_ptr(&c.function.0);
-            // The orphans this body kept aside are in scope in all of it.
-            let with_orphans: Vec<usize>;
-            let active = match newly.orphan_scopes.get(&Some(fp)) {
-                Some(orphans) => {
-                    with_orphans = active.iter().chain(orphans).copied().collect();
-                    &with_orphans
-                }
-                None => active,
-            };
+            let active = function_scope(active, targets, fp, newly);
+            let active = active.as_ref();
             let mut function = c.function.0.lock();
             let function = &mut *function;
             if let Some(lines) = &newly.lines {
                 lines.protos.borrow_mut().insert(fp, function.bytecode_proto_id);
             }
+            // A body no target's pattern is may be one copy whole (`function
+            // M.open(x) return activate("Open", x) end`): no helper can come
+            // back into it as its call.
+            let pattern = targets.iter().any(|t| t.func_ptr == fp);
             deinline_block(
                 &mut function.body.0,
                 targets,
@@ -3943,10 +5521,11 @@ fn recurse_into_closures(
                 &Enclosing::function(&function.parameters),
                 Some(fp),
                 true,
-                true,
+                pattern,
                 false,
                 newly,
             );
+            scan_orphan_bodies(&function.orphans, targets, decl_map, active, newly);
         }
         RValue::Call(c) => {
             recurse_into_closures(c.value.as_mut(), targets, decl_map, active, newly);
@@ -4286,6 +5865,11 @@ struct Hit {
     shaped: usize,
     /// [`Target::read_arity`] of the helper.
     read_arity: usize,
+    /// Where `host` holds the call ([`match_embedded_value`]): every value
+    /// it evaluates before the call is a literal, a constant import or a
+    /// local no other code writes, so an argument's expression may move into
+    /// the call past them ([`absorb_arguments`]).
+    host_inert: bool,
 }
 
 impl Hit {
@@ -4310,6 +5894,7 @@ impl Hit {
             placeholder: None,
             mode: "",
             single_valued: t.single_valued,
+            host_inert: false,
             partial: None,
             evidence: t.evidence,
             proto: t.proto,
@@ -4405,25 +5990,26 @@ fn try_match_at(
         // `canon` preserves). NOT to `AtResultDecl` Value targets — their `pat[0]`
         // may be a leaf `return X` unified against an `Assign`, so the variant
         // check would be unsound there.
-        // A constant argument can remove a leading `if` of a specializable
-        // pattern (Tier B), leaving any statement first at the site.
-        let head_may_vanish = t.specializable && matches!(t.pat[0], Statement::If(_));
+        // Partial evaluation can remove a leading branch or a proved scalar
+        // concat snapshot, leaving its following statement first at the site.
+        let head_may_vanish = t.specializable
+            && (matches!(t.pat[0], Statement::If(_)) || leading_scalar_snapshot(&t.pat).is_some());
         let use_disc = !head_may_vanish
             && (t.kind == TKind::Void || (t.kind == TKind::Value && t.value_anchor == ValueAnchor::AtPrefix));
         // Canon may fuse a site's select `if` into the assignment a pattern
         // starts with (N5).
         let fused_head = anchor_is_if && t.pat0_kind == assign_kind;
-        if use_disc && anchor_disc != Some(t.pat0_kind) && !fused_head {
-            return Ok(None); // first-statement variant cannot match this pattern
-        }
         // Name prefilter (same targets as the variant check): when BOTH the position
         // and the pattern have a fixed-name head anchor and they differ, the exact
         // unify of `pat[0]` would fail — skip without entering the window scan.
-        if use_disc
-            && let (Some(ak), Some(tk)) = (anchor_key, t.pat0_anchor_key)
-            && ak != tk
-        {
-            return Ok(None);
+        let filtered = use_disc
+            && ((anchor_disc != Some(t.pat0_kind) && !fused_head)
+                || matches!((anchor_key, t.pat0_anchor_key), (Some(ak), Some(tk)) if ak != tk));
+        // A specialized copy of the value alone may be in a statement of any
+        // kind ([`specialized_host`]).
+        let hosted_only = filtered && specialized_host(t).is_some();
+        if filtered && !hosted_only {
+            return Ok(None); // first-statement variant cannot match this pattern
         }
         // One unit per width the non-allocating length check scans; the deep
         // canon/unify work is charged where it happens (`charge_unify`).
@@ -4438,14 +6024,18 @@ fn try_match_at(
         if t.late() && !t.assigns {
             return Ok(None);
         }
-        // A variant claims constants its copy folded away: refused where
-        // line info shows none of the helper's code (honesty, part b).
-        if t.inferred.is_some() && t.lines.as_ref().is_some_and(|lines| lines.absent(current_func, t.proto)) {
+        // Where line info shows none of the helper's code, a match is code
+        // written out, not a copy (honesty, part b).
+        if t.lines.as_ref().is_some_and(|lines| lines.absent(current_func, t.proto)) {
             return Ok(None);
         }
+        // A function's whole body may be one call where line info shows a
+        // copy of the helper in it: Luau inlines no function into one it is
+        // inlined in, so no helper comes back into the other as its call.
+        let is_func_body_top = is_func_body_top && !t.lines.as_ref().is_some_and(|lines| lines.copies(current_func, t.proto) > 0);
         let mut hit = if seen_without_site {
             None
-        } else if t.hosted_only {
+        } else if t.hosted_only || hosted_only {
             match_hosted_value(stmts, i, anchor, t, canon_cache, current_func)
         } else { match (t.kind, t.value_anchor) {
             (TKind::Void, _) => match_void(
@@ -4462,17 +6052,18 @@ fn try_match_at(
             ),
             (TKind::Value, _) if t.loop_exit_at.is_some() => {
                 match_value_loop(stmts, i, t, is_func_body_top, last_occ, current_func)
+                    .or_else(|| match_own_local_loop(stmts, i, t, is_func_body_top, last_occ, current_func))
             }
             (TKind::Value, ValueAnchor::AtResultDecl) => {
                 match_value(stmts, i, t, is_func_body_top, last_occ, canon_cache, current_func)
                     .or_else(|| match_returned_value(stmts, i, t, is_func_body_top, last_occ, canon_cache, current_func))
-                    .or_else(|| match_hosted_value(stmts, i, anchor, t, canon_cache, current_func))
             }
             (TKind::Value, ValueAnchor::AtPrefix) => {
                 match_value_prefixed(stmts, i, t, current_func, is_func_body_top, last_occ)
                     .or_else(|| match_returned_value(stmts, i, t, is_func_body_top, last_occ, canon_cache, current_func))
                     .or_else(|| {
-                        (!narrow_prefix(&t.pat))
+                        // A specialized copy may have folded the prefix away.
+                        (!narrow_prefix(&t.pat) || may_specialize(t))
                             .then(|| match_value(stmts, i, t, is_func_body_top, last_occ, canon_cache, current_func))
                             .flatten()
                     })
@@ -4485,7 +6076,19 @@ fn try_match_at(
         if hit.is_none() && t.assigns && t.kind == TKind::Value && !t.hosted_only && assign_head_may_match(t, anchor_stmt, anchor_key) {
             hit = match_assigned_value(stmts, i, t, is_func_body_top, last_occ, canon_cache, current_func);
         }
+        // A copy evaluated in place, after the store of a whole value above,
+        // which takes in the temps Luau made for its arguments.
+        if hit.is_none() && !seen_without_site && !t.hosted_only && !hosted_only && t.kind == TKind::Value && t.loop_exit_at.is_none() {
+            hit = match_hosted_value(stmts, i, anchor, t, canon_cache, current_func);
+            if hit.is_some() {
+                found_at.insert((block, i, ti));
+            }
+        }
         let hit = hit.filter(|hit| !hit.inferred.as_ref().is_some_and(|param| continues_pruned_branch(t, param, stmts, i + hit.consume)));
+        let hit = hit.filter(|hit| {
+            let covered = if hit.host.is_some() { anchor..anchor + 1 } else { i..i + hit.consume };
+            !written_elsewhere(stmts.get(covered).unwrap_or_default(), t.own_lines)
+        });
         let hit = hit.map(|hit| host_returned_cell(stmts, i, hit, t, current_func).unwrap_or_else(|hit| hit));
         // A wrapper's copy is a plain call of the local it wraps; one a
         // de-inliner rebuilt is no copy of it.
@@ -4596,11 +6199,13 @@ fn match_void(
     // candidate region carrying 2+ interposed `Empty`s is still reachable. The
     // ceiling is the pattern's tail-spine length (guard-form expansion of every
     // tail `if`, see `tail_spine_len`) plus one for a site-only trailing `return`.
-    let max_w = raw_width_for_effective(stmts, start, t.pat_spine_len + 1);
+    // A constant argument can remove a branch or a proved concat snapshot
+    // (Tier B), so a specializable helper's copy may be shorter than its
+    // body, or longer where the branch it takes spreads its statements.
+    let spread = if t.specializable { statements_spread(&t.pat) } else { 0 };
+    let max_w = raw_width_for_effective(stmts, start, (t.pat_spine_len + 1).max(spread));
     let mut site: Option<Site> = None;
     let mut ambiguous = false;
-    // A constant argument can remove a branch of the body (Tier B), so a
-    // specializable helper's copy may be shorter than its body.
     let min_w = if t.specializable { 1 } else { kc };
     // The canon length and return scan of each width, one statement at a time.
     let mut grown = WindowGrowth::new(stmts, start, min_w);
@@ -4617,6 +6222,7 @@ fn match_void(
         if w < kc || top_len < kc {
             let shorter = may_specialize(t)
                 && top_len < kc
+                && top_len >= t.specialized_floor
                 && !(has_return && !(is_func_tail && start + w == stmts.len()));
             if shorter {
                 let plain = canon_window(canon_cache, t, stmts, start, w);
@@ -4628,6 +6234,19 @@ fn match_void(
                 }
             }
             continue;
+        }
+        // Longer only where a constant shows in the copy: one inferred from
+        // a branch's truth alone takes an arm (`if p >= 50 then` of a copy
+        // whose argument is `p >= 50`).
+        if top_len > kc && top_len <= spread && !has_return {
+            let plain = canon_window(canon_cache, t, stmts, start, w);
+            if charge_unify(t, &plain)
+                && let Some(u) = try_unify_specialized_site(t, &plain, current_func)
+                && u.inferred.is_none()
+                && !tail_has_live(last_occ, stmts, i, start + w, &u.callee_locals)
+            {
+                record_site(&mut site, &mut ambiguous, w, &u, None);
+            }
         }
         // Attempt 1 — plain canon, with tail-safety for consuming a caller return.
         // The canon length rejects most widths before any window is built.
@@ -4724,9 +6343,96 @@ fn match_void(
     if ambiguous {
         return None;
     }
-    let site = site?;
-    let results = site.unified.returned.clone();
+    let Some(site) = site else {
+        return match_assigned_results(stmts, start, t, is_func_body_top, last_occ, current_func);
+    };
+    // Results nothing reads after the call are left out (`local a = f()`,
+    // not `local a, _ = f()`); the call still computes them.
+    let mut results = site.unified.returned.clone();
+    while results.len() > 1
+        && !tail_has_live(last_occ, stmts, start, start + site.width, &FxHashSet::from_iter([results.last().unwrap().clone()]))
+    {
+        results.pop();
+    }
     Some(Hit { tail_ret: site.tail_ret, ..Hit::call(t, (start - i) + site.width, site.unified, results) })
+}
+
+/// A helper returning several values whose results go into locals the
+/// caller already has: `v19, v18 = perpBasis(v)`, or `v6 = perpBasis(v)`,
+/// whose copy still evaluates the values nothing takes into dead locals.
+/// The copy stores each result taken where the declared form declares it:
+/// read as declarations, those stores unify as that form. Rebuilt as
+/// `r1, ..., rk = f(args)`, the results taken first and the dead rest
+/// dropped. A local taking a result is read nowhere in the window before
+/// its store and captured by no closure, so nothing sees it change before
+/// the call returns.
+fn match_assigned_results(
+    stmts: &[Statement],
+    start: usize,
+    t: &Target,
+    is_func_body_top: bool,
+    last_occ: &mut Liveness,
+    current_func: Option<FnPtr>,
+) -> Option<Hit> {
+    if t.returns.is_empty() {
+        return None;
+    }
+    let kc = t.pat.len();
+    let max_w = raw_width_for_effective(stmts, start, t.pat_spine_len + 1);
+    let mut found = None;
+    for w in kc..=max_w {
+        if is_func_body_top && start == 0 && start + w == stmts.len() {
+            continue;
+        }
+        let raw = &stmts[start..start + w];
+        if canon_top_len(raw, true) != kc || block_has_return(raw) {
+            continue;
+        }
+        let mut declared = FxHashSet::default();
+        collect_declared_locals(raw, &mut declared);
+        let mut taken: Vec<(usize, RcLocal)> = Vec::new();
+        let window: Vec<Statement> = raw
+            .iter()
+            .enumerate()
+            .map(|(at, statement)| match statement {
+                Statement::Assign(store)
+                    if !store.prefix
+                        && !store.parallel
+                        && !store.compound
+                        && let ([LValue::Local(local)], [_]) = (store.left.as_slice(), store.right.as_slice())
+                        && !declared.contains(local)
+                        && !taken.iter().any(|(_, other)| other == local) =>
+                {
+                    taken.push((at, local.clone()));
+                    Assign { prefix: true, ..store.clone() }.into()
+                }
+                other => other.clone(),
+            })
+            .collect();
+        if taken.is_empty() || !charge_window(t, &window) {
+            continue;
+        }
+        let window = canon_recurse(canon_top(&window, true), true);
+        let Some(u) = try_unify_site_any(t, &window, current_func) else { continue };
+        let assigned = u.returned.iter().take_while(|result| taken.iter().any(|(_, local)| local == *result)).count();
+        let honest = assigned == taken.len()
+            && taken.iter().all(|(at, local)| {
+                t.captures.uncaptured(local)
+                    && !block_reads_local(&raw[..*at], local)
+                    && !matches!(&raw[*at], Statement::Assign(store) if reads_local(&store.right[0], local))
+            })
+            && !tail_has_live(last_occ, stmts, start, start + w, &u.returned[assigned..].iter().cloned().collect())
+            && !tail_has_live(last_occ, stmts, start, start + w, &u.callee_locals);
+        if !honest {
+            continue;
+        }
+        if found.is_some() {
+            return None;
+        }
+        let results = u.returned[..assigned].to_vec();
+        found = Some(Hit { assign: true, ..Hit::call(t, w, u, results) });
+    }
+    found
 }
 
 /// Whether [`continues_as_returns`] gives a body, read without copying one:
@@ -4888,7 +6594,9 @@ fn match_value(
     let max_w = raw_width_for_effective(stmts, body_start, t.pat_raw_len + 1);
     let mut site: Option<Site> = None;
     let mut ambiguous = false;
-    for w in kc..=max_w {
+    // A copy Luau specialized may be shorter than the helper (`match_void`).
+    let shorter = may_specialize(t);
+    for w in if shorter { 1 } else { kc }..=max_w {
         // whole-body gate: the decl + region must not be the function's entire body.
         if is_func_body_top && i == 0 && body_start + w == stmts.len() {
             continue;
@@ -4898,7 +6606,20 @@ fn match_value(
         // rejects most widths, so run it BEFORE the recursive `block_has_return`
         // return-safety scan. Both are pure `continue` gates, so the order is
         // byte-identical; it just avoids scanning returns for wrong-length regions.
-        if canon_top_len(region, true) != kc {
+        let top_len = canon_top_len(region, true);
+        if top_len != kc {
+            if shorter && top_len < kc && top_len >= t.specialized_floor && !block_has_return(region) {
+                let cwin = canon_window(canon_cache, t, stmts, body_start, w);
+                if charge_unify(t, &cwin)
+                    && let Some(u) = try_unify_specialized_site(t, &cwin, current_func)
+                    && u.result.as_ref() == Some(&r)
+                    && !u.callee_locals.contains(&r)
+                    && !block_reads_local(region, &r)
+                    && !tail_has_live(last_occ, stmts, i, body_start + w, &u.callee_locals)
+                {
+                    record_site(&mut site, &mut ambiguous, w, &u, None);
+                }
+            }
             continue;
         }
         // the region assigns RESULT; it must not itself contain returns.
@@ -4917,7 +6638,7 @@ fn match_value(
         // shape the callee's `local L = E; S(L)…; return L` unifies against.
         let attempts: [(Window, Option<Vec<Statement>>); 2] = [
             (cwin, None),
-            match alias_result_leaves(region, &r) {
+            match alias_result_leaves(region, &r, t.captures.uncaptured(&r)) {
                 Some(rw) if !block_has_return(&rw) && canon_top_len(&rw, true) == kc && charge_window(t, &rw) => (
                     Window::owned(canon_recurse(canon_top(&rw, true), true)),
                     Some(rw),
@@ -4925,6 +6646,15 @@ fn match_value(
                 _ => (Window::default(), None),
             },
         ];
+        // A helper returning from its loop: the copy stores and breaks.
+        let seed = Bindings { elide_nil: true, ..Bindings::default() };
+        if let Some(u) = unify_loop_exits(t, region, &r, seed, current_func)
+            && !u.callee_locals.contains(&r)
+            && !block_reads_local(region, &r)
+            && !tail_has_live(last_occ, stmts, i, body_start + w, &u.callee_locals)
+        {
+            record_site(&mut site, &mut ambiguous, w, &u, None);
+        }
         for (idx, (cw, rewritten)) in attempts.iter().enumerate() {
             if (idx == 0 && cw.is_empty()) || (idx == 1 && rewritten.is_none()) {
                 continue;
@@ -5046,24 +6776,55 @@ fn match_returned_value(
     // A whole function body is never one call (the thin-wrapper case):
     // only where its `return` gives more values than the copy's.
     let whole_body = is_func_body_top && i == 0;
-    let mut attempt = |window: &[Statement], before: Vec<RValue>| -> Option<Hit> {
+    let mut attempt = |window: &[Statement], before: &[RValue], canon_cache: &mut CanonCache| -> Option<Hit> {
         if whole_body && before.is_empty() {
             return None;
         }
         if !block_always_returns(window) || leading_statement_refused(t, window) || leading_condition_refused(t, window) {
             return None;
         }
-        if block_has_void_return(window) || has_depth_zero_loop_control(window, 0) || canon_top_len(window, true) != kc {
-            return None;
+        if before.is_empty() {
+            if canon_cache.returned_shape(window) != Some(kc)
+                || t.search.exhausted()
+                || !t.search.spend(canon_cache.returned_nodes(window))
+            {
+                return None;
+            }
+        } else {
+            if block_has_void_return(window) || has_depth_zero_loop_control(window, 0)
+                || canon_top_len(window, true) != kc || !charge_window(t, window)
+            {
+                return None;
+            }
         }
-        if !charge_window(t, window) {
-            return None;
-        }
-        let canonical = canon_recurse(canon_top(window, true), true);
+        // Keep the original per-attempt charge above. Return-mode caching
+        // must neither consume nor grant the ordinary window cache's fuel.
+        let canonical = if before.is_empty() {
+            canon_cache.returned(stmts, i)
+        } else {
+            Window::owned(canon_recurse(canon_top(window, true), true))
+        };
         if !charge_unify(t, &canonical) {
             return None;
         }
-        let u = try_unify_seeded(t, &canonical, current_func, Bindings { returning: true, ..Bindings::default() })?;
+        let u = match try_unify_seeded(t, &canonical, current_func, Bindings { returning: true, ..Bindings::default() }) {
+            Some(u) => u,
+            // A copy whose constant arguments Luau folded, its value
+            // returned by the caller (`return compareNumbers(a, b, true)`
+            // as the whole body of a sorter): the specializations unify
+            // with its returns as stores into one result.
+            None if before.is_empty() && may_specialize(t) => {
+                let result = RcLocal::default();
+                let stores = returns_as_stores(&canonical, &result)?;
+                let mut u = try_unify_specialized_site(t, &stores, current_func)?;
+                if u.result.as_ref() != Some(&result) {
+                    return None;
+                }
+                u.result = None;
+                u
+            }
+            None => return None,
+        };
         if u.result.is_some() || tail_has_live(last_occ, stmts, i, end, &u.callee_locals) {
             return None;
         }
@@ -5084,16 +6845,17 @@ fn match_returned_value(
             }
         }
         let mode = if before.is_empty() { "site_returned" } else { "site_returned_tuple" };
-        Some(Hit { returns_value: true, returned_before: before, mode, ..Hit::call(t, end - i, u, Vec::new()) })
+        Some(Hit { returns_value: true, returned_before: before.to_vec(), mode, ..Hit::call(t, end - i, u, Vec::new()) })
     };
-    if let Some(hit) = attempt(&stmts[i..end], Vec::new()) {
+    if let Some(hit) = attempt(&stmts[i..end], &[], canon_cache) {
         return Some(hit);
     }
     // The caller's `return` may give values before the copy's: the same
     // ones on every path (`return p, f(x)`, the copy's leaves each `return
     // p, A`), split off.
-    let (stripped, before) = returned_before(&stmts[i..end])?;
-    attempt(&stripped, before)
+    let prefix = canon_cache.returned_prefix(stmts, i)?;
+    let (stripped, before) = prefix.as_ref();
+    attempt(stripped, before, canon_cache)
 }
 
 /// `stmts`, a window returning on every path, with each `return v1, ...,
@@ -5157,11 +6919,15 @@ fn leading_condition_refused(t: &Target, stmts: &[Statement]) -> bool {
     let (Some(Statement::If(pattern)), Some(Statement::If(head))) = (t.pat.first(), stmts.iter().find(|s| !is_match_trivia(s))) else {
         return false;
     };
+    let refused = |condition: &RValue| unify_rvalue(&t.ctx(), &pattern.condition, condition, &mut Bindings::default()).is_err();
+    if !refused(&head.condition) {
+        return false;
+    }
     let negated = negate_canon(head.condition.clone());
-    let twice = negate_canon(negated.clone());
-    [&head.condition, &negated, &twice]
-        .into_iter()
-        .all(|condition| unify_rvalue(&t.ctx(), &pattern.condition, condition, &mut Bindings::default()).is_err())
+    if !refused(&negated) {
+        return false;
+    }
+    refused(&negate_canon(negated))
 }
 
 /// Whether the window `stmts`, running to the end of its block, may
@@ -5213,26 +6979,63 @@ fn match_assigned_value(
     canon_cache: &mut CanonCache,
     current_func: Option<FnPtr>,
 ) -> Option<Hit> {
-    // Every window here opens with the statement at `i`; the bindings fixed
-    // in advance only narrow what unifies with it.
-    if t.loop_exit_at.is_some() || !t.returns.is_empty() || leading_statement_refused(t, &stmts[i..]) {
+    if t.loop_exit_at.is_some() || !t.returns.is_empty() {
         return None;
     }
+    // Every window as long as the pattern opens with the statement at `i`;
+    // the bindings fixed in advance only narrow what unifies with it. A copy
+    // Luau specialized may be shorter (`match_value`), its first statements
+    // folded away.
+    let whole = !leading_statement_refused(t, &stmts[i..]);
+    let shorter = may_specialize(t);
+    if !whole && !shorter {
+        return None;
+    }
+    let returned = if shorter { returned_kinds(&t.pat) } else { 0 };
     let kc = t.pat.len();
     let max_w = raw_width_for_effective(stmts, i, t.pat_raw_len + 1);
     let mut site: Option<Site> = None;
     let mut ambiguous = false;
-    let mut grown = WindowGrowth::new(stmts, i, kc);
-    for w in kc..=max_w {
+    let mut declared = false;
+    let narrowest = if shorter { 1 } else { kc };
+    let mut grown = WindowGrowth::new(stmts, i, narrowest);
+    for w in narrowest..=max_w {
         let (top_len, has_return) = grown.extend_to(stmts, i + w);
         if is_func_body_top && i == 0 && i + w == stmts.len() {
             continue;
         }
         let region = &stmts[i..i + w];
         if top_len != kc || has_return {
+            if shorter && top_len < kc && top_len >= t.specialized_floor && !has_return
+                && let Some(result) = terminal_store(region)
+                && stored_kind_may_match(region, returned)
+            {
+                let cwin = canon_window(canon_cache, t, stmts, i, w);
+                let seed = Bindings { result: Some(result.clone()), assigned: true, ..Bindings::default() };
+                if charge_unify(t, &cwin)
+                    && let Some(u) = try_seeded_specialization(t, &cwin, current_func, &seed)
+                    && u.result.as_ref() == Some(&result)
+                    && !u.callee_locals.contains(&result)
+                    && !tail_has_live(last_occ, stmts, i, i + w, &u.callee_locals)
+                    && !(t.lines.as_ref().is_some_and(|lines| lines.absent(current_func, t.proto)))
+                {
+                    record_site(&mut site, &mut ambiguous, w, &u, None);
+                }
+            }
+            continue;
+        }
+        if !whole {
             continue;
         }
         let Some(result) = terminal_store(region) else { continue };
+        let seed = Bindings { assigned: true, ..Bindings::default() };
+        if let Some(u) = unify_loop_exits(t, region, &result, seed, current_func)
+            && !u.callee_locals.contains(&result)
+            && !tail_has_live(last_occ, stmts, i, i + w, &u.callee_locals)
+        {
+            record_site(&mut site, &mut ambiguous, w, &u, None);
+            continue;
+        }
         if !plain_kinds_may_match(t, region) {
             continue;
         }
@@ -5253,17 +7056,74 @@ fn match_assigned_value(
                 record_site(&mut site, &mut ambiguous, w, &u, None);
             }
         }
+        // The helper's own local the copy keeps the result in, declared at
+        // its top (`local ok, result = invoke(); if not ok then result =
+        // nil ... end`): the call declares it.
+        // A closure holding its cell would see the stores into it, where the
+        // helper's closure holds its own local.
+        if site.is_none()
+            && elided_declaration(region, &result)
+            && !closures_capture_any(region, std::slice::from_ref(&result))
+            && !t.captures.closure_written(&result)
+            && !cwin.is_empty()
+            && charge_unify(t, &cwin)
+            && let Some(mut u) = try_unify_seeded(t, &cwin, current_func, Bindings { result: Some(result.clone()), ..Bindings::default() })
+            && u.result.as_ref() == Some(&result)
+        {
+            u.callee_locals.remove(&result);
+            if !tail_has_live(last_occ, stmts, i, i + w, &u.callee_locals) {
+                record_site(&mut site, &mut ambiguous, w, &u, None);
+                declared = true;
+            }
+        }
     }
     if ambiguous {
         return None;
     }
     let site = site?;
     let result = site.unified.result.clone()?;
-    Some(Hit { assign: true, ..Hit::call(t, site.width, site.unified, vec![result]) })
+    Some(Hit { assign: !declared, ..Hit::call(t, site.width, site.unified, vec![result]) })
+}
+
+/// Whether a top-level statement of `region` declares `local` (with others,
+/// `local ok, result = ...`).
+fn elided_declaration(region: &[Statement], local: &RcLocal) -> bool {
+    region.iter().any(|statement| {
+        matches!(statement, Statement::Assign(declaration)
+            if declaration.prefix && declaration.left.iter().any(|left| matches!(left, LValue::Local(declared) if declared == local)))
+    })
 }
 
 /// The local the leaf stores of a region write: its last statement `R = X`,
 /// or the first such store at the end of an arm of the `if` ending it.
+/// [`kind_bit`]s of the values `stmts` returns, or of what a constant may
+/// fold one to (an arm of a select); every kind where one is a local.
+fn returned_kinds(stmts: &[Statement]) -> u32 {
+    fn value(returned: &RValue) -> u32 {
+        match returned {
+            RValue::Local(_) => u32::MAX,
+            RValue::Binary(binary) if matches!(binary.operation, BinaryOperation::And | BinaryOperation::Or) => {
+                kind_bit(returned) | value(&binary.left) | value(&binary.right)
+            }
+            RValue::IfExpression(select) => kind_bit(returned) | value(&select.then_value) | value(&select.else_value),
+            _ => kind_bit(returned),
+        }
+    }
+    stmts.iter().fold(0, |kinds, statement| kinds | match statement {
+        Statement::Return(ret) => ret.values.iter().fold(0, |kinds, returned| kinds | value(returned)),
+        other => nested_blocks(other).iter().fold(0, |kinds, block| kinds | returned_kinds(&block.lock().0)),
+    })
+}
+
+/// Whether the store a window ends with may be a value of these
+/// [`returned_kinds`]: a cheap gate before a specialized copy is built.
+fn stored_kind_may_match(stmts: &[Statement], returned: u32) -> bool {
+    match stmts.iter().rev().find(|statement| !is_match_trivia(statement)) {
+        Some(Statement::Assign(assign)) => assign.right.first().is_some_and(|stored| kind_bit(stored) & returned != 0),
+        _ => true,
+    }
+}
+
 fn terminal_store(stmts: &[Statement]) -> Option<RcLocal> {
     match stmts.iter().rev().find(|statement| !is_match_trivia(statement))? {
         Statement::Assign(assign)
@@ -5316,7 +7176,7 @@ fn absorb_arguments(
     is_func_body_top: bool,
 ) -> Option<Hit> {
     let end = i + hit.consume;
-    let result: Option<RcLocal> = if hit.assign {
+    let result: Option<RcLocal> = if hit.assign && hit.results.len() == 1 {
         hit.results.first().cloned()
     } else if hit.results.is_empty() && hit.host.is_none() {
         t.returns_parameter
@@ -5336,16 +7196,54 @@ fn absorb_arguments(
     // unless it holds the call first of all it evaluates
     // (`Hit::placeholder`).
     let into_host = hit.placeholder.is_some();
-    let mut below = if hit.host.is_some() && !into_host { 0 } else { hit.first_moved.unwrap_or(usize::MAX) };
-    let host_reads = |local: &RcLocal| hit.host.as_ref().is_some_and(|host| count_local_reads(std::slice::from_ref(host), local) > 0);
+    // Past values that nothing an argument's expression runs can change
+    // (`math.max(v, 0, hashInt(record.Id, 7))`, where Luau evaluated
+    // `record.Id` after `v` and `0` too), the temps go in as well.
+    let mut below = if hit.host.is_some() && !into_host && !hit.host_inert { 0 } else { hit.first_moved.unwrap_or(usize::MAX) };
+    // Reads of the host's own, the arguments of the call it holds aside.
+    let host_reads = |local: &RcLocal| {
+        hit.host.as_ref().is_some_and(|host| {
+            let in_call = if into_host {
+                0
+            } else {
+                hit.args.iter().map(|arg| usize::from(matches!(arg, RValue::Local(read) if read == local)) + arg_nested_reads(arg, local)).sum()
+            };
+            count_local_reads(std::slice::from_ref(host), local) > in_call
+        })
+    };
+    // The varargs spread into the last parameters (`local _, value = ...`
+    // for `f("Stats", key, ...)`), from where the call passes `...`.
+    let mut spread: Option<(usize, RValue)> = None;
     while let Some(k) = (0..start).rev().find(|&k| !is_match_trivia(&stmts[k])) {
         let Statement::Assign(declaration) = &stmts[k] else { break };
+        if spread.is_none()
+            && taken.is_empty()
+            && let Some(at) = vararg_spread(declaration, &hit.args, &mut |local| {
+                tail_has_live(last_occ, stmts, i, end, &FxHashSet::from_iter([local.clone()])) || host_reads(local)
+            })
+            && at < below
+            && !hit.written.iter().any(|&written| written >= at)
+            // `...` fills every parameter after it too: the declared ones
+            // only, or ones the body never reads (`show(..., nil)` stays).
+            && t.param_order.iter().skip(at + declaration.left.len()).all(|param| t.unread.contains(param))
+            && !(is_func_body_top && k == 0 && end == stmts.len())
+        {
+            spread = Some((at, crate::untruncated(declaration.right[0].clone())));
+            below = at;
+            start = k;
+            continue;
+        }
         let ([LValue::Local(local)], [init]) = (declaration.left.as_slice(), declaration.right.as_slice()) else { break };
         if !declaration.prefix || declaration.parallel || declaration.compound || matches!(init, RValue::Closure(_)) {
             break;
         }
         let Some(at) = hit.args.iter().position(|arg| matches!(arg, RValue::Local(read) if read == local)) else { break };
-        if declared_by_source(local, init, t.param_order.get(at)) {
+        // A guarded value (`character and character:FindFirstChildOfClass(...)`)
+        // keeps its name: the bytecode is the same either way, and it reads as
+        // the local the source almost always gave it, not as an argument.
+        if declared_by_source(local, init, t.param_order.get(at))
+            || matches!(init, RValue::Binary(binary) if binary.operation == BinaryOperation::And)
+        {
             break;
         }
         let read_elsewhere = hit.args.iter().enumerate().any(|(other, arg)| other != at && reads(arg, local))
@@ -5401,12 +7299,45 @@ fn absorb_arguments(
     // after: the call is for its effects only.
     let result_taken = result.as_ref().is_some_and(|result| taken.iter().any(|(_, local, _)| local == result));
     let taken_at: Vec<usize> = taken.iter().map(|(at, ..)| *at).collect();
+    let found_args = hit.args.clone();
     for (at, _, init) in taken {
         hit.args[at] = crate::untruncated(init);
     }
+    if let Some((at, varargs)) = spread {
+        hit.args.truncate(at);
+        hit.args.push(varargs);
+        // `...` gives the parameters after it what they had: no `nil` fills them.
+        hit.read_arity = hit.args.len();
+    }
+    // The host holds the call already: its arguments too.
+    if !taken_at.is_empty()
+        && !into_host
+        && let Some(host) = &mut hit.host
+    {
+        let (f_local, args) = (hit.f_local.clone(), hit.args.clone());
+        let mut replaced = false;
+        host.traverse_rvalues(&mut |value| {
+            if let RValue::Call(call) | RValue::Select(Select::Call(call)) = value
+                && !replaced
+                && matches!(call.value.as_ref(), RValue::Local(callee) if *callee == f_local)
+                && args_vec_eq(&call.arguments, &found_args)
+            {
+                call.arguments = args.clone();
+                replaced = true;
+            }
+        });
+        if !replaced {
+            return refused("hosted_call_not_found");
+        }
+    }
     for &at in hit.written.iter().filter(|at| !taken_at.contains(at)) {
         let Some(RValue::Local(local)) = hit.args.get(at) else { return refused("written_parameter_unbound") };
-        if !t.captures.uncaptured(local) || hit.args.iter().enumerate().any(|(other, arg)| other != at && reads(arg, local)) {
+        // The host holds the call, or the placeholder it goes in.
+        let private = t.captures.uncaptured(local)
+            || hit.host.as_ref().is_some_and(|host| private_to_copy(stmts, i, end, host, usize::from(hit.placeholder.is_none()), local));
+        // A handed back local the call did not declare keeps its old value.
+        let handed_back = result.as_ref() == Some(local) && tail_has_live(last_occ, stmts, i, end, &FxHashSet::from_iter([local.clone()]));
+        if !private || handed_back || hit.args.iter().enumerate().any(|(other, arg)| other != at && reads(arg, local)) {
             return refused("written_parameter_unbound");
         }
     }
@@ -5423,6 +7354,60 @@ fn absorb_arguments(
     }
     hit.absorbed = i - start;
     Some(hit)
+}
+
+/// Where `local a, b = ...` gives the last arguments of `args`: each of
+/// `a, b` the argument at its place (one past the end, or `nil` standing for
+/// a parameter nothing reads, only where nothing reads it), and none read by
+/// another argument or after the window (`live`).
+fn vararg_spread(declaration: &Assign, args: &[RValue], live: &mut dyn FnMut(&RcLocal) -> bool) -> Option<usize> {
+    if !declaration.prefix || declaration.parallel || declaration.compound
+        || !matches!(declaration.right.as_slice(), [RValue::VarArg(_) | RValue::Select(Select::VarArg(_))])
+    {
+        return None;
+    }
+    let locals: Vec<&RcLocal> = declaration.left.iter().map(LValue::as_local).collect::<Option<_>>()?;
+    let (j, at) = locals.iter().enumerate().find_map(|(j, local)| {
+        args.iter().position(|arg| matches!(arg, RValue::Local(read) if read == *local)).map(|at| (j, at))
+    })?;
+    let at = at.checked_sub(j)?;
+    if at + locals.len() < args.len() {
+        return None;
+    }
+    let read_by_others = |local: &RcLocal, own: usize| {
+        args.iter().enumerate().any(|(other, arg)| other != own && arg.any_local_read(&mut |read| read == local))
+    };
+    locals.iter().enumerate().all(|(j, local)| {
+        let own = at + j;
+        let in_place = match args.get(own) {
+            Some(RValue::Local(read)) => read == *local,
+            Some(RValue::Literal(Literal::Nil)) | None => !args.iter().any(|arg| arg.any_local_read(&mut |read| read == *local)),
+            Some(_) => false,
+        };
+        in_place && !read_by_others(local, own) && !live(local)
+    })
+    .then_some(at)
+}
+
+/// Whether `local`, the parameter local a copy evaluated in place in `host`
+/// had its function literal write, was that copy's alone: declared in this
+/// block before it, used nowhere else, and read `calls` times in `host`
+/// (by the call there, if built). The helper's own parameter then stands for it: the call passes
+/// the value the literal would have captured, and nothing else saw the
+/// writes (`local name = nil; t.Cutscene = function() name = name or "x"
+/// end` is `t.Cutscene = f(name)`).
+fn private_to_copy(stmts: &[Statement], i: usize, end: usize, host: &Statement, calls: usize, local: &RcLocal) -> bool {
+    let declared = stmts[..i].iter().any(|statement| {
+        matches!(statement, Statement::Assign(declaration)
+            if declaration.prefix && declaration.left.iter().any(|left| matches!(left, LValue::Local(l) if l == local)))
+    });
+    let mut written = FxHashSet::default();
+    collect_written(&stmts[end..], &mut written);
+    collect_written(std::slice::from_ref(host), &mut written);
+    declared
+        && !written.contains(local)
+        && count_local_reads(std::slice::from_ref(host), local) == calls
+        && count_local_reads(&stmts[..i], local) + count_local_reads(&stmts[end..], local) == 0
 }
 
 /// A declaration `local L = init` the source wrote, which stays declared
@@ -5495,6 +7480,119 @@ fn match_value_loop(
     complete.then(|| Hit::call(t, end - i, u, vec![result]))
 }
 
+/// A value helper returning its own local after a loop it returns from
+/// (`local sum = 0; for ... do sum += v; if sum > 100 then return 100 end
+/// end; return sum`), the local in the result's register (Luau's move
+/// elision): the copy stores each loop return into it and breaks (`sum =
+/// 100; break`), and its last `return` has nothing to store. Unified with
+/// those exits given back as returns and the last `return` elided;
+/// rebuilt as `local sum = f(args)`. No closure of the window may capture
+/// the local, which lives on after it.
+fn match_own_local_loop(
+    stmts: &[Statement],
+    i: usize,
+    t: &Target,
+    is_func_body_top: bool,
+    last_occ: &mut Liveness,
+    current_func: Option<FnPtr>,
+) -> Option<Hit> {
+    let [prefix @ .., looped, Statement::Return(ret)] = t.pat.as_slice() else { return None };
+    let [RValue::Local(own)] = ret.values.as_slice() else { return None };
+    let k = prefix.iter().position(|statement| {
+        matches!(statement, Statement::Assign(declaration) if declaration.prefix && matches!(declaration.left.as_slice(), [LValue::Local(local)] if local == own))
+    });
+    // A parameter the helper writes is the copy's local declared from its
+    // argument right before ([`absorb_arguments`] takes that in).
+    let declared = match k {
+        Some(k) => nth_effective_index(stmts, i, k)?,
+        None if t.written_params.contains(own) => (0..i).rev().find(|&at| !is_match_trivia(&stmts[at]))?,
+        None => return None,
+    };
+    let Statement::Assign(declaration) = &stmts[declared] else { return None };
+    let (true, [LValue::Local(r)]) = (declaration.prefix, declaration.left.as_slice()) else { return None };
+    // Where code follows, the structurer leaves the exits a flag (`local ok
+    // = true; ... r = x; ok = false; break ...; if ok then end`).
+    let first = nth_effective_index(stmts, i, prefix.len())?;
+    let flag = flag_decl(&stmts[first]);
+    let at = if flag.is_some() { nth_effective_index(stmts, first + 1, 0)? } else { first };
+    if loop_body(looped).is_none() || std::mem::discriminant(&stmts[at]) != std::mem::discriminant(looped) {
+        return None;
+    }
+    let guard = flag.as_ref().and_then(|flag| {
+        nth_effective_index(stmts, at + 1, 0).filter(|&g| matches!(&stmts[g], Statement::If(branch)
+            if matches!(&branch.condition, RValue::Local(read) if read == flag)
+                && branch.then_block.lock().0.iter().all(is_match_trivia)
+                && branch.else_block.lock().0.iter().all(is_match_trivia)))
+    });
+    let end = guard.unwrap_or(at) + 1;
+    if (is_func_body_top && i == 0 && end == stmts.len()) || block_has_return(&stmts[i..end]) {
+        return None;
+    }
+    let mut window = stmts[i..first].to_vec();
+    window.push(match &flag {
+        Some(flag) => return_from_loop(&stmts[at], flag, Some(r))?,
+        None => returned_loop_exits(&stmts[at], r)?,
+    });
+    if !charge_window(t, &window) {
+        return None;
+    }
+    let seed = Bindings { result: Some(r.clone()), elide: Some(own.clone()), loop_exits: true, ..Bindings::default() };
+    let mut u = try_unify_seeded(t, &canon_recurse(canon_top(&window, true), true), current_func, seed)?;
+    if u.result.as_ref() != Some(r) || !u.callee_locals.remove(r) || closures_capture_any(&stmts[i..end], std::slice::from_ref(r))
+        || tail_has_live(last_occ, stmts, i, end, &u.callee_locals)
+        || flag.is_some_and(|flag| tail_has_live(last_occ, stmts, i, end, &FxHashSet::from_iter([flag])))
+    {
+        return None;
+    }
+    // Declared before the window, the local is the call's declaration
+    // only where its argument's copy is taken in.
+    Some(Hit { mode: "site_own_local", assign: k.is_none(), ..Hit::call(t, end - i, u, vec![r.clone()]) })
+}
+
+/// `looped` with each `r = x; break` of its own (in its body and the
+/// arms there, not in a nested loop) as `return x`; `None` where it has
+/// none.
+fn returned_loop_exits(looped: &Statement, r: &RcLocal) -> Option<Statement> {
+    fn exits(stmts: &[Statement], r: &RcLocal, converted: &mut bool) -> Vec<Statement> {
+        let mut out = Vec::with_capacity(stmts.len());
+        let mut index = 0;
+        while index < stmts.len() {
+            match (&stmts[index], stmts.get(index + 1)) {
+                (Statement::Assign(store), Some(Statement::Break(_))) if is_plain_local_write(store, r) && !store.compound => {
+                    out.push(Return::new(store.right.clone()).into());
+                    *converted = true;
+                    index += 2;
+                    continue;
+                }
+                (Statement::If(branch), _) => out.push(If::new(
+                    branch.condition.clone(),
+                    Block(exits(&branch.then_block.lock().0, r, converted)),
+                    Block(exits(&branch.else_block.lock().0, r, converted)),
+                ).into()),
+                (statement, _) => out.push(statement.clone()),
+            }
+            index += 1;
+        }
+        out
+    }
+    let mut converted = false;
+    let mut looped = looped.clone();
+    let body = loop_body(&looped)?;
+    let replaced = exits(&body.lock().0, r, &mut converted);
+    if !converted {
+        return None;
+    }
+    let block = Arc::new(Mutex::new(Block(replaced)));
+    match &mut looped {
+        Statement::While(node) => node.block = block,
+        Statement::Repeat(node) => node.block = block,
+        Statement::NumericFor(node) => node.block = block,
+        Statement::GenericFor(node) => node.block = block,
+        _ => unreachable!(),
+    }
+    Some(looped)
+}
+
 /// `local flag = true` -> `flag`.
 fn flag_decl(statement: &Statement) -> Option<RcLocal> {
     let Statement::Assign(assign) = statement else { return None };
@@ -5555,8 +7653,10 @@ fn match_declared_value(
 /// before `trove:Add(conn)`, for a helper ending `return conn`. The call
 /// declares that local: `local conn = helper(args)`, or stands alone when
 /// nothing reads it. The helper's closures keep their own `conn` then, so
-/// nothing may write the local once the prefix defines it: no later
-/// statement, and no closure, the prefix's included.
+/// no closure may write the local, the prefix's included, and where the
+/// prefix's closures capture it, no later statement either. Without them,
+/// a later write is the caller's own (`v = IsFinite(x)` after `local v =
+/// IsFinite(x)` in an `and` chain).
 fn match_returned_local(
     stmts: &[Statement],
     i: usize,
@@ -5569,6 +7669,9 @@ fn match_returned_local(
     hint: Option<&Option<RcLocal>>,
     // `stmts[i..d]`, shared by the plain forms.
     site: &SitePrefix,
+    // A copy of another length than the pattern, which only a
+    // specialization matches.
+    specialized: bool,
 ) -> Option<Hit> {
     let prefix = &stmts[i..d];
     if t.falls_off || prefix.is_empty() || block_has_return(prefix) {
@@ -5601,6 +7704,7 @@ fn match_returned_local(
         }
         let read_later = tail_has_live(last_occ, stmts, i, d, &FxHashSet::from_iter([local.clone()]));
         if read_later
+            && closures_capture_any(prefix, std::slice::from_ref(local))
             && written_after
                 .get_or_insert_with(|| {
                     let mut written = FxHashSet::default();
@@ -5613,7 +7717,8 @@ fn match_returned_local(
         }
         let result = RcLocal::default();
         let store: Statement = Assign::new(vec![result.clone().into()], vec![RValue::Local(local.clone())]).into();
-        if canon_top_len_of(prefix.iter().chain(std::iter::once(&store)), true) != t.pat.len() {
+        let len = canon_top_len_of(prefix.iter().chain(std::iter::once(&store)), true);
+        if specialized == (len == t.pat.len()) {
             continue;
         }
         let Some(u) = site.unify_store(t, store, current_func) else {
@@ -5773,12 +7878,13 @@ fn match_embedded_value(
     // The call runs the helper's statements after every value `S` evaluated
     // before its place, which the prefix ran before: none of those may see a
     // difference. A local the prefix writes, a cell a call in it may write,
-    // and a global or field that code may change once the prefix runs any
-    // (`dispatch = new; dispatch(f())` is not `dispatch(helper())`). A method
-    // lookup is no effect, as everywhere in evaluation order.
+    // and a global or field whose lookup may observe the prefix's effects
+    // (`dispatch = new; dispatch(f())` is not `dispatch(helper())`). Method
+    // lookup follows the arguments, so it is not an earlier value here.
     // Each read once a value needs it.
     let prefix_writes = std::cell::OnceCell::new();
     let prefix_runs_code = std::cell::OnceCell::new();
+    let prefix_lookup_conflict = std::cell::OnceCell::new();
     let writes = || {
         prefix_writes.get_or_init(|| {
             let mut written = FxHashSet::default();
@@ -5786,15 +7892,22 @@ fn match_embedded_value(
             written
         })
     };
-    let runs_code = || *prefix_runs_code.get_or_init(|| may_run_code(prefix));
+    let runs_code = || *prefix_runs_code.get_or_init(|| prefix_has_order_dependency(prefix, &|_| false));
+    let conflicts_with_lookup = || *prefix_lookup_conflict.get_or_init(|| {
+        prefix_has_order_dependency(prefix, &|local| !t.captures.uncaptured(local))
+            || writes().iter().any(|local| !t.captures.uncaptured(local))
+    });
     let function = current_func.map(|function| function as usize);
     let register = |local: &RcLocal| t.captures.register_of(local, function);
+    let mut inert = false;
     let changed_by_prefix = |read: &Earlier| match read {
         Earlier::Value(RValue::Literal(_)) => false,
         Earlier::Value(value @ RValue::Local(local)) => {
             writes().contains(local) || (runs_code() && !t.captures.stable_at(value, function))
         }
-        Earlier::Value(value) => runs_code() && !t.captures.constant_import(value),
+        // A constant import is resolved when the script loads; any other
+        // lookup can run an `__index` the prefix may change.
+        Earlier::Value(value) => !t.captures.constant_import(value) && conflicts_with_lookup(),
     };
     visit_leading_values(&mut host, &register, &mut |value, evaluated_before, spread| {
         if value_kind(value) != root || evaluated_before.iter().any(&changed_by_prefix) {
@@ -5829,6 +7942,11 @@ fn match_embedded_value(
             && !t.single_valued
             && matches!(value, RValue::Select(Select::Call(_) | Select::MethodCall(_)));
         replaced = value_nodes(value).saturating_sub(u.args.iter().map(value_nodes).sum());
+        inert = evaluated_before.iter().all(|read| match read {
+            Earlier::Value(RValue::Literal(_)) => true,
+            Earlier::Value(value @ RValue::Local(_)) => t.captures.stable_at(value, function),
+            Earlier::Value(value) => t.captures.constant_import(value),
+        });
         *value = hosted_call(t, u.args.clone(), wrap);
         found = Some(u);
         true
@@ -5842,19 +7960,21 @@ fn match_embedded_value(
     if !host_locals.is_disjoint(&u.callee_locals) || tail_has_live(last_occ, stmts, i, d + 1, &u.callee_locals) {
         return None;
     }
-    Some(Hit { host: Some(host), partial: Some(replaced), ..Hit::call(t, d + 1 - i, u, Vec::new()) })
+    Some(Hit { host: Some(host), partial: Some(replaced), host_inert: inert, mode: "site_embedded", ..Hit::call(t, d + 1 - i, u, Vec::new()) })
 }
 
 /// [`Target::hosted`]: the `V` of a `return V` pattern, when it pins its
 /// copies down: not a parameter handed back as it is (any value would
-/// match it), with no parameter the body writes (a copy writes a local of
-/// its own), and no smaller than the expression helpers' floor
+/// match it), and no smaller than the expression helpers' floor
 /// (`expr_deinline::NODE_COUNT_FLOOR`), a function literal counted with
 /// its body ([`value_nodes`]).
 fn hosted_pattern(t: &Target) -> Option<RValue> {
-    if t.kind != TKind::Value || t.loop_exit_at.is_some() || !t.returns.is_empty() || !t.written_params.is_empty() {
+    if t.kind != TKind::Value || t.loop_exit_at.is_some() || !t.returns.is_empty() {
         return None;
     }
+    // A parameter written here is written by a function literal of `V`
+    // (`return function() name = name or "x" end`), whose copy captures a
+    // local of its own ([`private_to_copy`]).
     let [Statement::Return(ret)] = t.pat.as_slice() else { return None };
     let [value] = ret.values.as_slice() else { return None };
     if matches!(value, RValue::Local(local) if t.params.contains(local))
@@ -5865,6 +7985,74 @@ fn hosted_pattern(t: &Target) -> Option<RValue> {
     // Below the floor, line evidence admits it, and only the saving gate
     // of the matcher applies.
     (t.evidence || value_nodes(value) >= crate::expr_deinline::NODE_COUNT_FLOOR).then(|| value.clone())
+}
+
+/// How many statements `stmts` hold, those of their nested blocks too: the
+/// most a copy taking every branch it reaches whole can spread to.
+fn statements_spread(stmts: &[Statement]) -> usize {
+    stmts.iter().map(|statement| 1 + nested_blocks(statement).iter().map(|block| statements_spread(&block.lock().0)).sum::<usize>()).sum()
+}
+
+/// The value a value helper that may specialize returns last, after
+/// statements returning nothing (`return { ... }` after `local text =
+/// "Gift Box"; if count ~= 1 then text ..= "es" end`): given constants,
+/// its copy may be that value alone, in place ([`match_hosted_value`]).
+fn specialized_host(t: &Target) -> Option<&RValue> {
+    // The copy is the value alone: every statement before it folded away.
+    if t.kind != TKind::Value || t.loop_exit_at.is_some() || !t.returns.is_empty() || !may_specialize(t) || t.specialized_floor > 1 {
+        return None;
+    }
+    let (Statement::Return(ret), prefix) = t.pat.split_last()? else { return None };
+    match ret.values.as_slice() {
+        [value] if !prefix.is_empty() && !block_has_return(prefix) => Some(value),
+        _ => None,
+    }
+}
+
+/// `if c then return a else return b end`, one value each, nested alike,
+/// after statements returning nothing, as the pattern returning its
+/// `and`/`or` value a copy taking one value is, with the parameters it
+/// takes as truthy ([`Target::select_truthy`]). Canon keeps such a select
+/// a statement where an arm returns a call, all of whose results the
+/// helper gives, or a parameter, whose truth it cannot know.
+fn select_return(pattern: &[Statement], params: &FxHashSet<RcLocal>) -> Option<(Vec<Statement>, Vec<RcLocal>)> {
+    fn select(pattern: &[Statement], params: &FxHashSet<RcLocal>) -> Option<RValue> {
+        let [Statement::If(branch)] = pattern else { return None };
+        let arm = |block: &Block| {
+            let real: Vec<Statement> = block.0.iter().filter(|s| !matches!(s, Statement::Empty(_))).cloned().collect();
+            match real.as_slice() {
+                [Statement::Return(ret)] if ret.values.len() == 1 => Some(ret.values[0].clone()),
+                nested => select(nested, params),
+            }
+        };
+        let (then_value, else_value) = (arm(&branch.then_block.lock())?, arm(&branch.else_block.lock())?);
+        let parameter = |value: &RValue| matches!(value, RValue::Local(local) if params.contains(local));
+        crate::select_value::select_value_assuming(&mut branch.condition.clone(), then_value, else_value, &parameter)
+    }
+    // `c and p or q` is `if c then p else q` only where `p` is truthy.
+    fn truthy(value: &RValue, params: &FxHashSet<RcLocal>, out: &mut Vec<RcLocal>) {
+        if let RValue::Binary(or) = value
+            && or.operation == BinaryOperation::Or
+            && let RValue::Binary(and) = or.left.as_ref()
+            && and.operation == BinaryOperation::And
+            && let RValue::Local(param) = and.right.as_ref()
+            && params.contains(param)
+        {
+            out.push(param.clone());
+        }
+        value.visit_rvalues(&mut |child| {
+            truthy(child, params, out);
+            true
+        });
+    }
+    let (last, prefix) = pattern.split_last()?;
+    if block_has_return(prefix) {
+        return None;
+    }
+    let value = select(std::slice::from_ref(last), params)?;
+    let mut needed = Vec::new();
+    truthy(&value, params, &mut needed);
+    Some((prefix.iter().cloned().chain([Return::new(vec![value]).into()]).collect(), needed))
 }
 
 /// The nodes of `value`, a function literal's body included: the size of
@@ -5905,7 +8093,13 @@ fn match_hosted_value(
     canon_cache: &mut CanonCache,
     current_func: Option<FnPtr>,
 ) -> Option<Hit> {
-    let pattern = t.hosted.as_ref()?;
+    // A helper whose constant arguments leave only the value it returns
+    // last matches as that value specialized ([`specialized_host`]).
+    let specialized = t.hosted.is_none();
+    let pattern = match &t.hosted {
+        Some(pattern) => pattern,
+        None => specialized_host(t)?,
+    };
     let statement = stmts.get(anchor)?;
     if canon_cache.kinds(statement) & kind_bit(pattern) == 0 {
         return None;
@@ -5914,7 +8108,10 @@ fn match_hosted_value(
     // No copy to build where no value of the statement has the pattern's
     // shape (the walk does not enter function bodies, as the visits below
     // do not).
-    if !holds_shape(statement, &|value| value_kind(value) == kind && unify_returned_value(&t.ctx(), pattern, value, &mut Bindings::default()).is_ok()) {
+    let shaped = |value: &RValue| {
+        value_kind(value) == kind && (specialized || unify_returned_value(&t.ctx(), pattern, value, &mut Bindings::default()).is_ok())
+    };
+    if !holds_shape(statement, &shaped) {
         return None;
     }
     let function = current_func.map(|function| function as usize);
@@ -5937,19 +8134,24 @@ fn match_hosted_value(
         if value_kind(value) != kind || (!t.assigns && whole == Some(value as *const RValue)) {
             return None;
         }
-        if !charge_unify(t, &[]) || unify_returned_value(&t.ctx(), pattern, value, &mut Bindings::default()).is_err() {
+        if !charge_unify(t, &[]) || !shaped(value) {
             return None;
         }
         let wrap = hosted_spread(t, pattern, value, spread)?;
         let result = RcLocal::default();
         let window = [Statement::Assign(Assign::new(vec![LValue::Local(result.clone())], vec![value.clone()]))];
-        let u = try_unify_site(t, &window, current_func)?;
+        let u = if specialized { try_unify_specialized_site(t, &window, current_func)? } else { try_unify_site(t, &window, current_func)? };
         let argument_nodes: usize = u.args.iter().map(value_nodes).sum();
         let nodes = value_nodes(value);
         // Where line evidence admits the helper, the call (itself, its
         // callee and its arguments) need only be no larger than the copy.
         let saves = if t.evidence { nodes >= 2 + argument_nodes } else { nodes >= 1 + argument_nodes + crate::expr_deinline::NET_SAVING_FLOOR };
-        if u.result.as_ref() != Some(&result) || !u.callee_locals.is_empty() || !saves {
+        // The copy's own locals are the parameters its function literals
+        // write, which the call passes ([`private_to_copy`]).
+        let written_only = u.callee_locals.iter().all(|local| {
+            u.written.iter().any(|&at| matches!(&u.args[at], RValue::Local(arg) if arg == local))
+        });
+        if u.result.as_ref() != Some(&result) || !written_only || !saves {
             return None;
         }
         Some((u, wrap, nodes - argument_nodes))
@@ -6436,14 +8638,13 @@ enum Earlier {
     Value(RValue),
 }
 
-/// Whether `stmts` may run code other than their own: a call, a store to a
-/// global or a field, or an operation a metamethod can take over.
-fn may_run_code(stmts: &[Statement]) -> bool {
+/// Whether `stmts` may run other code or read a cell that it may change.
+fn prefix_has_order_dependency(stmts: &[Statement], capture: &impl Fn(&RcLocal) -> bool) -> bool {
     stmts.iter().any(|statement| match statement {
         Statement::Assign(assign) => {
             assign.left.iter().any(|left| !matches!(left, LValue::Local(_)))
                 || assign.right.iter().any(|value| {
-                    !crate::effects::summarize(value, &|_| false).effects.is_total_pure()
+                    crate::effects::summarize(value, capture).effects.has_order_dependency()
                 })
         }
         Statement::Comment(_) | Statement::Empty(_) => false,
@@ -6482,6 +8683,58 @@ fn match_value_prefixed(
     is_func_body_top: bool,
     last_occ: &mut Liveness,
 ) -> Option<Hit> {
+    match_value_prefixed_plain(stmts, i, t, current_func, is_func_body_top, last_occ)
+        .or_else(|| match_returned_local_specialized(stmts, i, t, current_func, last_occ))
+}
+
+/// A copy whose constant arguments Luau folded through branches has another
+/// length than the helper's prefix: dropped arms shorten it
+/// (`collect(1, nil, 3)`), taken ones spread their statements
+/// (`counted(4)`). Of a helper returning its own local, a prefix of another
+/// length only a specialization matches, at one width only, and none an
+/// `if` of a pruned branch's shape continues.
+fn match_returned_local_specialized(
+    stmts: &[Statement],
+    i: usize,
+    t: &Target,
+    current_func: Option<FnPtr>,
+    last_occ: &mut Liveness,
+) -> Option<Hit> {
+    if !may_specialize(t) || !matches!(t.pat.last(), Some(Statement::Return(ret)) if matches!(ret.values.as_slice(), [RValue::Local(_)])) {
+        return None;
+    }
+    if !may_open_specialized_copy(t, &t.pat, &stmts[i], 0) {
+        return None;
+    }
+    fn spread(stmts: &[Statement]) -> usize {
+        stmts.iter().map(|statement| 1 + nested_blocks(statement).iter().map(|block| spread(&block.lock().0)).sum::<usize>()).sum()
+    }
+    let mut found = None;
+    for k in (1..spread(&t.pat)).filter(|&k| k != t.prefix_len) {
+        let Some(d) = nth_effective_index(stmts, i, k) else { break };
+        if result_decl(&stmts[d]).is_some() {
+            continue;
+        }
+        let hit = match_returned_local(stmts, i, d, t, current_func, last_occ, None, &SitePrefix::new(&stmts[i..d]), true)
+            .filter(|hit| !hit.inferred.as_ref().is_some_and(|param| continues_pruned_branch(t, param, stmts, i + hit.consume)));
+        if hit.is_some() {
+            if found.is_some() {
+                return None;
+            }
+            found = hit;
+        }
+    }
+    found
+}
+
+fn match_value_prefixed_plain(
+    stmts: &[Statement],
+    i: usize,
+    t: &Target,
+    current_func: Option<FnPtr>,
+    is_func_body_top: bool,
+    last_occ: &mut Liveness,
+) -> Option<Hit> {
     // Every window here opens with the callee prefix, an `if` of which keeps
     // its condition through canon (the prefix returns nothing).
     if head_refused(t, &stmts[i..])
@@ -6511,7 +8764,7 @@ fn match_value_prefixed(
         });
         return match_declared_value(stmts, i, d, t, is_func_body_top, last_occ, current_func, &site)
             .or_else(|| match_embedded_value(stmts, i, d, t, current_func, is_func_body_top, last_occ, &site))
-            .or_else(|| match_returned_local(stmts, i, d, t, current_func, last_occ, returned_hint.as_ref(), &site))
+            .or_else(|| match_returned_local(stmts, i, d, t, current_func, last_occ, returned_hint.as_ref(), &site, false))
             .or_else(|| match_own_local_value(stmts, i, d, t, current_func, is_func_body_top, last_occ));
     };
     let kc = t.pat.len();
@@ -6549,31 +8802,43 @@ fn match_value_prefixed(
         if block_has_return(region) {
             continue;
         }
-        let mut union: Vec<Statement> = Vec::with_capacity(p + w);
-        union.extend_from_slice(prefix);
-        union.extend_from_slice(region);
-        if !charge_window(t, &union) {
-            break;
-        }
-        let cwin = {
-            dprof::inc(&dprof::CANON_RECURSE_CALLS, 1);
-            crate::telemetry::count("canonicalize_calls", 1);
-            let _t = dprof::T::new(&dprof::CANON_RECURSE_US);
-            canon_recurse(canon_top(&union, true), true)
-        };
-        if let Some(u) = try_unify_declared_result(t, &cwin, current_func) {
-            // RESULT must be exactly the interposed decl, written-only inside the
-            // union (its full computation), NOT also a callee-prefix binder (the
-            // getOwnerId reassignment-collision class), and every OTHER callee temp
-            // — including the consumed prefix local — must be dead after.
-            if u.result.as_ref() == Some(&r)
-                && !u.callee_locals.contains(&r)
-                && !block_reads_local(prefix, &r)
-                && !block_reads_local(region, &r)
-                && !tail_has_live(last_occ, stmts, i, region_start + w, &u.callee_locals)
-            {
-                record_site(&mut site, &mut ambiguous, w, &u, None);
+        // The plain region, then its result-alias form ([`alias_result_leaves`]):
+        // the copy computing the helper's returned locals in RESULT's register.
+        let aliased = alias_result_leaves(region, &r, t.captures.uncaptured(&r))
+            .filter(|rewritten| !block_has_return(rewritten) && canon_top_len_of(prefix.iter().chain(rewritten.iter()), true) == kc);
+        let mut stop = false;
+        for region in std::iter::once(region).chain(aliased.as_deref()) {
+            let mut union: Vec<Statement> = Vec::with_capacity(p + region.len());
+            union.extend_from_slice(prefix);
+            union.extend_from_slice(region);
+            if !charge_window(t, &union) {
+                stop = true;
+                break;
             }
+            let cwin = {
+                dprof::inc(&dprof::CANON_RECURSE_CALLS, 1);
+                crate::telemetry::count("canonicalize_calls", 1);
+                let _t = dprof::T::new(&dprof::CANON_RECURSE_US);
+                canon_recurse(canon_top(&union, true), true)
+            };
+            if let Some(u) = try_unify_declared_result(t, &cwin, current_func) {
+                // RESULT must be exactly the interposed decl, written-only inside the
+                // union (its full computation), NOT also a callee-prefix binder (the
+                // getOwnerId reassignment-collision class), and every OTHER callee temp
+                // — including the consumed prefix local — must be dead after.
+                if u.result.as_ref() == Some(&r)
+                    && !u.callee_locals.contains(&r)
+                    && !block_reads_local(prefix, &r)
+                    && !block_reads_local(region, &r)
+                    && !tail_has_live(last_occ, stmts, i, region_start + w, &u.callee_locals)
+                {
+                    record_site(&mut site, &mut ambiguous, w, &u, None);
+                    break;
+                }
+            }
+        }
+        if stop {
+            break;
         }
     }
     if ambiguous {
@@ -6684,22 +8949,23 @@ impl<'a> SitePrefix<'a> {
 /// cannot leave early: no `return` — the caller checks — and no depth-zero
 /// `break`/`continue`) and is exactly the shape the pattern unifies against. Leaves
 /// already ending in a RESULT write are left alone. `None` when nothing changed.
-fn alias_result_leaves(region: &[Statement], r: &RcLocal) -> Option<Vec<Statement>> {
+fn alias_result_leaves(region: &[Statement], r: &RcLocal, allow_merged: bool) -> Option<Vec<Statement>> {
     let mut out = region.to_vec();
     let mut changed = false;
-    alias_leaf_block(&mut out, r, &mut changed);
+    alias_leaf_block(&mut out, r, allow_merged, &mut changed);
     changed.then_some(out)
 }
 
 fn is_plain_local_write(a: &Assign, r: &RcLocal) -> bool {
     !a.prefix
         && !a.parallel
+        && !a.compound
         && a.left.len() == 1
         && a.right.len() == 1
         && matches!(&a.left[0], LValue::Local(x) if x == r)
 }
 
-fn alias_leaf_block(stmts: &mut Vec<Statement>, r: &RcLocal, changed: &mut bool) {
+fn alias_leaf_block(stmts: &mut Vec<Statement>, r: &RcLocal, allow_merged: bool, changed: &mut bool) {
     let Some(last) = stmts.iter().rposition(|s| !is_match_trivia(s)) else {
         return;
     };
@@ -6713,10 +8979,20 @@ fn alias_leaf_block(stmts: &mut Vec<Statement>, r: &RcLocal, changed: &mut bool)
         collect_written(&then, &mut w);
         collect_written(&els, &mut w);
         if w.contains(r) {
-            alias_leaf_block(&mut then, r, changed);
-            alias_leaf_block(&mut els, r, changed);
             let cond = f.condition.clone();
+            alias_leaf_block(&mut then, r, allow_merged, changed);
+            alias_leaf_block(&mut els, r, allow_merged, changed);
             stmts[last] = Statement::If(If::new(cond, Block(then), Block(els)));
+            // SSA can reuse RESULT for a helper local before the final
+            // branch, then overwrite it only on the selected path. Keep
+            // that local in a fresh temporary and make each leaf's result
+            // explicit before matching, including the unchanged path. The
+            // arms go first: a leaf of theirs reusing RESULT too has its
+            // store made terminal (`r = cache[p]; if not r or ... then ...
+            // r = found; if r then ... end end`).
+            if allow_merged && alias_merged_result(stmts, last, r) {
+                *changed = true;
+            }
             return;
         }
     }
@@ -6775,6 +9051,58 @@ fn alias_leaf_block(stmts: &mut Vec<Statement>, r: &RcLocal, changed: &mut bool)
         compound: false,
     }));
     *changed = true;
+}
+
+/// Matching-only normalization of `R = E; S(R); if c then R = V end`
+/// into `local T = E; S(T); if c then R = V else R = T end`.
+///
+/// The caller requires R to be uncaptured in the whole chunk. Its first
+/// value must be defined before any read, every later store must be a
+/// terminal leaf, and no path may leave the region before that leaf. We
+/// neither move evaluations nor duplicate them: only a private register
+/// and its reads change names. Exact unification still proves the helper
+/// and every argument, and the usual liveness/arity/frame gates still run.
+fn alias_merged_result(stmts: &mut [Statement], last: usize, r: &RcLocal) -> bool {
+    let Some(first) = stmts[..last].iter().position(|statement| {
+        matches!(statement, Statement::Assign(assign) if is_plain_local_write(assign, r))
+    }) else {
+        return false;
+    };
+    if block_reads_local(&stmts[..=first], r)
+        || block_writes_local(&stmts[..first], r)
+        || !result_writes_are_terminal(&stmts[first + 1..=last], r)
+        || has_depth_zero_loop_control(&stmts[first + 1..=last], 0)
+        || closures_capture_any(&stmts[first..=last], std::slice::from_ref(r))
+    {
+        return false;
+    }
+
+    let temp = RcLocal::default();
+    let Statement::Assign(assign) = &mut stmts[first] else { unreachable!() };
+    assign.left[0] = LValue::Local(temp.clone());
+    assign.prefix = true;
+    for statement in &mut stmts[first + 1..=last] {
+        *statement = subst_reads_owned(statement.clone(), r, &temp);
+    }
+    let Statement::If(branch) = &mut stmts[last] else { unreachable!() };
+    complete_result_leaves(&mut branch.then_block.lock().0, r, &temp);
+    complete_result_leaves(&mut branch.else_block.lock().0, r, &temp);
+    true
+}
+
+/// The preceding proof permits only tail stores and fallthrough here.
+/// Preserve explicit stores; a fallthrough path keeps the original value.
+fn complete_result_leaves(stmts: &mut Vec<Statement>, result: &RcLocal, original: &RcLocal) {
+    match stmts.iter_mut().rfind(|statement| !is_match_trivia(statement)) {
+        Some(Statement::Assign(assign)) if is_plain_local_write(assign, result) => return,
+        Some(Statement::If(branch)) => {
+            complete_result_leaves(&mut branch.then_block.lock().0, result, original);
+            complete_result_leaves(&mut branch.else_block.lock().0, result, original);
+            return;
+        }
+        _ => {}
+    }
+    stmts.push(Assign::new(vec![result.clone().into()], vec![original.clone().into()]).into());
 }
 
 /// `s` with every (non-closure) read of `old` replaced by `new`, nested blocks
@@ -6886,17 +9214,36 @@ fn refused<T>(reason: &'static str) -> Option<T> {
     None
 }
 
-fn finish_unified(
+fn finish_unified(t: &Target, cwin: &[Statement], b: Bindings, current_func: Option<FnPtr>) -> Option<Unified> {
+    finish_unified_reading(t, cwin, b, current_func, t.leading())
+}
+
+/// `leading`: the leading reads of the pattern `cwin` unified with, a
+/// specialization's own where the constants folded code away.
+fn finish_unified_reading(
     t: &Target,
     cwin: &[Statement],
     mut b: Bindings,
     // The function the site is in: its registers read alike across calls.
     current_func: Option<FnPtr>,
+    leading: &crate::evaluation_order::LeadingReads,
 ) -> Option<Unified> {
     // A fold variant's equations, proven: the parameters they solve are
     // the call's constant arguments.
+    // A copied upvalue keeps its creation-time value: the helper's and the
+    // site's copies must be taken with no write between them.
+    if !t.captures.copies_agree_at(t.func_ptr as usize, current_func.map(|function| function as usize)) {
+        return refused("copy_capture_changed");
+    }
     if let Err(reason) = resolve_equations(t, &mut b, current_func) {
         return reason.and_then(refused);
+    }
+    // A false truth a select kept the arm of is the argument a reader
+    // expects, as for an inferred one ([`falsy_argument`]).
+    for param in &b.truths {
+        if b.params.get(param).is_some_and(|value| matches!(value, RValue::Literal(Literal::Nil | Literal::Boolean(false)))) {
+            b.params.insert(param.clone(), RValue::Literal(falsy_argument(t, param)));
+        }
     }
     // A specialization variant passes its constant, where nothing the
     // specialization kept (a function literal's capture) read the argument
@@ -6944,6 +9291,7 @@ fn finish_unified(
         .last()
         .is_some_and(|a| matches!(a, RValue::Literal(Literal::Nil)))
         && (t.unread.contains(&t.param_order[args.len() - 1])
+            || b.truths.contains(&t.param_order[args.len() - 1])
             || matches!(&t.inferred, Some((param, InferredTruth::Omitted)) if *param == t.param_order[args.len() - 1]))
     {
         args.pop();
@@ -7002,17 +9350,16 @@ fn finish_unified(
         if written.contains(&idx) {
             continue;
         }
-        if !t.captures.stable_at(a, current_func.map(|function| function as usize)) {
+        let stable = |value: &RValue| t.captures.stable_at(value, current_func.map(|function| function as usize));
+        if !stable(a) && !stable_table(a, &stable) {
             unstable.push((&t.param_order[idx], matches!(a, RValue::Local(_))));
             first_moved.get_or_insert(idx);
         }
-        for r in a.values_read() {
-            if region_writes.contains(r) {
-                return refused("argument_reads_region_write");
-            }
+        if reads_on_evaluation(a).iter().any(|read| region_writes.contains(*read)) {
+            return refused("argument_reads_region_write");
         }
     }
-    if !t.leading().admits(unstable) {
+    if !leading.admits(unstable) {
         return refused("unstable_argument");
     }
     // Each returned local is declared by the pattern, so the site's matching
@@ -7020,9 +9367,19 @@ fn finish_unified(
     let Some(returned) = t.returns.iter().map(|l| b.locals.get(l).cloned()).collect::<Option<Vec<_>>>() else {
         return refused("returned_local_unbound");
     };
+    // A discard target's call hands back the written parameter every leaf
+    // returns: the copy's local for it, which the call declares
+    // ([`absorb_arguments`]).
+    let handed_back = t.returns_parameter.as_ref().filter(|param| t.written_params.contains(param)).and_then(|param| b.locals.get(param).cloned());
     let mut callee_locals: FxHashSet<RcLocal> = b.locals.into_values().collect();
-    for l in &returned {
+    for l in returned.iter().chain(&handed_back) {
         callee_locals.remove(l);
+    }
+    // A select's twin stands for copies whose `and` arms got truthy values.
+    if !t.select_truthy.iter().all(|param| {
+        t.param_order.iter().position(|p| p == param).and_then(|at| args.get(at)).is_some_and(crate::select_value::known_truthy)
+    }) {
+        return refused("select_arm_not_truthy");
     }
     let mut inferred = None;
     if let Some((param, _)) = &t.inferred {
@@ -7060,7 +9417,7 @@ fn resolve_equations(t: &Target, b: &mut Bindings, current_func: Option<FnPtr>) 
     let Some(helpers) = t.fold.as_deref() else { return Ok(()) };
     let equations = std::mem::take(&mut b.equations);
     if equations.is_empty() {
-        return Err(None);
+        return if b.truth_folded { Ok(()) } else { Err(None) };
     }
     if equations.iter().any(|(pattern, _)| t.fold_roots.iter().any(|root| rvalue_exact_eq(root, pattern))) {
         return Err(Some("fold_whole_value"));
@@ -7069,13 +9426,20 @@ fn resolve_equations(t: &Target, b: &mut Bindings, current_func: Option<FnPtr>) 
     // this function refer to: a literal written by hand with another value
     // (`{ time = 0.5 }` beside `linear(6)` copies) stays as it is.
     let caller = t.lines.as_ref().and_then(|lines| lines.caller(current_func));
-    let inside = |literal: &Literal| match (literal, &t.lines, caller, t.proto) {
+    let inside = |pattern: &RValue, literal: &Literal| match (literal, &t.lines, caller, t.proto) {
         (Literal::Number(number), Some(lines), Some(caller), Some(helper)) => {
             lines.copies.constant_in_copies(Some(caller), helper, number.to_bits())
         }
+        // Text holding the helper's own text it concatenates.
+        (Literal::String(site), ..) => text_concat(pattern) && {
+            let RValue::Binary(binary) = pattern else { unreachable!() };
+            [&binary.left, &binary.right].iter().any(|side| {
+                matches!(side.as_ref(), RValue::Literal(Literal::String(text)) if !text.is_empty() && site.windows(text.len()).any(|window| window == text.as_slice()))
+            })
+        },
         _ => false,
     };
-    if !equations.iter().all(|(_, literal)| inside(literal)) {
+    if !equations.iter().all(|(pattern, literal)| inside(pattern, literal)) {
         return Err(Some("fold_constant_outside_copies"));
     }
     let mut known = FxHashMap::default();
@@ -7507,7 +9871,8 @@ fn may_specialize(t: &Target) -> bool {
 }
 
 fn try_unify_specialized_site(t: &Target, cwin: &[Statement], current_func: Option<FnPtr>) -> Option<Unified> {
-    let unified = try_seeded_specialization(t, cwin, current_func).or_else(|| try_inferred_constant(t, cwin, current_func))?;
+    let unified = try_seeded_specialization(t, cwin, current_func, &Bindings::default())
+        .or_else(|| try_inferred_constant(t, cwin, current_func))?;
     // Honesty, part (b): no specialized copy where line info shows none
     // of the helper's code.
     if t.lines.as_ref().is_some_and(|lines| lines.absent(current_func, t.proto)) {
@@ -7516,13 +9881,412 @@ fn try_unify_specialized_site(t: &Target, cwin: &[Statement], current_func: Opti
     Some(unified)
 }
 
-fn try_seeded_specialization(t: &Target, cwin: &[Statement], current_func: Option<FnPtr>) -> Option<Unified> {
+/// Exactly one leading scalar declaration consumed as a direct argument of the
+/// adjacent call. No nested expression, statement, or closure search is needed.
+fn leading_scalar_snapshot(stmts: &[Statement]) -> Option<(&RcLocal, &RValue, usize)> {
+    let [Statement::Assign(assign), Statement::Call(call), ..] = stmts else { return None };
+    let ([LValue::Local(local)], [value]) = (assign.left.as_slice(), assign.right.as_slice()) else { return None };
+    let named = local.0.0.lock().0.is_some();
+    if !assign.prefix || assign.parallel || assign.compound || local.preserve_binding()
+        || (named && !crate::inline_temps::is_generated_temp(local))
+    { return None; }
+    let argument = call.arguments.iter().position(|value| matches!(value, RValue::Local(read) if read == local))?;
+    Some((local, value, argument))
+}
+
+fn concat_literal(value: &RValue) -> bool {
+    matches!(value, RValue::Literal(Literal::String(_) | Literal::Number(_)))
+        // Pi/non-finite numeric spellings can read the environment.
+        && crate::effects::intrinsic(value, &|_| false).is_total_pure()
+}
+
+fn specializable_leading_concat(stmts: &[Statement], params: &FxHashSet<RcLocal>,
+    captures: &crate::deinline_safety::CaptureSafety) -> bool {
+    if !captures.unique_function_bodies() || captures.dynamic_environment() { return false; }
+    let Some((local, RValue::Binary(binary), _)) = leading_scalar_snapshot(stmts) else { return false };
+    let parameter = |value: &RValue| matches!(value, RValue::Local(read) if params.contains(read));
+    binary.operation == BinaryOperation::Concat
+        && [&*binary.left, &*binary.right].into_iter().all(|value| concat_literal(value) || parameter(value))
+        && (parameter(&binary.left) || parameter(&binary.right))
+        && !params.contains(local) && captures.uncaptured(local) && captures.never_reassigned(local)
+        && count_local_reads(stmts, local) == 1
+}
+
+/// Used speculatively only to expose parameter positions to the seed unifier.
+/// The emitted match must separately prove this motion after substitution.
+fn expand_leading_scalar_snapshot(stmts: &mut Vec<Statement>) -> bool {
+    let Some((_, value, argument)) = leading_scalar_snapshot(stmts) else { return false };
+    let value = value.clone();
+    let Statement::Call(call) = &mut stmts[1] else { unreachable!() };
+    call.arguments[argument] = value;
+    stmts.remove(0);
+    true
+}
+
+fn fold_specialized_leading_concat(t: &Target, specialized: &mut Vec<Statement>) -> bool {
+    if t.kind != TKind::Void || t.orphan.is_some()
+        || !specializable_leading_concat(&t.pat, &t.params, &t.captures)
+    { return false; }
+    let Some((local, value, _)) = leading_scalar_snapshot(specialized) else { return false };
+    if leading_scalar_snapshot(&t.pat).is_none_or(|(original, _, _)| original != local) { return false; }
+    // Luau concatenates primitive strings/numbers without invoking a
+    // metamethod. Keep every leaf's ordinary emission proof; unknown values,
+    // booleans, nil, calls and environment-backed literals remain effectful.
+    let nodes = match value {
+        RValue::Literal(Literal::String(_)) => 1,
+        RValue::Binary(binary) if binary.operation == BinaryOperation::Concat
+            && concat_literal(&binary.left) && concat_literal(&binary.right) => 3,
+        _ => return false,
+    };
+    let summary = crate::effects::Summary { effects: crate::effects::Effects::ALLOCATION, nodes, exhausted: false };
+    if !crate::evaluation_order::can_sink_with_summary(&specialized[1], local, value,
+        &|read| !t.captures.uncaptured(read), &|_| false, summary)
+    { return false; }
+    expand_leading_scalar_snapshot(specialized)
+}
+
+/// Whether the constants of `params` fold a builtin call of `t`'s body that
+/// specialization folds (`math.pow(10, places)` as 100), directly or through
+/// a local declared from them, where a call of the helper written with a
+/// literal there (`round(x, 2)`) groups that builtin call to keep it a call
+/// (`preserve_builtin_calls`): the helper's one body cannot also be the
+/// copy that folded it.
+fn folds_builtin_of_written_literal(t: &Target, params: &FxHashMap<RcLocal, RValue>) -> bool {
+    fn folds(value: &RValue, constant: &[RcLocal]) -> bool {
+        match value {
+            RValue::Call(call) | RValue::Select(Select::Call(call))
+                if fold::specialization_folds(call)
+                    && call.arguments.iter().any(|argument| constant.iter().any(|local| fold::reads(argument, local) > 0)) => true,
+            RValue::Closure(_) => false,
+            _ => !value.visit_rvalues(&mut |child| !folds(child, constant)),
+        }
+    }
+    fn block(stmts: &[Statement], constant: &mut Vec<RcLocal>) -> bool {
+        stmts.iter().any(|statement| {
+            if let Statement::Assign(assign) = statement
+                && assign.prefix
+                && let ([LValue::Local(local)], [value]) = (assign.left.as_slice(), assign.right.as_slice())
+                && constant.iter().any(|read| fold::reads(value, read) > 0)
+            {
+                constant.push(local.clone());
+            }
+            !visit_stmt_rvalues(statement, &mut |value| !folds(value, constant))
+                || nested_blocks(statement).iter().any(|nested| block(&nested.lock().0, constant))
+        })
+    }
+    let mut constant: Vec<RcLocal> = t.param_order.iter().enumerate()
+        .filter(|(index, param)| matches!(params.get(*param), Some(RValue::Literal(_))) && t.captures.literal_argument(&t.f_local, *index))
+        .map(|(_, param)| param.clone())
+        .collect();
+    !constant.is_empty() && block(&t.pat, &mut constant)
+}
+
+/// The number constants `pat` refers to, its function literals' aside.
+fn pattern_numbers(pat: &[Statement]) -> FxHashSet<u64> {
+    fn numbers_in(value: &RValue, numbers: &mut FxHashSet<u64>) {
+        match value {
+            RValue::Literal(Literal::Number(number)) => {
+                numbers.insert(number.to_bits());
+            }
+            RValue::Closure(_) => {}
+            _ => {
+                value.visit_rvalues(&mut |child| {
+                    numbers_in(child, numbers);
+                    true
+                });
+            }
+        }
+    }
+    fn block(stmts: &[Statement], numbers: &mut FxHashSet<u64>) {
+        for statement in stmts {
+            visit_stmt_rvalues(statement, &mut |rvalue| {
+                numbers_in(rvalue, numbers);
+                true
+            });
+            for nested in nested_blocks(statement) {
+                block(&nested.lock().0, numbers);
+            }
+        }
+    }
+    let mut numbers = FxHashSet::default();
+    block(pat, &mut numbers);
+    numbers
+}
+
+/// The top-level statements of `pat` constant arguments fold away through
+/// its declarations from parameters alone: each such declaration Luau
+/// folds (`local factor = math.pow(10, places)`, and one from those in
+/// turn), and each `if` whose condition they decide. Constants put them
+/// into their reads ([`fold_constant_locals`]). With whether the first
+/// statement is one.
+fn foldable_statements(pat: &[Statement], params: &FxHashSet<RcLocal>) -> (usize, bool) {
+    let no_helpers = fold::PureHelpers::default();
+    let mut folded: Vec<RcLocal> = Vec::new();
+    let constant = |local: &RcLocal, folded: &[RcLocal]| params.contains(local) || folded.contains(local);
+    let decided = |value: &RValue, folded: &[RcLocal]| {
+        params.iter().chain(folded).any(|local| fold::reads(value, local) > 0)
+            && fold::foldable(value, &|local| constant(local, folded), &no_helpers)
+    };
+    let mut count = 0;
+    let mut head = false;
+    for (index, statement) in pat.iter().enumerate() {
+        let folds = match statement {
+            Statement::Assign(assign) if assign.prefix && !assign.parallel => {
+                if let ([LValue::Local(local)], [value]) = (assign.left.as_slice(), assign.right.as_slice())
+                    && !matches!(value, RValue::Literal(_) | RValue::Local(_) | RValue::Closure(_))
+                    && decided(value, &folded)
+                {
+                    folded.push(local.clone());
+                    true
+                } else {
+                    false
+                }
+            }
+            Statement::If(branch) => !folded.is_empty() && decided(&branch.condition, &folded),
+            _ => false,
+        };
+        count += usize::from(folds);
+        head |= folds && index == 0;
+    }
+    (count, head)
+}
+
+/// The pattern with each local it declares from parameters alone (`local
+/// key = `LastApplied{name}``) put where it is read, to seed through: a
+/// constant argument made such a local constant in the copy, where Luau
+/// folded it into its reads (`state.LastAppliedEnabled`,
+/// [`fold_constant_locals`]). `None` where the pattern declares none.
+fn through_parameter_locals(t: &Target) -> Option<Vec<Statement>> {
+    let mut locals = FxHashMap::default();
+    for statement in &t.pat {
+        if let Statement::Assign(assign) = statement
+            && let (true, false, [LValue::Local(local)], [value]) = (assign.prefix, assign.parallel, assign.left.as_slice(), assign.right.as_slice())
+            && !matches!(value, RValue::Literal(_) | RValue::Local(_) | RValue::Closure(_))
+            && let reads = value.values_read()
+            && !reads.is_empty()
+            && reads.iter().all(|read| t.params.contains(*read))
+        {
+            locals.insert(local.clone(), value.clone());
+        }
+    }
+    if locals.is_empty() {
+        return None;
+    }
+    let mut pattern = canon(&t.pat);
+    drop_declarations(&mut pattern, &locals);
+    specialize_block(&mut pattern, &locals);
+    specialize_lvalue_keys(&mut pattern, &locals);
+    Some(pattern)
+}
+
+/// Luau folds a local nothing assigns again whose value is constant: one a
+/// constant argument made so (`local key = `LastApplied{name}`` given
+/// `"Enabled"`) is only that constant where the copy reads it, its
+/// declaration gone. Folds those of `stmts`, a specialization of
+/// `pattern`, and what they make constant in turn; the helper's own
+/// constant declarations stay, as its bytecode kept them. `false` where a
+/// read is left that no constant took.
+fn fold_constant_locals(stmts: &mut Vec<Statement>, pattern: &[Statement]) -> bool {
+    let mut own = FxHashMap::default();
+    constant_declarations(pattern, &mut own);
+    loop {
+        let mut constants = FxHashMap::default();
+        constant_declarations(stmts, &mut constants);
+        constants.retain(|local, _| {
+            !own.contains_key(local) && assignments(stmts, local) == 1 && !closures_capture_any(stmts, std::slice::from_ref(local))
+        });
+        if constants.is_empty() {
+            return true;
+        }
+        drop_declarations(stmts, &constants);
+        specialize_block(stmts, &constants);
+        specialize_lvalue_keys(stmts, &constants);
+        if constants.keys().any(|local| local_queries::reads(stmts, local)) {
+            return false;
+        }
+    }
+}
+
+/// The copy as the decompiler shows it: SSA puts the constant a local of
+/// the copy holds where it is read (`local text = "Gift Box"; text ..=
+/// "es"`, once the constants pruned the branch around the store, is
+/// `"Gift Boxes"` in place). Propagates the locals of `stmts` every store
+/// of which is a statement of its own giving a constant; `false` where
+/// there are none, or a read is left that no constant took.
+fn propagate_literal_locals(stmts: &mut Vec<Statement>) -> bool {
+    fn store_of(statement: &Statement) -> Option<&RcLocal> {
+        match statement {
+            Statement::Assign(assign) if !assign.parallel && !assign.compound && assign.right.len() == 1 => match assign.left.as_slice() {
+                [LValue::Local(local)] => Some(local),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    let mut candidates: FxHashSet<RcLocal> = stmts
+        .iter()
+        .filter(|statement| matches!(statement, Statement::Assign(assign) if assign.prefix))
+        .filter_map(store_of)
+        .cloned()
+        .collect();
+    candidates.retain(|local| {
+        assignments(stmts, local) == stmts.iter().filter(|statement| store_of(statement) == Some(local)).count()
+            && !closures_capture_any(stmts, std::slice::from_ref(local))
+    });
+    // The constant each store gives, in order: a local one of whose stores
+    // gives none is left, and what read it.
+    let values = loop {
+        let mut known = FxHashMap::default();
+        let mut stores = Vec::new();
+        let mut failed = None;
+        for statement in stmts.iter() {
+            let Some(local) = store_of(statement).filter(|local| candidates.contains(*local)) else { continue };
+            let Statement::Assign(assign) = statement else { unreachable!() };
+            let mut value = assign.right[0].clone();
+            specialize_rvalue(&mut value, &known);
+            let value = value.reduce();
+            if !matches!(value, RValue::Literal(_)) {
+                failed = Some(local.clone());
+                break;
+            }
+            known.insert(local.clone(), value.clone());
+            stores.push(value);
+        }
+        match failed {
+            Some(local) => {
+                candidates.remove(&local);
+            }
+            None => break stores,
+        }
+    };
+    if candidates.is_empty() {
+        return false;
+    }
+    let mut known = FxHashMap::default();
+    let mut values = values.into_iter();
+    let mut out = Vec::with_capacity(stmts.len());
+    for statement in std::mem::take(stmts) {
+        if let Some(local) = store_of(&statement).filter(|local| candidates.contains(*local)) {
+            known.insert(local.clone(), values.next().unwrap());
+            continue;
+        }
+        let mut one = vec![statement];
+        specialize_block(&mut one, &known);
+        specialize_lvalue_keys(&mut one, &known);
+        out.extend(one);
+    }
+    *stmts = out;
+    !candidates.iter().any(|local| local_queries::reads(stmts, local))
+}
+
+/// `local x = K` of `stmts`, `K` a constant Luau folds, at any depth.
+fn constant_declarations(stmts: &[Statement], out: &mut FxHashMap<RcLocal, RValue>) {
+    for statement in stmts {
+        if let Statement::Assign(assign) = statement
+            && assign.prefix
+            && !assign.parallel
+            && !assign.compound
+            && let ([LValue::Local(local)], [value @ RValue::Literal(Literal::Nil | Literal::Boolean(_) | Literal::Number(_) | Literal::String(_))]) =
+                (assign.left.as_slice(), assign.right.as_slice())
+        {
+            out.insert(local.clone(), value.clone());
+        }
+        for block in nested_blocks(statement) {
+            constant_declarations(&block.lock().0, out);
+        }
+    }
+}
+
+/// How many assignments of `stmts` write `local`, at any depth.
+fn assignments(stmts: &[Statement], local: &RcLocal) -> usize {
+    stmts
+        .iter()
+        .map(|statement| {
+            let own = matches!(statement, Statement::Assign(assign) if assign.left.iter().any(|left| matches!(left, LValue::Local(written) if written == local)));
+            own as usize + nested_blocks(statement).iter().map(|block| assignments(&block.lock().0, local)).sum::<usize>()
+        })
+        .sum()
+}
+
+fn drop_declarations(stmts: &mut Vec<Statement>, locals: &FxHashMap<RcLocal, RValue>) {
+    stmts.retain(|statement| {
+        !matches!(statement, Statement::Assign(assign) if assign.prefix && matches!(assign.left.as_slice(), [LValue::Local(local)] if locals.contains_key(local)))
+    });
+    for statement in stmts.iter() {
+        for block in nested_blocks(statement) {
+            drop_declarations(&mut block.lock().0, locals);
+        }
+    }
+}
+
+/// [`specialize_block`] of what an assignment indexes (`p[key] = v`).
+fn specialize_lvalue_keys(stmts: &mut [Statement], bindings: &FxHashMap<RcLocal, RValue>) {
+    for statement in stmts.iter_mut() {
+        if let Statement::Assign(assign) = statement {
+            for left in &mut assign.left {
+                if let LValue::Index(index) = left {
+                    specialize_rvalue(&mut index.left, bindings);
+                    specialize_rvalue(&mut index.right, bindings);
+                }
+            }
+        }
+        for block in nested_blocks(statement) {
+            specialize_lvalue_keys(&mut block.lock().0, bindings);
+        }
+    }
+}
+
+/// `site`: the result binding the window's store fixes, if any
+/// ([`match_assigned_value`]); only its `result` and `assigned` are read.
+fn try_seeded_specialization(t: &Target, cwin: &[Statement], current_func: Option<FnPtr>, site: &Bindings) -> Option<Unified> {
     if !t.specializable || t.params.is_empty() {
         return None;
     }
 
     let mut seed = Bindings::default();
     seed_unify_block(t, &t.pat, cwin, &mut seed);
+    let complete_seed = |seed: &Bindings| seed.params.values().any(|value| matches!(value, RValue::Literal(_)))
+        && t.param_order.iter().all(|param| seed.params.contains_key(param) || t.unread.contains(param));
+    if !complete_seed(&seed) && t.kind == TKind::Void && t.orphan.is_none()
+        && specializable_leading_concat(&t.pat, &t.params, &t.captures)
+    {
+        let mut seed_pattern = canon(&t.pat);
+        if expand_leading_scalar_snapshot(&mut seed_pattern) {
+            seed = Bindings::default();
+            seed_unify_block(t, &seed_pattern, cwin, &mut seed);
+        }
+    }
+    if !complete_seed(&seed)
+        && let Some(aligned) = seed_aligned(t, cwin)
+    {
+        seed = aligned;
+    }
+    if !complete_seed(&seed)
+        && let Some(through) = through_parameter_locals(t)
+    {
+        // Through them, a value of parameters alone meets a number of the
+        // copy where the constants folded it (`math.pow(10, places)` as 100).
+        let no_helpers = fold::PureHelpers::default();
+        let helpers = t.fold.as_deref().unwrap_or(&no_helpers);
+        let mut deep = Bindings::default();
+        seed_unify_block_in(&MatchCtx { fold: Some(helpers), ..t.ctx() }, &through, cwin, &mut deep);
+        if solve_seed_equations(t, &mut deep, helpers).is_some() && complete_seed(&deep) {
+            seed = deep;
+        }
+    }
+    // A truth the copy's select kept (`flag and 0 or 1` as `1`) is the
+    // falsy argument a reader expects of the parameter, as `seed_aligned`
+    // gives it.
+    for param in seed.truths.clone() {
+        if matches!(seed.params.get(&param), Some(RValue::Literal(Literal::Nil))) {
+            let literal = falsy_argument(t, &param);
+            if literal == Literal::Nil {
+                if !seed.left_out.contains(&param) { seed.left_out.push(param.clone()); }
+            } else {
+                seed.params.insert(param, RValue::Literal(literal));
+            }
+        }
+    }
     if !seed
         .params
         .values()
@@ -7530,11 +10294,18 @@ fn try_seeded_specialization(t: &Target, cwin: &[Statement], current_func: Optio
     {
         return None;
     }
-    if t.param_order
-        .iter()
-        .any(|param| !seed.params.contains_key(param) && !t.unread.contains(param))
-    {
-        return None;
+    // A parameter only a branch the constants dropped reads (`slot` where
+    // `kind` is "Stats"): passed `nil`, which nothing then reads.
+    let missing: Vec<RcLocal> = t.param_order.iter().filter(|param| !seed.params.contains_key(*param) && !t.unread.contains(*param)).cloned().collect();
+    if !missing.is_empty() {
+        let mut probe = canon(&t.pat);
+        specialize_block(&mut probe, &seed.params);
+        if !fold_constant_locals(&mut probe, &t.pat) || missing.iter().any(|param| local_queries::reads(&probe, param)) {
+            return None;
+        }
+        for param in missing {
+            seed.params.insert(param, RValue::Literal(Literal::Nil));
+        }
     }
     // Seeding intentionally tolerates structural mismatches, but substituting a
     // repeated identity-producing argument (`{}` / closure-valued if-expression)
@@ -7550,18 +10321,60 @@ fn try_seeded_specialization(t: &Target, cwin: &[Statement], current_func: Optio
 
     // `canon` deep-copies every block-bearing statement, avoiding mutation of
     // the recovered function body's shared Arcs while we prune constant arms.
+    if folds_builtin_of_written_literal(t, &seed.params) {
+        return refused("folded_builtin_of_written_literal");
+    }
     let mut specialized = canon(&t.pat);
     specialize_block(&mut specialized, &seed.params);
-    let specialized = canon(&specialized);
-
-    let mut verified = Bindings {
-        params: seed.params,
-        ..Bindings::default()
-    };
-    if unify_block(t, &specialized, cwin, &mut verified).is_err() {
+    if !fold_constant_locals(&mut specialized, &t.pat) {
         return None;
     }
-    let unified = finish_unified(t, cwin, verified, current_func)?;
+    fold_specialized_table_stores(&mut specialized);
+    call_unread_specialized_locals(&mut specialized);
+    let mut specialized = canon(&specialized);
+
+    let fresh = || Bindings { params: seed.params.clone(), result: site.result.clone(), assigned: site.assigned, ..Bindings::default() };
+    let mut verified = fresh();
+    if unify_block(t, &specialized, cwin, &mut verified).is_err() {
+        // Literal substitution can make an earlier scalar or callee snapshot
+        // redundant. The ordinary pattern still needs it. Only mutate this owned specialized pattern;
+        // nested Function bodies remain shared and must not be traversed.
+        // Detached orphan bodies (including their nested captures) are absent
+        // from the full-tree census until a proven call materializes them.
+        let snapshots = t.orphan.is_none() && {
+            let concat = fold_specialized_leading_concat(t, &mut specialized);
+            let imports = crate::fold_import_callees::fold_specialized_import_callees(&mut specialized, &t.captures);
+            concat || imports
+        };
+        verified = fresh();
+        if !snapshots || unify_block(t, &specialized, cwin, &mut verified).is_err() {
+            if !propagate_literal_locals(&mut specialized) {
+                return None;
+            }
+            specialized = canon(&specialized);
+            verified = fresh();
+            unify_block(t, &specialized, cwin, &mut verified).ok()?;
+        }
+    }
+    // The copy reads its arguments where the body specialized to its
+    // constants alone reads them: the code they folded away
+    // (`math.pow(10, places)`) ran nothing before.
+    let constants: FxHashMap<RcLocal, RValue> =
+        seed.params.iter().filter(|(_, value)| matches!(value, RValue::Literal(_))).map(|(p, v)| (p.clone(), v.clone())).collect();
+    let mut reading = canon(&t.pat);
+    specialize_block(&mut reading, &constants);
+    let leading = if fold_constant_locals(&mut reading, &t.pat) { t.leading_reads_of(&reading) } else { t.leading().clone() };
+    let mut unified = finish_unified_reading(t, cwin, verified, current_func, &leading)?;
+    while matches!(unified.args.last(), Some(RValue::Literal(Literal::Nil)))
+        && seed.left_out.contains(&t.param_order[unified.args.len() - 1])
+    {
+        unified.args.pop();
+    }
+    // A constant inferred from a branch's truth alone: weighed, and checked
+    // against a pruned branch following the window, as a variant's.
+    if unified.inferred.is_none() {
+        unified.inferred = seed.truths.first().cloned();
+    }
     if !specialization_is_honest(t, cwin, &unified.args) {
         return refused("specialization_no_larger_than_call");
     }
@@ -7635,17 +10448,96 @@ fn try_inferred_constant(t: &Target, cwin: &[Statement], current_func: Option<Fn
         let truthy = try_truth(t, cwin, current_func, index, InferredTruth::True);
         // A flag passed last that only switches extra work on reads `nil`
         // alike: left out where `nil` gives the copy too ([`omittable`]).
-        let preferred = if optional || omittable(t, param) { InferredTruth::Nil } else { InferredTruth::False };
+        let preferred = if falsy_argument(t, param) == Literal::Nil { InferredTruth::Nil } else { InferredTruth::False };
         let other = if preferred == InferredTruth::Nil { InferredTruth::False } else { InferredTruth::Nil };
         let falsy = try_truth(t, cwin, current_func, index, preferred)
             .or_else(|| try_truth(t, cwin, current_func, index, other));
         match (truthy, falsy) {
+            // An argument left out where any constant gives the copy (`typeof(d)
+            // == "string"` folded alike for `nil` and `true`): the call reads
+            // as the copy's source did, without it.
+            (Some(_), Some(unified)) if optional && t.trailing(param) => return Some(unified),
             (Some(_), Some(_)) => return None,
             (Some(unified), None) | (None, Some(unified)) => return Some(unified),
             (None, None) => {}
         }
     }
-    None
+    try_site_constant(t, cwin, current_func)
+}
+
+/// A constant argument the copy shows where the helper reads the parameter
+/// after testing its type, which Luau folded (`return if typeof(d) ==
+/// "string" then d else ""` storing `"fallback"`): a literal of the site
+/// the helper's body holds nowhere, tried for each such parameter, is it
+/// where it alone specializes the body into the copy exactly
+/// (`pickAsset("shop", "icon", "fallback")`).
+fn try_site_constant(t: &Target, cwin: &[Statement], current_func: Option<FnPtr>) -> Option<Unified> {
+    const MAX_CANDIDATES: usize = 4;
+    fn each_value(stmts: &[Statement], visit: &mut impl FnMut(&RValue)) {
+        for statement in stmts {
+            statement.traverse_rvalues_ref(&mut |value| visit(value));
+            for block in nested_blocks(statement) {
+                each_value(&block.lock().0, visit);
+            }
+        }
+    }
+    let tested: Vec<&RcLocal> = t
+        .truth_params
+        .iter()
+        .filter(|param| {
+            let mut found = false;
+            each_value(&t.pat, &mut |value| found |= type_tested_param(value) == Some(*param));
+            found
+        })
+        .collect();
+    if tested.is_empty() {
+        return None;
+    }
+    let mut own: Vec<Literal> = Vec::new();
+    each_value(&t.pat, &mut |value| {
+        if let RValue::Literal(literal) = value {
+            own.push(literal.clone());
+        }
+    });
+    let mut candidates: Vec<Literal> = Vec::new();
+    each_value(cwin, &mut |value| {
+        if let RValue::Literal(literal @ (Literal::String(_) | Literal::Number(_))) = value
+            && !own.contains(literal)
+            && !candidates.contains(literal)
+        {
+            candidates.push(literal.clone());
+        }
+    });
+    if candidates.is_empty() || candidates.len() > MAX_CANDIDATES {
+        return None;
+    }
+    let mut found = None;
+    for param in tested {
+        for literal in &candidates {
+            let mut specialized = canon(&t.pat);
+            specialize_block(&mut specialized, &FxHashMap::from_iter([(param.clone(), RValue::Literal(literal.clone()))]));
+            let specialized = canon(&specialized);
+            if specialized.len() != cwin.len() || !charge_unify(t, cwin) {
+                continue;
+            }
+            let mut bindings = Bindings::default();
+            if unify_block(t, &specialized, cwin, &mut bindings).is_err() || bindings.params.contains_key(param) {
+                continue;
+            }
+            bindings.params.insert(param.clone(), RValue::Literal(literal.clone()));
+            let Some(mut unified) = finish_unified(t, cwin, bindings, current_func) else { continue };
+            unified.inferred = Some(param.clone());
+            if found.is_some() {
+                return None;
+            }
+            found = Some(unified);
+        }
+    }
+    let unified = found?;
+    if !specialization_is_honest(t, cwin, &unified.args) {
+        return refused("specialization_no_larger_than_call");
+    }
+    Some(unified)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
@@ -7666,6 +10558,14 @@ impl InferredTruth {
             InferredTruth::Nil | InferredTruth::Omitted => Literal::Nil,
         }
     }
+}
+
+/// The false argument a call passes for a truth parameter its copy kept no
+/// trace of: `nil`, left out when last, for an optional one or a flag that
+/// only switches extra work on ([`omittable`]); else `false`, what a reader
+/// expects of a setter (`setVisible(p, false)` for `visible and 0 or 1`).
+fn falsy_argument(t: &Target, param: &RcLocal) -> Literal {
+    if t.optional_params.contains(param) || omittable(t, param) { Literal::Nil } else { Literal::Boolean(false) }
 }
 
 /// Whether a constant `false` inferred for truth parameter `param` of `t`
@@ -7809,7 +10709,12 @@ fn truth_tested_params(
                 truth(&binary.left, params, found);
                 truth(&binary.right, params, found);
             }
-            other => operands(other, params, found),
+            other => {
+                if let Some(param) = type_tested_param(other).filter(|param| params.contains(*param)) {
+                    found.truth.insert(param.clone());
+                }
+                operands(other, params, found)
+            }
         }
     }
     // `p or default` gives `p` itself where it is true.
@@ -7901,95 +10806,611 @@ fn truth_tested_params(
 /// mismatch is expected for a specialized site, so failures are ignored here;
 /// every harvested binding is re-checked by `unify_block` after specialization.
 fn seed_unify_block(t: &Target, pattern: &[Statement], candidate: &[Statement], b: &mut Bindings) {
+    seed_unify_block_in(&t.ctx(), pattern, candidate, b);
+}
+
+fn seed_unify_block_in(ctx: &MatchCtx, pattern: &[Statement], candidate: &[Statement], b: &mut Bindings) {
     for (left, right) in pattern.iter().zip(candidate) {
-        seed_unify_stmt(t, left, right, b);
+        seed_unify_stmt(ctx, left, right, b);
     }
     // A removed leading branch shifts the rest: align from the end too.
     if pattern.len() != candidate.len() {
         for (left, right) in pattern.iter().rev().zip(candidate.iter().rev()) {
-            seed_unify_stmt(t, left, right, b);
+            seed_unify_stmt(ctx, left, right, b);
         }
     }
 }
 
-fn seed_unify_values(ctx: &MatchCtx, pattern: &[RValue], candidate: &[RValue], b: &mut Bindings) {
-    for (left, right) in pattern.iter().zip(candidate) {
-        let _ = unify_rvalue(ctx, left, right, b);
+/// Steps an aligned seeding may take for one window ([`seed_aligned`]).
+const ALIGN_BUDGET: usize = 256;
+
+/// Seeds for a copy whose constant arguments Luau folded through branches
+/// and values ([`try_seeded_specialization`]), where the positional seeding
+/// leaves a parameter unbound: the pattern is walked against the window
+/// statement by statement, an `if` whose condition reads a parameter
+/// standing for an `if` of the site or for one of its arms taken whole (the
+/// constants decided it: `collect(1, nil, 3)` keeps `list[1] = a` and drops
+/// `list[2] = b`). An aligned pair binds what it shows, a value computed
+/// from parameters only that meets a number of the site gives an equation
+/// (`1 * p` as `3`), and an arm taken on a bare parameter tells its truth.
+/// Nothing here is trusted: the specialization these seeds give must unify
+/// with the site exactly.
+fn seed_aligned(t: &Target, candidate: &[Statement]) -> Option<Bindings> {
+    let no_helpers = fold::PureHelpers::default();
+    let helpers = t.fold.as_deref().unwrap_or(&no_helpers);
+    let ctx = MatchCtx { fold: Some(helpers), ..t.ctx() };
+    let mut budget = ALIGN_BUDGET;
+    if !candidate.first().is_some_and(|first| may_open_specialized_copy(t, &t.pat, first, 0)) {
+        return None;
+    }
+    let (mut b, truths) = align_seed(t, &ctx, &t.pat, None, candidate, Bindings::default(), Vec::new(), &mut budget)?;
+    solve_seed_equations(t, &mut b, helpers)?;
+    // A parameter only an arm's choice reads: its truth is all the copy keeps.
+    for (param, truth) in truths {
+        if !b.params.contains_key(&param) {
+            b.truths.push(param.clone());
+            let literal = if truth { Literal::Boolean(true) } else { falsy_argument(t, &param) };
+            if literal == Literal::Nil {
+                b.left_out.push(param.clone());
+            }
+            b.params.insert(param, RValue::Literal(literal));
+        }
+    }
+    Some(b)
+}
+
+/// The parameters the seeding's equations ([`Bindings::equations`]) give,
+/// bound to their constants; `None` where they hold no solution.
+fn solve_seed_equations(t: &Target, b: &mut Bindings, helpers: &fold::PureHelpers) -> Option<()> {
+    let equations = std::mem::take(&mut b.equations);
+    if equations.is_empty() {
+        return Some(());
+    }
+    let mut known = FxHashMap::default();
+    let mut unknowns = Vec::new();
+    for param in &t.param_order {
+        match b.params.get(param) {
+            Some(RValue::Literal(literal)) => {
+                known.insert(param.clone(), fold::Value::of(literal)?);
+            }
+            Some(_) => {}
+            None if equations.iter().any(|(pattern, _)| fold::reads(pattern, param) > 0) => unknowns.push(param.clone()),
+            None => {}
+        }
+    }
+    for (param, value) in fold::solve_equations(&equations, &known, &unknowns, helpers)? {
+        b.params.entry(param).or_insert_with(|| RValue::Literal(value.literal()));
+    }
+    Some(())
+}
+
+/// The copy went through the SSA fold of the stores right after a table
+/// constructor into it (`cfg::ssa::inline`); a store the specialization
+/// brings next to its constructor, from an arm the constants took, folds the
+/// same way, keyed: `local t = {}; t[1] = a` is `local t = { [1] = a }`.
+/// Only appends: a store the fold would merge into a listed entry stays.
+/// A local the specialization left unread (`local now = os.clock()` once
+/// the branches reading `now` folded away), declared from a call: the copy
+/// keeps the call alone, as a statement.
+fn call_unread_specialized_locals(stmts: &mut [Statement]) {
+    fn walk(stmts: &mut [Statement], reads: &FxHashSet<RcLocal>) {
+        for statement in stmts.iter_mut() {
+            for block in nested_blocks(statement) {
+                walk(&mut block.lock().0, reads);
+            }
+            let Statement::Assign(declaration) = &*statement else { continue };
+            let (true, [LValue::Local(local)], [value]) = (declaration.prefix, declaration.left.as_slice(), declaration.right.as_slice()) else {
+                continue;
+            };
+            if declaration.parallel || declaration.compound || reads.contains(local) {
+                continue;
+            }
+            *statement = match value {
+                RValue::Call(call) | RValue::Select(Select::Call(call)) => Statement::Call(call.clone()),
+                RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call)) => Statement::MethodCall(call.clone()),
+                _ => continue,
+            };
+        }
+    }
+    let mut reads = FxHashSet::default();
+    collect_reads(stmts, &mut reads);
+    walk(stmts, &reads);
+}
+
+fn fold_specialized_table_stores(stmts: &mut Vec<Statement>) {
+    for statement in stmts.iter_mut() {
+        for block in nested_blocks(statement) {
+            fold_specialized_table_stores(&mut block.lock().0);
+        }
+    }
+    let mut index = 0;
+    while index < stmts.len() {
+        let object = match &stmts[index] {
+            Statement::Assign(assign)
+                if assign.left.len() == 1 && assign.right.len() == 1 && matches!(assign.right[0], RValue::Table(_)) =>
+            {
+                match &assign.left[0] {
+                    LValue::Local(object) => object.clone(),
+                    _ => {
+                        index += 1;
+                        continue;
+                    }
+                }
+            }
+            _ => {
+                index += 1;
+                continue;
+            }
+        };
+        while let Some(Statement::Assign(store)) = stmts.get(index + 1)
+            && let ([LValue::Index(target)], [value]) = (store.left.as_slice(), store.right.as_slice())
+            && matches!(target.left.as_ref(), RValue::Local(local) if *local == object)
+            && !store.prefix
+            && !target.right.has_side_effects()
+            && !reads_local(&target.right, &object)
+            && !reads_local(value, &object)
+        {
+            let Statement::Assign(declaration) = &stmts[index] else { unreachable!() };
+            let RValue::Table(table) = &declaration.right[0] else { unreachable!() };
+            let key = target.right.as_ref();
+            if table.0.last().is_some_and(|(key, value)| key.is_none() && matches!(value, RValue::Call(_) | RValue::MethodCall(_) | RValue::VarArg(_)))
+                || crate::ListedKeys::new(table).lists(table, key)
+                || !crate::table_takes_another_key(table, key)
+            {
+                break;
+            }
+            let (key, value) = (key.clone(), value.clone());
+            stmts.remove(index + 1);
+            let Statement::Assign(declaration) = &mut stmts[index] else { unreachable!() };
+            let RValue::Table(table) = &mut declaration.right[0] else { unreachable!() };
+            table.0.push((Some(key), value));
+        }
+        index += 1;
     }
 }
 
-fn seed_unify_stmt(t: &Target, pattern: &Statement, candidate: &Statement, b: &mut Bindings) {
-    let ctx = t.ctx();
+/// The site statement `local v = { ..., [k] = x }` aligned with a pattern
+/// constructor of fewer entries: the declaration with the pattern's count,
+/// then the other keyed entries as the stores SSA folded (`v[k] = x`).
+fn unfold_site_entries(pattern: &Statement, site: &Statement) -> Option<Vec<Statement>> {
+    let (Statement::Assign(left), Statement::Assign(right)) = (pattern, site) else { return None };
+    let ([_], [RValue::Table(pattern_table)], [LValue::Local(object)], [RValue::Table(site_table)]) =
+        (left.left.as_slice(), left.right.as_slice(), right.left.as_slice(), right.right.as_slice())
+    else {
+        return None;
+    };
+    let kept = pattern_table.0.len();
+    if site_table.0.len() <= kept || site_table.0[kept..].iter().any(|(key, _)| key.is_none()) {
+        return None;
+    }
+    let mut declaration = right.clone();
+    let RValue::Table(table) = &mut declaration.right[0] else { unreachable!() };
+    let stores = table.0.split_off(kept);
+    let mut unfolded = vec![Statement::Assign(declaration)];
+    for (key, value) in stores {
+        let target = crate::Index::new(RValue::Local(object.clone()), key.unwrap());
+        unfolded.push(Assign::new(vec![LValue::Index(target)], vec![value]).into());
+    }
+    Some(unfolded)
+}
+
+/// The parameter a condition tests bare (`p`, `not p`), and the truth that
+/// takes the then arm.
+fn bare_truth_test<'a>(condition: &'a RValue, params: &FxHashSet<RcLocal>) -> Option<(&'a RcLocal, bool)> {
+    match condition {
+        RValue::Local(local) if params.contains(local) => Some((local, true)),
+        RValue::Unary(unary) if unary.operation == UnaryOperation::Not => match unary.value.as_ref() {
+            RValue::Local(local) if params.contains(local) => Some((local, false)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// `c and a or b` where `c` is a bare parameter or its `not`: the
+/// parameter, whether `c` is it itself, and the two arms.
+fn parameter_select<'a>(value: &'a RValue, params: &FxHashSet<RcLocal>) -> Option<(&'a RcLocal, bool, &'a RValue, &'a RValue)> {
+    let RValue::Binary(or) = value else { return None };
+    let RValue::Binary(and) = or.left.as_ref() else { return None };
+    if or.operation != BinaryOperation::Or || and.operation != BinaryOperation::And {
+        return None;
+    }
+    let (param, positive) = bare_truth_test(&and.left, params)?;
+    Some((param, positive, &and.right, &or.right))
+}
+
+/// What follows a run of pattern statements being aligned ([`align_seed`]).
+struct AlignRest<'a> {
+    statements: &'a [Statement],
+    then: Option<&'a AlignRest<'a>>,
+}
+
+/// [`seed_aligned`]'s walk: the bindings and truths of the first alignment
+/// of all of `pattern`, then of what follows it, with all of `candidate`.
+#[allow(clippy::too_many_arguments)]
+fn align_seed(
+    t: &Target,
+    ctx: &MatchCtx,
+    pattern: &[Statement],
+    then: Option<&AlignRest>,
+    candidate: &[Statement],
+    b: Bindings,
+    truths: Vec<(RcLocal, bool)>,
+    budget: &mut usize,
+) -> Option<(Bindings, Vec<(RcLocal, bool)>)> {
+    *budget = budget.checked_sub(1)?;
+    let Some((head, rest)) = pattern.split_first() else {
+        return match then {
+            Some(next) => align_seed(t, ctx, next.statements, next.then, candidate, b, truths, budget),
+            None => candidate.is_empty().then_some((b, truths)),
+        };
+    };
+    // A value pattern's last `return` is the site's result, which the exact
+    // unification maps: none, or the store of it a value form adds.
+    if let Statement::Return(ret) = head
+        && rest.is_empty()
+        && then.is_none()
+    {
+        return match candidate {
+            [] => Some((b, truths)),
+            [Statement::Assign(store)] if ret.values.len() == 1 && store.left.len() == 1 && store.right.len() == 1 => {
+                let mut b = b;
+                seed_unify_values(ctx, &ret.values, &store.right, &mut b);
+                Some((b, truths))
+            }
+            _ => None,
+        };
+    }
+    if let Statement::If(branch) = head
+        && t.params.iter().any(|param| fold::reads(&branch.condition, param) > 0)
+    {
+        if let Some((Statement::If(_), site_rest)) = candidate.split_first() {
+            let mut aligned = b.clone();
+            seed_unify_stmt(ctx, head, &candidate[0], &mut aligned);
+            if let Some(found) = align_seed(t, ctx, rest, then, site_rest, aligned, truths.clone(), budget) {
+                return Some(found);
+            }
+        }
+        let after = AlignRest { statements: rest, then };
+        for taken in [true, false] {
+            let mut truths = truths.clone();
+            if let Some((param, then_truth)) = bare_truth_test(&branch.condition, &t.params) {
+                let truth = then_truth == taken;
+                if truths.iter().any(|(known, value)| known == param && *value != truth) {
+                    continue;
+                }
+                truths.push((param.clone(), truth));
+            }
+            // An arm taken on `p == K` tells `p` is `K` (`kind == "Stats"`).
+            let mut b = b.clone();
+            if let Some((param, literal, equal_when)) = equality_test(&branch.condition, &t.params)
+                && equal_when == taken
+            {
+                match b.params.get(param) {
+                    Some(RValue::Literal(bound)) if bound != literal => continue,
+                    Some(_) => {}
+                    None => {
+                        b.params.insert(param.clone(), RValue::Literal(literal.clone()));
+                    }
+                }
+            }
+            let arm = if taken { branch.then_block.lock().0.clone() } else { branch.else_block.lock().0.clone() };
+            // An arm leaving the function ends the copy.
+            let next = (!sequence_has_terminal_tail(&arm)).then_some(&after);
+            if let Some(found) = align_seed(t, ctx, &arm, next, candidate, b, truths, budget) {
+                return Some(found);
+            }
+        }
+        return None;
+    }
+    let (site, site_rest) = candidate.split_first()?;
+    if let Some(unfolded) = unfold_site_entries(head, site) {
+        let site_rest = unfolded.into_iter().chain(site_rest.iter().cloned()).collect::<Vec<_>>();
+        let mut b = b;
+        seed_unify_stmt(ctx, head, &site_rest[0], &mut b);
+        return align_seed(t, ctx, rest, then, &site_rest[1..], b, truths, budget);
+    }
+    if !same_skeleton(head, site) {
+        return None;
+    }
+    let mut b = b;
+    seed_unify_stmt(ctx, head, site, &mut b);
+    align_seed(t, ctx, rest, then, site_rest, b, truths, budget)
+}
+
+/// `p == K` / `K ~= p` of a parameter and a literal: the parameter, the
+/// literal, and the truth of the condition where `p` is `K`.
+fn equality_test<'a>(condition: &'a RValue, params: &FxHashSet<RcLocal>) -> Option<(&'a RcLocal, &'a Literal, bool)> {
+    let RValue::Binary(binary) = condition else { return None };
+    let equal_when = match binary.operation {
+        BinaryOperation::Equal => true,
+        BinaryOperation::NotEqual => false,
+        _ => return None,
+    };
+    match (binary.left.as_ref(), binary.right.as_ref()) {
+        // A `nil` test is an optional parameter's, left to its truth.
+        (RValue::Local(param), RValue::Literal(literal)) | (RValue::Literal(literal), RValue::Local(param))
+            if params.contains(param) && *literal != Literal::Nil =>
+        {
+            Some((param, literal, equal_when))
+        }
+        _ => None,
+    }
+}
+
+/// Whether a pattern statement and a site statement can be one statement
+/// whatever constants their values folded: the same kind, writing to the
+/// same kind of place or calling the same kind of function, where literal
+/// keys and names agree.
+fn same_skeleton(pattern: &Statement, site: &Statement) -> bool {
+    fn path(pattern: &RValue, site: &RValue) -> bool {
+        match (pattern, site) {
+            (RValue::Local(_), RValue::Local(_)) => true,
+            (RValue::Global(a), RValue::Global(b)) => a == b,
+            (RValue::Index(a), RValue::Index(b)) => path(&a.left, &b.left) && key(&a.right, &b.right),
+            _ => false,
+        }
+    }
+    fn key(pattern: &RValue, site: &RValue) -> bool {
+        match (pattern, site) {
+            (RValue::Literal(a), RValue::Literal(b)) => a == b,
+            _ => true,
+        }
+    }
+    fn place(pattern: &LValue, site: &LValue) -> bool {
+        match (pattern, site) {
+            (LValue::Local(_), LValue::Local(_)) => true,
+            (LValue::Global(a), LValue::Global(b)) => a == b,
+            (LValue::Index(a), LValue::Index(b)) => path(&a.left, &b.left) && key(&a.right, &b.right),
+            _ => false,
+        }
+    }
+    match (pattern, site) {
+        (Statement::Assign(left), Statement::Assign(right)) => {
+            left.prefix == right.prefix
+                && left.parallel == right.parallel
+                && left.left.len() == right.left.len()
+                && left.right.len() == right.right.len()
+                && left.left.iter().zip(&right.left).all(|(pattern, site)| place(pattern, site))
+        }
+        (Statement::Call(left), Statement::Call(right)) => {
+            left.arguments.len() == right.arguments.len() && path(&left.value, &right.value)
+        }
+        (Statement::MethodCall(left), Statement::MethodCall(right)) => {
+            left.method == right.method && left.arguments.len() == right.arguments.len()
+        }
+        (Statement::Return(left), Statement::Return(right)) => left.values.len() == right.values.len(),
+        (left, right) => std::mem::discriminant(left) == std::mem::discriminant(right),
+    }
+}
+
+/// Whether `site` can open a copy of `pattern` some constants folded: as its
+/// first statement, or as the first statement of an arm of a leading `if`
+/// on a parameter (or of what follows such an `if`).
+fn may_open_specialized_copy(t: &Target, pattern: &[Statement], site: &Statement, depth: usize) -> bool {
+    let Some((head, rest)) = pattern.split_first() else { return false };
+    if let Statement::If(branch) = head
+        && t.params.iter().any(|param| fold::reads(&branch.condition, param) > 0)
+    {
+        return matches!(site, Statement::If(_))
+            || depth < 4
+                && (may_open_specialized_copy(t, &branch.then_block.lock().0, site, depth + 1)
+                    || may_open_specialized_copy(t, &branch.else_block.lock().0, site, depth + 1)
+                    || may_open_specialized_copy(t, rest, site, depth + 1));
+    }
+    same_skeleton(head, site)
+}
+
+fn seed_unify_values(ctx: &MatchCtx, pattern: &[RValue], candidate: &[RValue], b: &mut Bindings) {
+    for (left, right) in pattern.iter().zip(candidate) {
+        seed_unify_value(ctx, left, right, b);
+    }
+}
+
+/// [`seed_unify_values`] of one value: where the exact unification stops,
+/// the bindings a constant argument's folding still shows.
+fn seed_unify_value(ctx: &MatchCtx, pattern: &RValue, candidate: &RValue, b: &mut Bindings) {
+    if unify_rvalue(ctx, pattern, candidate, b).is_ok() {
+        return;
+    }
+    match (pattern, candidate) {
+        // `p or "N/A"` folded to the constant passed: that constant.
+        (RValue::Binary(Binary { operation: BinaryOperation::Or, left: param, right: default, .. }), RValue::Literal(literal))
+            if let (RValue::Local(param), RValue::Literal(default)) = (&**param, &**default)
+                && ctx.params.contains(param)
+                && literal != default
+                && crate::select_value::known_truthy(candidate) =>
+        {
+            b.params.entry(param.clone()).or_insert_with(|| candidate.clone());
+        }
+        // An interpolated string whose constant strings Luau put in its
+        // text: each hole of the pattern's text either still a hole of the
+        // site's, taking its argument, or the string there.
+        (RValue::MethodCall(pattern) | RValue::Select(Select::MethodCall(pattern)), RValue::MethodCall(candidate) | RValue::Select(Select::MethodCall(candidate)))
+            if let Some(holes) = interpolation_holes(pattern, candidate) =>
+        {
+            let mut site_arguments = candidate.arguments.iter();
+            for (argument, hole) in pattern.arguments.iter().zip(holes) {
+                match hole {
+                    Some(text) => {
+                        if let RValue::Local(param) = argument
+                            && ctx.params.contains(param)
+                        {
+                            b.params.entry(param.clone()).or_insert_with(|| RValue::Literal(Literal::String(text)));
+                        }
+                    }
+                    None => {
+                        let Some(site) = site_arguments.next() else { return };
+                        seed_unify_value(ctx, argument, site, b);
+                    }
+                }
+            }
+        }
+        // An interpolated string all of whose holes Luau filled with
+        // constant strings: the text alone (`"LastAppliedEnabled"`).
+        (RValue::MethodCall(pattern) | RValue::Select(Select::MethodCall(pattern)), RValue::Literal(Literal::String(text))) => {
+            let mut escaped = Vec::with_capacity(text.len());
+            for &byte in text {
+                escaped.push(byte);
+                if byte == b'%' {
+                    escaped.push(b'%');
+                }
+            }
+            let site = crate::MethodCall::new(RValue::Literal(Literal::String(escaped)), "format".into(), Vec::new());
+            if let Some(holes) = interpolation_holes(pattern, &site) {
+                for (argument, hole) in pattern.arguments.iter().zip(holes) {
+                    if let (RValue::Local(param), Some(text)) = (argument, hole)
+                        && ctx.params.contains(param)
+                    {
+                        b.params.entry(param.clone()).or_insert_with(|| RValue::Literal(Literal::String(text)));
+                    }
+                }
+            }
+        }
+        // A constructor's fields, key by key (`{ SpawnedBy = reason or
+        // "unknown", Last = event }`).
+        (RValue::Table(pattern), RValue::Table(candidate)) if pattern.0.len() == candidate.0.len() => {
+            for ((pattern_key, pattern_value), (candidate_key, candidate_value)) in pattern.0.iter().zip(&candidate.0) {
+                if pattern_key == candidate_key {
+                    seed_unify_value(ctx, pattern_value, candidate_value, b);
+                }
+            }
+        }
+        // Into the operands of an operation and an index, where one of the
+        // above may be (`p[`LastApplied{name}`] == nil`).
+        (RValue::Binary(pattern), RValue::Binary(candidate)) if pattern.operation == candidate.operation => {
+            seed_unify_value(ctx, &pattern.left, &candidate.left, b);
+            seed_unify_value(ctx, &pattern.right, &candidate.right, b);
+        }
+        (RValue::Unary(pattern), RValue::Unary(candidate)) if pattern.operation == candidate.operation => {
+            seed_unify_value(ctx, &pattern.value, &candidate.value, b);
+        }
+        (RValue::Index(pattern), RValue::Index(candidate)) => {
+            seed_unify_value(ctx, &pattern.left, &candidate.left, b);
+            seed_unify_value(ctx, &pattern.right, &candidate.right, b);
+        }
+        _ => {}
+    }
+}
+
+fn seed_unify_stmt(ctx: &MatchCtx, pattern: &Statement, candidate: &Statement, b: &mut Bindings) {
     match (pattern, candidate) {
         (Statement::Assign(left), Statement::Assign(right)) => {
             if left.prefix != right.prefix || left.parallel != right.parallel {
                 return;
             }
             for (pl, cl) in left.left.iter().zip(&right.left) {
-                let _ = unify_lvalue(&ctx, pl, cl, b);
+                if unify_lvalue(ctx, pl, cl, b).is_err()
+                    && let (LValue::Index(pattern), LValue::Index(candidate)) = (pl, cl)
+                {
+                    seed_unify_value(ctx, &pattern.left, &candidate.left, b);
+                    seed_unify_value(ctx, &pattern.right, &candidate.right, b);
+                }
             }
-            seed_unify_values(&ctx, &left.right, &right.right, b);
+            seed_unify_values(ctx, &left.right, &right.right, b);
         }
-        (Statement::Call(left), Statement::Call(right)) => {
-            let _ = unify_rvalue(&ctx, &left.value, &right.value, b);
-            seed_unify_values(&ctx, &left.arguments, &right.arguments, b);
+        (Statement::Call(left), Statement::Call(right)) if left.same_execution(right) => {
+            let _ = unify_rvalue(ctx, &left.value, &right.value, b);
+            seed_unify_values(ctx, &left.arguments, &right.arguments, b);
         }
         (Statement::MethodCall(left), Statement::MethodCall(right))
             if left.method == right.method =>
         {
-            let _ = unify_rvalue(&ctx, &left.value, &right.value, b);
-            seed_unify_values(&ctx, &left.arguments, &right.arguments, b);
+            let _ = unify_rvalue(ctx, &left.value, &right.value, b);
+            seed_unify_values(ctx, &left.arguments, &right.arguments, b);
         }
         (Statement::If(left), Statement::If(right)) => {
-            let _ = unify_rvalue(&ctx, &left.condition, &right.condition, b);
-            seed_unify_block(t, &left.then_block.lock().0, &right.then_block.lock().0, b);
-            seed_unify_block(t, &left.else_block.lock().0, &right.else_block.lock().0, b);
+            seed_unify_value(ctx, &left.condition, &right.condition, b);
+            seed_unify_block_in(ctx, &left.then_block.lock().0, &right.then_block.lock().0, b);
+            seed_unify_block_in(ctx, &left.else_block.lock().0, &right.else_block.lock().0, b);
         }
         (Statement::While(left), Statement::While(right)) => {
-            let _ = unify_rvalue(&ctx, &left.condition, &right.condition, b);
-            seed_unify_block(t, &left.block.lock().0, &right.block.lock().0, b);
+            seed_unify_value(ctx, &left.condition, &right.condition, b);
+            seed_unify_block_in(ctx, &left.block.lock().0, &right.block.lock().0, b);
         }
         (Statement::Repeat(left), Statement::Repeat(right)) => {
-            let _ = unify_rvalue(&ctx, &left.condition, &right.condition, b);
-            seed_unify_block(t, &left.block.lock().0, &right.block.lock().0, b);
+            seed_unify_value(ctx, &left.condition, &right.condition, b);
+            seed_unify_block_in(ctx, &left.block.lock().0, &right.block.lock().0, b);
         }
         (Statement::NumericFor(left), Statement::NumericFor(right)) => {
-            let _ = unify_rvalue(&ctx, &left.initial, &right.initial, b);
-            let _ = unify_rvalue(&ctx, &left.limit, &right.limit, b);
-            let _ = unify_rvalue(&ctx, &left.step, &right.step, b);
-            let _ = unify_local(&ctx, &left.counter, &right.counter, b);
-            seed_unify_block(t, &left.block.lock().0, &right.block.lock().0, b);
+            let _ = unify_rvalue(ctx, &left.initial, &right.initial, b);
+            let _ = unify_rvalue(ctx, &left.limit, &right.limit, b);
+            let _ = unify_rvalue(ctx, &left.step, &right.step, b);
+            let _ = unify_local(ctx, &left.counter, &right.counter, b);
+            seed_unify_block_in(ctx, &left.block.lock().0, &right.block.lock().0, b);
         }
         (Statement::GenericFor(left), Statement::GenericFor(right)) => {
             for (pl, cl) in left.res_locals.iter().zip(&right.res_locals) {
-                let _ = unify_local(&ctx, pl, cl, b);
+                let _ = unify_local(ctx, pl, cl, b);
             }
-            seed_unify_values(&ctx, &left.right, &right.right, b);
-            seed_unify_block(t, &left.block.lock().0, &right.block.lock().0, b);
+            seed_unify_values(ctx, &left.right, &right.right, b);
+            seed_unify_block_in(ctx, &left.block.lock().0, &right.block.lock().0, b);
         }
         (Statement::Return(left), Statement::Return(right)) => {
-            seed_unify_values(&ctx, &left.values, &right.values, b);
+            seed_unify_values(ctx, &left.values, &right.values, b);
+        }
+        // A value the copy stores into its result.
+        (Statement::Return(left), Statement::Assign(right)) if !right.prefix && left.values.len() == right.right.len() => {
+            seed_unify_values(ctx, &left.values, &right.right, b);
         }
         (Statement::SetList(left), Statement::SetList(right)) => {
-            let _ = unify_local(&ctx, &left.object_local, &right.object_local, b);
-            seed_unify_values(&ctx, &left.values, &right.values, b);
+            let _ = unify_local(ctx, &left.object_local, &right.object_local, b);
+            seed_unify_values(ctx, &left.values, &right.values, b);
             if let (Some(pl), Some(cl)) = (&left.tail, &right.tail) {
-                let _ = unify_rvalue(&ctx, pl, cl, b);
+                let _ = unify_rvalue(ctx, pl, cl, b);
             }
         }
         _ => {}
     }
 }
 
-fn specialize_rvalue(value: &mut RValue, bindings: &FxHashMap<RcLocal, RValue>) {
+/// Substitutes `bindings` into `value` and folds what that made constant;
+/// whether anything was substituted.
+/// The type name `typeof(K)` / `type(K)` gives for a constant `K` the
+/// compiler folds: nil, a boolean, a number or a string.
+fn type_name_of_constant(call: &Call) -> Option<&'static str> {
+    let (RValue::Global(callee), [RValue::Literal(constant)]) = (&*call.value, call.arguments.as_slice()) else { return None };
+    if callee.0 != b"typeof" && callee.0 != b"type" {
+        return None;
+    }
+    Some(match constant {
+        Literal::Nil => "nil",
+        Literal::Boolean(_) => "boolean",
+        Literal::Number(_) => "number",
+        Literal::String(_) => "string",
+        _ => return None,
+    })
+}
+
+/// `typeof(p) == "string"` (`type`, `~=`, either side): a test a constant
+/// argument folds, as a truth test does.
+fn type_tested_param(value: &RValue) -> Option<&RcLocal> {
+    let RValue::Binary(binary) = value else { return None };
+    if !matches!(binary.operation, BinaryOperation::Equal | BinaryOperation::NotEqual) {
+        return None;
+    }
+    fn tested<'a>(call: &'a RValue, name: &RValue) -> Option<&'a RcLocal> {
+        match (call, name) {
+            (RValue::Call(call) | RValue::Select(Select::Call(call)), RValue::Literal(Literal::String(_))) => match (&*call.value, call.arguments.as_slice()) {
+                (RValue::Global(callee), [RValue::Local(param)]) if callee.0 == b"typeof" || callee.0 == b"type" => Some(param),
+                _ => None,
+            },
+            _ => None,
+        }
+    }
+    tested(&binary.left, &binary.right).or_else(|| tested(&binary.right, &binary.left))
+}
+
+fn specialize_rvalue(value: &mut RValue, bindings: &FxHashMap<RcLocal, RValue>) -> bool {
     if let RValue::Local(local) = value
         && let Some(replacement) = bindings.get(local)
     {
         *value = replacement.clone();
-        return;
+        return true;
     }
+    let mut substituted = false;
     value.visit_rvalues_mut(&mut |child| {
-        specialize_rvalue(child, bindings);
+        substituted |= specialize_rvalue(child, bindings);
         true
     });
     let owned = std::mem::replace(value, RValue::Literal(Literal::Nil));
@@ -8032,8 +11453,159 @@ fn specialize_rvalue(value: &mut RValue, bindings: &FxHashMap<RcLocal, RValue>) 
                 _ => unreachable!(),
             }
         }
+        // An interpolated string given constant strings, which Luau puts
+        // in its text (`"... to {name} ({kind} expected"` with `name` and
+        // `kind` constants is `"... to spr.target (Instance expected"`).
+        RValue::MethodCall(call) if substituted && let Some(folded) = interpolated_constants(&call) => folded,
+        RValue::Select(Select::MethodCall(call)) if substituted && let Some(folded) = interpolated_constants(&call) => match folded {
+            RValue::MethodCall(call) => RValue::Select(Select::MethodCall(call)),
+            other => other,
+        },
+        // `X or Y` where a constant made `X` (`true and X`, `X` truthy):
+        // `Y` never runs, `X` still does, as in the copy.
+        RValue::Binary(binary)
+            if substituted && binary.operation == BinaryOperation::Or && crate::select_value::known_truthy(&binary.left) =>
+        {
+            *binary.left
+        }
+        // `typeof(p)` / `type(p)` of a constant argument, which Luau folds
+        // in the copy (`typeof(nil) == "string"` is `false` there).
+        RValue::Call(ref call) | RValue::Select(Select::Call(ref call)) if substituted && let Some(name) = type_name_of_constant(call) => {
+            RValue::Literal(Literal::String(name.into()))
+        }
+        // Arithmetic and comparisons a constant argument made constant, as
+        // Luau folded them in the copy (`1 * p` is `3`, `p >= 4` is `false`
+        // for `3`, `math.pow(10, p)` is `100` for `2`); the helper's own
+        // constant expressions read as written.
+        other @ (RValue::Binary(_) | RValue::Unary(_) | RValue::Call(_) | RValue::Select(Select::Call(_)))
+            if substituted && let Some(value) = fold::evaluate(&other, &|_| None, &fold::PureHelpers::default()) =>
+        {
+            RValue::Literal(value.literal())
+        }
         other => other.reduce(),
     };
+    substituted
+}
+
+/// For `pattern` and `candidate`, `format` calls on literal texts of the
+/// `%*` form, what each hole of the pattern's text is in the candidate's:
+/// `None` still a hole, or the string Luau put there. `None` where the
+/// texts do not align.
+fn interpolation_holes(pattern: &crate::MethodCall, candidate: &crate::MethodCall) -> Option<Vec<Option<Vec<u8>>>> {
+    let (RValue::Literal(Literal::String(text)), RValue::Literal(Literal::String(site))) = (pattern.value.as_ref(), candidate.value.as_ref()) else {
+        return None;
+    };
+    if pattern.method != "format" || candidate.method != "format" {
+        return None;
+    }
+    // The fixed parts between `%*` holes, `%%` kept as written.
+    let mut parts: Vec<&[u8]> = Vec::new();
+    let (mut start, mut at) = (0, 0);
+    while at < text.len() {
+        match (text[at], text.get(at + 1)) {
+            (b'%', Some(b'*')) => {
+                parts.push(&text[start..at]);
+                at += 2;
+                start = at;
+            }
+            (b'%', Some(b'%')) => at += 2,
+            (b'%', _) => return None,
+            _ => at += 1,
+        }
+    }
+    parts.push(&text[start..]);
+    if parts.len() != pattern.arguments.len() + 1 || !site.starts_with(parts[0]) {
+        return None;
+    }
+    let mut holes = Vec::with_capacity(pattern.arguments.len());
+    let mut cursor = parts[0].len();
+    for (index, next) in parts[1..].iter().enumerate() {
+        let last = index + 2 == parts.len();
+        if site[cursor..].starts_with(b"%*") && (if last { site[cursor + 2..] == **next } else { site[cursor + 2..].starts_with(next) }) {
+            holes.push(None);
+            cursor += 2 + next.len();
+            continue;
+        }
+        let end = if last {
+            site.len().checked_sub(next.len()).filter(|&end| end >= cursor && site[end..] == **next)?
+        } else {
+            cursor + site[cursor..].windows(next.len().max(1)).position(|window| next.is_empty() || window == *next)?
+        };
+        let escaped = &site[cursor..end];
+        let mut text = Vec::with_capacity(escaped.len());
+        let mut index = 0;
+        while index < escaped.len() {
+            if escaped[index] == b'%' {
+                if escaped.get(index + 1) != Some(&b'%') {
+                    return None;
+                }
+                index += 1;
+            }
+            text.push(escaped[index]);
+            index += 1;
+        }
+        holes.push(Some(text));
+        cursor = end + next.len();
+    }
+    (cursor == site.len()).then_some(holes)
+}
+
+/// `("a%*b%*c"):format(x, "k")`, the form of `` `a{x}b{"k"}c` ``, with each
+/// string argument in the text where its `%*` is, as Luau's compiler puts
+/// constant strings; `None` where no argument is a string or the text has
+/// another specifier than `%*` and `%%`.
+fn interpolated_constants(call: &crate::MethodCall) -> Option<RValue> {
+    let RValue::Literal(Literal::String(text)) = call.value.as_ref() else { return None };
+    if call.method != "format" || !call.arguments.iter().any(|argument| matches!(argument, RValue::Literal(Literal::String(_)))) {
+        return None;
+    }
+    let mut folded: Vec<u8> = Vec::with_capacity(text.len());
+    let mut arguments = call.arguments.iter();
+    let mut kept = Vec::new();
+    let mut at = 0;
+    while at < text.len() {
+        if text[at] != b'%' {
+            folded.push(text[at]);
+            at += 1;
+            continue;
+        }
+        match text.get(at + 1) {
+            Some(b'%') => folded.extend_from_slice(b"%%"),
+            Some(b'*') => match arguments.next()? {
+                RValue::Literal(Literal::String(constant)) => {
+                    for &byte in constant {
+                        folded.push(byte);
+                        if byte == b'%' {
+                            folded.push(b'%');
+                        }
+                    }
+                }
+                other => {
+                    folded.extend_from_slice(b"%*");
+                    kept.push(other.clone());
+                }
+            },
+            _ => return None,
+        }
+        at += 2;
+    }
+    if arguments.next().is_some() {
+        return None;
+    }
+    if kept.is_empty() {
+        // No `%*` left: the text itself, `%%` read as `%`.
+        let mut plain = Vec::with_capacity(folded.len());
+        let mut index = 0;
+        while index < folded.len() {
+            plain.push(folded[index]);
+            index += if folded[index] == b'%' { 2 } else { 1 };
+        }
+        return Some(RValue::Literal(Literal::String(plain)));
+    }
+    let mut format = call.clone();
+    format.value = Box::new(RValue::Literal(Literal::String(folded)));
+    format.arguments = kept;
+    Some(RValue::MethodCall(format))
 }
 
 fn runtime_literal_equal(left: &Literal, right: &Literal) -> Option<bool> {
@@ -8064,10 +11636,27 @@ fn specialized_truth(value: &RValue) -> Option<bool> {
 fn specialize_block(stmts: &mut Vec<Statement>, bindings: &FxHashMap<RcLocal, RValue>) {
     let mut output = Vec::with_capacity(stmts.len());
     for mut statement in std::mem::take(stmts) {
-        statement.visit_rvalues_mut(&mut |value| {
-            specialize_rvalue(value, bindings);
-            true
-        });
+        // A condition a constant reached reads only its truth: `not (false
+        // or not v)` is `v` there, as the copy's canon spells it.
+        let condition = match &mut statement {
+            Statement::If(node) => Some(&mut node.condition),
+            Statement::While(node) => Some(&mut node.condition),
+            Statement::Repeat(node) => Some(&mut node.condition),
+            _ => None,
+        };
+        match condition {
+            Some(condition) => {
+                if specialize_rvalue(condition, bindings) {
+                    *condition = std::mem::replace(condition, RValue::Literal(Literal::Nil)).reduce_condition();
+                }
+            }
+            None => {
+                statement.visit_rvalues_mut(&mut |value| {
+                    specialize_rvalue(value, bindings);
+                    true
+                });
+            }
+        }
 
         match &mut statement {
             Statement::If(node) => {
@@ -8169,21 +11758,14 @@ fn sequence_has_return_tail(stmts: &[Statement]) -> bool {
 }
 
 fn has_depth_zero_loop_control(stmts: &[Statement], loop_depth: usize) -> bool {
+    // Once inside another loop, every break/continue belongs to that loop
+    // (or a deeper one). No descendant can transfer to the original loop.
+    if loop_depth != 0 { return false; }
     stmts.iter().any(|statement| match statement {
-        Statement::Break(_) | Statement::Continue(_) => loop_depth == 0,
+        Statement::Break(_) | Statement::Continue(_) => true,
         Statement::If(node) => {
             has_depth_zero_loop_control(&node.then_block.lock().0, loop_depth)
                 || has_depth_zero_loop_control(&node.else_block.lock().0, loop_depth)
-        }
-        Statement::While(node) => has_depth_zero_loop_control(&node.block.lock().0, loop_depth + 1),
-        Statement::Repeat(node) => {
-            has_depth_zero_loop_control(&node.block.lock().0, loop_depth + 1)
-        }
-        Statement::NumericFor(node) => {
-            has_depth_zero_loop_control(&node.block.lock().0, loop_depth + 1)
-        }
-        Statement::GenericFor(node) => {
-            has_depth_zero_loop_control(&node.block.lock().0, loop_depth + 1)
         }
         _ => false,
     })
@@ -8220,7 +11802,7 @@ fn result_decl(s: &Statement) -> Option<RcLocal> {
 }
 
 fn block_reads_local(stmts: &[Statement], target: &RcLocal) -> bool {
-    count_local_reads(stmts, target) > 0
+    local_queries::reads(stmts, target)
 }
 
 fn args_vec_eq(a: &[RValue], b: &[RValue]) -> bool {
@@ -8447,13 +12029,11 @@ fn unflag_value_loop(
 }
 
 fn reads_local(value: &RValue, local: &RcLocal) -> bool {
-    count_local_reads(&[Statement::Return(Return::new(vec![value.clone()]))], local) > 0
+    local_queries::value_reads(value, local)
 }
 
 fn block_writes_local(stmts: &[Statement], local: &RcLocal) -> bool {
-    let mut written = FxHashSet::default();
-    collect_written(stmts, &mut written);
-    written.contains(local)
+    local_queries::writes(stmts, local)
 }
 
 fn is_void_return_guard(statement: &Statement) -> bool {
@@ -8504,7 +12084,8 @@ fn any_structural_target(body: &Block, copies: Option<&evidence::Copies>) -> boo
         if pattern.is_empty() {
             return;
         }
-        let loop_exit = kind == TKind::Value && !value_leaf_shape(&pattern) && loop_return_split(&pattern).is_some();
+        let loop_exit = kind == TKind::Value && !value_leaf_shape(&pattern)
+            && (loop_return_split(&pattern).is_some() || loop_exit_shape(&pattern));
         // Below the floor only where line info shows copies (E1).
         if anchor_score(&pattern, &g.parameters) + LOOP_EXIT_ANCHORS * usize::from(loop_exit) < 2
             && !g.bytecode_proto_id.is_some_and(|proto| copies.is_some_and(|copies| copies.inlined_anywhere(proto)))
@@ -8533,7 +12114,326 @@ fn pattern_body<'a>(body: &'a [Statement], parameters: &[RcLocal]) -> (std::borr
     if let Some((lowered, returned)) = straight_tuple_return(body, parameters) {
         return (std::borrow::Cow::Owned(lowered), returned);
     }
+    if let Some(lowered) = return_from_tail_loop(body).filter(|_| !value_leaf_shape(&canon(body))) {
+        return (std::borrow::Cow::Owned(lowered), Vec::new());
+    }
+    if let Some(lowered) = returned_local_leaves(body) {
+        return (std::borrow::Cow::Owned(lowered), Vec::new());
+    }
+    if let Some(lowered) = distributed_tail(body) {
+        return (std::borrow::Cow::Owned(lowered), Vec::new());
+    }
     (std::borrow::Cow::Borrowed(body), Vec::new())
+}
+
+/// The statements after an `if` that returns on some path and falls off
+/// its end on others, returning on every path themselves: they run at each
+/// of those ends, so each takes a copy (`if t then local v = t[k]; if ok(v)
+/// then return v end end; if typeof(d) == "string" then return d end;
+/// return ""`). The copy Luau inlined reaches them from each end too, and
+/// a constant argument folds them to a store there. Only a tail small
+/// enough to repeat, and only where that makes every return a leaf.
+fn distributed_tail(body: &[Statement]) -> Option<Vec<Statement>> {
+    const MAX_TAIL_NODES: usize = 64;
+    if value_leaf_shape(&canon(body)) {
+        return None;
+    }
+    let at = body.iter().rposition(|statement| matches!(statement, Statement::If(f) if is_distributing_if(f)))?;
+    let (head, rest) = body.split_at(at);
+    let (branch, tail) = rest.split_first()?;
+    let real = tail.iter().filter(|statement| !is_match_trivia(statement)).count();
+    if real < 2
+        || open_ends(tail) != Some(0)
+        || block_has_return(head)
+        || tail.iter().map(dbg_stmt_node_count).sum::<usize>() > MAX_TAIL_NODES
+    {
+        return None;
+    }
+    let mut out = head.to_vec();
+    out.extend(graft_all(vec![branch.clone()], tail));
+    value_leaf_shape(&canon(&out)).then_some(out)
+}
+
+/// `local R; if ... then ...; R = X else ...; R = Y end; return R` ending a
+/// helper, `R` stored last on every path of the `if` and read nowhere else:
+/// those stores are its returns (`if ... then ...; return X else ...;
+/// return Y end`), the shape its copies take, storing each leaf into their
+/// result, declared there or a local the caller has (`local v =
+/// IsFinite(x)`, then `v = IsFinite(y)` in an `and` chain).
+fn returned_local_leaves(body: &[Statement]) -> Option<Vec<Statement>> {
+    fn returning(stmts: &[Statement], result: &RcLocal) -> Option<Vec<Statement>> {
+        let (last, rest) = stmts.split_last()?;
+        let mut written = FxHashSet::default();
+        collect_written(rest, &mut written);
+        if written.contains(result) || block_reads_local(rest, result) {
+            return None;
+        }
+        let leaf: Statement = match last {
+            Statement::Assign(store)
+                if !store.prefix
+                    && !store.parallel
+                    && !store.compound
+                    && store.left.len() == 1
+                    && store.right.len() == 1
+                    && store.left[0].as_local() == Some(result)
+                    && !reads_local(&store.right[0], result) =>
+            {
+                Return::new(vec![store.right[0].clone()]).into()
+            }
+            Statement::If(branch) if !reads_local(&branch.condition, result) => If::new(
+                branch.condition.clone(),
+                Block(returning(&branch.then_block.lock().0, result)?),
+                Block(returning(&branch.else_block.lock().0, result)?),
+            )
+            .into(),
+            _ => return None,
+        };
+        let mut out = rest.to_vec();
+        out.push(leaf);
+        Some(out)
+    }
+    let [prefix @ .., Statement::Assign(declaration), branch @ Statement::If(_), Statement::Return(ret)] = body else { return None };
+    let (true, [LValue::Local(result)], []) = (declaration.prefix, declaration.left.as_slice(), declaration.right.as_slice()) else {
+        return None;
+    };
+    if !matches!(ret.values.as_slice(), [RValue::Local(returned)] if returned == result)
+        || closures_capture_any(std::slice::from_ref(branch), std::slice::from_ref(result))
+    {
+        return None;
+    }
+    let mut out = prefix.to_vec();
+    out.extend(returning(std::slice::from_ref(branch), result)?);
+    Some(out)
+}
+
+/// `while true do ... break ... end; return t` ending a helper: each `break`
+/// of the loop leads straight to the `return`, so the loop may return there
+/// (`if found then return i end`), the shape [`loop_exit_shape`] admits.
+fn return_from_tail_loop(body: &[Statement]) -> Option<Vec<Statement>> {
+    fn owns_break(stmts: &[Statement]) -> bool {
+        stmts.iter().any(|statement| match statement {
+            Statement::Break(_) => true,
+            Statement::If(branch) => owns_break(&branch.then_block.lock().0) || owns_break(&branch.else_block.lock().0),
+            _ => false,
+        })
+    }
+    fn returning(stmts: &[Statement], ret: &Return) -> Vec<Statement> {
+        stmts.iter().map(|statement| match statement {
+            Statement::Break(_) => Statement::Return(ret.clone()),
+            Statement::If(branch) => If::new(
+                branch.condition.clone(),
+                Block(returning(&branch.then_block.lock().0, ret)),
+                Block(returning(&branch.else_block.lock().0, ret)),
+            ).into(),
+            other => other.clone(),
+        }).collect()
+    }
+    let (Statement::Return(ret), rest) = body.split_last()? else { return None };
+    let (Statement::While(node), prefix) = rest.split_last()? else { return None };
+    let looped = node.block.lock();
+    if !matches!(node.condition, RValue::Literal(Literal::Boolean(true)))
+        || !matches!(ret.values.as_slice(), [value] if is_truncatable_return_value(value))
+        || !owns_break(&looped.0)
+    {
+        return None;
+    }
+    let mut out = prefix.to_vec();
+    out.push(While::new(node.condition.clone(), Block(returning(&looped.0, ret))).into());
+    Some(out)
+}
+
+/// A value helper whose every `return` ends it, on each path: a leaf, as
+/// in [`value_leaf_shape`], or a loop returning from inside, then what its
+/// normal exit runs (nothing after a `while true` it leaves only by
+/// returning). Its copies store the value and leave the loop by a `break`,
+/// past the rest under a flag where there is a rest ([`exit_result_loops`]).
+fn loop_exit_shape(stmts: &[Statement]) -> bool {
+    if let Some(at) = stmts.iter().position(|statement| loop_body(statement).is_some() && statement_has_return(statement)) {
+        let looped = loop_body(&stmts[at]).expect("a loop");
+        let mut found = false;
+        if block_has_return(&stmts[..at]) || !exits_once(&looped.lock().0, &mut found) || !found {
+            return false;
+        }
+        let rest = &stmts[at + 1..];
+        return if rest.iter().all(is_match_trivia) {
+            matches!(&stmts[at], Statement::While(node) if matches!(node.condition, RValue::Literal(Literal::Boolean(true))))
+                && !has_owned_break(&looped.lock().0)
+        } else {
+            loop_exit_shape(rest)
+        };
+    }
+    let Some((last, prefix)) = stmts.split_last() else { return false };
+    if block_has_return(prefix) {
+        return false;
+    }
+    match last {
+        Statement::Return(ret) => matches!(ret.values.as_slice(), [value] if is_truncatable_return_value(value)),
+        Statement::If(branch) => {
+            let else_block = branch.else_block.lock();
+            !else_block.0.is_empty() && loop_exit_shape(&else_block.0) && loop_exit_shape(&branch.then_block.lock().0)
+        }
+        _ => false,
+    }
+}
+
+fn loop_body(statement: &Statement) -> Option<&Arc<Mutex<Block>>> {
+    match statement {
+        Statement::While(node) => Some(&node.block),
+        Statement::Repeat(node) => Some(&node.block),
+        Statement::NumericFor(node) => Some(&node.block),
+        Statement::GenericFor(node) => Some(&node.block),
+        _ => None,
+    }
+}
+
+fn has_owned_break(stmts: &[Statement]) -> bool {
+    stmts.iter().any(|statement| match statement {
+        Statement::Break(_) => true,
+        Statement::If(branch) => has_owned_break(&branch.then_block.lock().0) || has_owned_break(&branch.else_block.lock().0),
+        _ => false,
+    })
+}
+
+/// Every `return` of `stmts` gives one value, none inside a nested loop.
+fn exits_once(stmts: &[Statement], found: &mut bool) -> bool {
+    stmts.iter().all(|statement| match statement {
+        Statement::Return(ret) => {
+            *found = true;
+            ret.values.len() == 1 && is_truncatable_return_value(&ret.values[0])
+        }
+        Statement::If(branch) => {
+            exits_once(&branch.then_block.lock().0, found) && exits_once(&branch.else_block.lock().0, found)
+        }
+        // A `return` two loops deep leaves through two flags.
+        other => !statement_has_return(other),
+    })
+}
+
+/// A copy of a [`loop_exit_shape`] helper storing into `result`, unified
+/// with its loops' exits given back as returns ([`exit_result_loops`]):
+/// plainly, then with a loop's opening exit as its test.
+fn unify_loop_exits(t: &Target, region: &[Statement], result: &RcLocal, seed: Bindings, current_func: Option<FnPtr>) -> Option<Unified> {
+    if t.loop_exit_at.is_some() || value_leaf_shape(&t.pat) || !loop_exit_shape(&t.pat) {
+        return None;
+    }
+    [false, true].into_iter().find_map(|tested| {
+        let window = exit_result_loops(region, result, tested)?;
+        if canon_top_len(&window, true) != t.pat.len() || !charge_window(t, &window) || !charge_unify(t, &window) {
+            return None;
+        }
+        let seed = Bindings { loop_exits: true, result: Some(result.clone()), ..seed.clone() };
+        try_unify_seeded(t, &canon_recurse(canon_top(&window, true), true), current_func, seed)
+            .filter(|unified| unified.result.as_ref() == Some(result))
+    })
+}
+
+/// A copy of a [`loop_exit_shape`] helper after its result declaration,
+/// given back with the helper's returns: in each `while true` loop ending a
+/// path of `region`, `r = x; break` is `return x`. Every break of such a loop
+/// must store `r` right before it, and the loop may not read or otherwise
+/// write `r`. With `tested`, a loop opening with `if c then return x end`
+/// is `while not c do ... end; return x`, the form of the helper's `while`
+/// whose exit the copy stores before its `break`.
+fn exit_result_loops(region: &[Statement], r: &RcLocal, tested: bool) -> Option<Vec<Statement>> {
+    fn store(statement: &Statement, r: &RcLocal) -> Option<RValue> {
+        let Statement::Assign(assign) = statement else { return None };
+        (is_plain_local_write(assign, r) && !assign.compound).then(|| assign.right[0].clone())
+    }
+    fn exits(stmts: &[Statement], r: &RcLocal) -> Option<Vec<Statement>> {
+        let mut out = Vec::with_capacity(stmts.len());
+        let mut index = 0;
+        while index < stmts.len() {
+            match &stmts[index] {
+                Statement::Break(_) => return None,
+                Statement::If(branch) => out.push(If::new(
+                    branch.condition.clone(),
+                    Block(exits(&branch.then_block.lock().0, r)?),
+                    Block(exits(&branch.else_block.lock().0, r)?),
+                ).into()),
+                statement => match (store(statement, r), stmts.get(index + 1)) {
+                    (Some(value), Some(Statement::Break(_))) => {
+                        out.push(Return::new(vec![value]).into());
+                        index += 1;
+                    }
+                    _ => out.push(statement.clone()),
+                },
+            }
+            index += 1;
+        }
+        Some(out)
+    }
+    /// `local ok = true; LOOP; if ok then REST end` ending a path
+    /// ([`unflag_value_loop`]).
+    fn flagged(stmts: &[Statement], r: &RcLocal) -> Option<Vec<Statement>> {
+        let real = (0..stmts.len()).filter(|&n| !is_match_trivia(&stmts[n])).collect::<Vec<_>>();
+        let (decl, looped, guard) = match real[..] {
+            [.., decl, looped, guard] if loop_body(&stmts[looped]).is_some() => (decl, looped, Some(guard)),
+            [.., decl, looped] if loop_body(&stmts[looped]).is_some() => (decl, looped, None),
+            _ => return None,
+        };
+        let flag = flag_decl(&stmts[decl])?;
+        if guard.is_some_and(|guard| !matches!(&stmts[guard], Statement::If(branch)
+            if matches!(&branch.condition, RValue::Local(read) if *read == flag)))
+        {
+            return None;
+        }
+        unflag_value_loop(&stmts[..decl], &stmts[looped], guard.map(|guard| &stmts[guard]), r, &flag)
+    }
+    /// `if c then return x end` opening a loop body: its test and exit.
+    fn opening_exit(stmts: &[Statement]) -> Option<(usize, RValue, Return)> {
+        let at = stmts.iter().position(|statement| !is_match_trivia(statement))?;
+        let Statement::If(branch) = &stmts[at] else { return None };
+        if !branch.else_block.lock().0.is_empty() {
+            return None;
+        }
+        let then = branch.then_block.lock();
+        let mut real = then.0.iter().filter(|statement| !is_match_trivia(statement));
+        let (Some(Statement::Return(ret)), None) = (real.next(), real.next()) else { return None };
+        Some((at, branch.condition.clone(), ret.clone()))
+    }
+    fn ending(stmts: &[Statement], r: &RcLocal, tested: bool, converted: &mut bool) -> Option<Vec<Statement>> {
+        if let Some(window) = flagged(stmts, r) {
+            *converted = true;
+            return Some(window);
+        }
+        let mut out = stmts.to_vec();
+        let at = out.iter().rposition(|statement| !is_match_trivia(statement))?;
+        let mut tail = None;
+        let replaced: Statement = match &out[at] {
+            Statement::If(branch) => {
+                // Each guard ends with its `let`: an arm left as it is locks again.
+                let then_block = ending(&branch.then_block.lock().0, r, tested, converted);
+                let else_block = ending(&branch.else_block.lock().0, r, tested, converted);
+                If::new(
+                    branch.condition.clone(),
+                    Block(then_block.unwrap_or_else(|| branch.then_block.lock().0.clone())),
+                    Block(else_block.unwrap_or_else(|| branch.else_block.lock().0.clone())),
+                ).into()
+            }
+            Statement::While(node) if matches!(node.condition, RValue::Literal(Literal::Boolean(true))) => {
+                let mut looped = exits(&node.block.lock().0, r)?;
+                if block_writes_local(&looped, r) || block_reads_local(&looped, r) {
+                    return None;
+                }
+                *converted = true;
+                match opening_exit(&looped).filter(|_| tested) {
+                    Some((exit_at, condition, ret)) => {
+                        looped.remove(exit_at);
+                        tail = Some(Statement::from(ret));
+                        While::new(negate_canon(condition), Block(looped)).into()
+                    }
+                    None => While::new(node.condition.clone(), Block(looped)).into(),
+                }
+            }
+            _ => return Some(out),
+        };
+        out[at] = replaced;
+        out.extend(tail);
+        Some(out)
+    }
+    let mut converted = false;
+    let window = ending(region, r, tested, &mut converted)?;
+    converted.then_some(window)
 }
 
 /// A helper ending with one `return e1, e2, ...` of two or more values, not
@@ -8630,6 +12530,16 @@ fn branch_tuple_return(body: &[Statement], parameters: &[RcLocal]) -> Option<(Ve
         .flatten()
         .filter(|local| !parameters.contains(local))
         .collect();
+    // Locals one value declares in a branch: shared with a result, their
+    // declaration is a store into it (`local integer = math.floor(number)`
+    // inlined as `count = math.floor(number)`).
+    let mut nested: Vec<RcLocal> = Vec::new();
+    for statement in &tree {
+        if let Statement::If(branch) = statement {
+            branch_declarations(&branch.then_block.lock().0, &mut nested);
+            branch_declarations(&branch.else_block.lock().0, &mut nested);
+        }
+    }
     let mut results: Vec<RcLocal> = Vec::with_capacity(arity);
     let mut fresh: Vec<RcLocal> = Vec::new();
     for slot in 0..arity {
@@ -8637,7 +12547,7 @@ fn branch_tuple_return(body: &[Statement], parameters: &[RcLocal]) -> Option<(Ve
         let mut unique = true;
         for leaf in &leaves {
             if let RValue::Local(local) = &leaf[slot]
-                && declared.contains(local)
+                && (declared.contains(local) || nested.contains(local))
             {
                 match own {
                     None => own = Some(local),
@@ -8657,7 +12567,12 @@ fn branch_tuple_return(body: &[Statement], parameters: &[RcLocal]) -> Option<(Ve
                 })
         });
         match shared {
-            Some(local) => results.push(local.clone()),
+            Some(local) => {
+                if nested.contains(local) {
+                    fresh.push(local.clone());
+                }
+                results.push(local.clone());
+            }
             None => {
                 let result = RcLocal::default();
                 fresh.push(result.clone());
@@ -8666,18 +12581,65 @@ fn branch_tuple_return(body: &[Statement], parameters: &[RcLocal]) -> Option<(Ve
         }
     }
     let mut lowered = store_returns(&tree, &results);
-    for result in fresh {
+    undeclare(&mut lowered, &fresh);
+    // Each result declared without a value right before its first store,
+    // those first stored in one statement together.
+    let mut declarations: Vec<(usize, Vec<LValue>)> = Vec::new();
+    for result in &fresh {
         let first_store = lowered.iter().position(|statement| {
             let mut written = FxHashSet::default();
             collect_written(std::slice::from_ref(statement), &mut written);
-            written.contains(&result)
+            written.contains(result)
         })?;
-        let mut declaration = Assign::new(vec![LValue::Local(result)], Vec::new());
+        match declarations.iter_mut().find(|(at, _)| *at == first_store) {
+            Some((_, locals)) => locals.push(LValue::Local(result.clone())),
+            None => declarations.push((first_store, vec![LValue::Local(result.clone())])),
+        }
+    }
+    declarations.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
+    for (at, locals) in declarations {
+        let mut declaration = Assign::new(locals, Vec::new());
         declaration.prefix = true;
-        lowered.insert(first_store, declaration.into());
+        lowered.insert(at, declaration.into());
     }
     Some((lowered, results))
 }
+
+/// The locals declared, one per declaration, in `stmts` and the branches
+/// of its `if`s.
+fn branch_declarations(stmts: &[Statement], out: &mut Vec<RcLocal>) {
+    for statement in stmts {
+        match statement {
+            Statement::Assign(assign) if assign.prefix => {
+                if let [LValue::Local(local)] = assign.left.as_slice() {
+                    out.push(local.clone());
+                }
+            }
+            Statement::If(branch) => {
+                branch_declarations(&branch.then_block.lock().0, out);
+                branch_declarations(&branch.else_block.lock().0, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// `stmts` with each declaration of one of `locals` a store into it.
+fn undeclare(stmts: &mut [Statement], locals: &[RcLocal]) {
+    for statement in stmts {
+        match statement {
+            Statement::Assign(assign) if assign.prefix && matches!(assign.left.as_slice(), [LValue::Local(local)] if locals.contains(local)) => {
+                assign.prefix = false;
+            }
+            Statement::If(branch) => {
+                undeclare(&mut branch.then_block.lock().0, locals);
+                undeclare(&mut branch.else_block.lock().0, locals);
+            }
+            _ => {}
+        }
+    }
+}
+
 
 /// `stmts` with every `return` last in its block: a guard `if c then ...
 /// return x end; rest` takes `rest` as its `else`. Refuses a `return` inside
@@ -8865,8 +12827,8 @@ fn helper_targets(
     };
     match entry.analysis {
         HelperAnalysis::Refused(reason) => deinline_reject!(reason, f_local, g.name.as_deref().unwrap_or("<anon>")),
-        // Its code runs a call frame deeper inside the helper, where reading
-        // frames gives another answer.
+        // A reconstructed call adds a frame. The proof reads the current
+        // module census, as each site's copy proof does ([`finish_unified`]).
         _ if captures.reads_frames(&g.body.0) => {
             deinline_reject!(RejectReason::UnsafeBody, f_local, g.name.as_deref().unwrap_or("<anon>"))
         }
@@ -8895,7 +12857,7 @@ fn helper_targets(
 /// function within it, drops it ([`HelperCache::forget_rewritten`]). The
 /// analysis reads nothing else that changes: the write-once census and the
 /// single-valued helpers are read once, and the capture facts only by the
-/// frame gate and lazily by the targets, both read anew. The targets of the
+/// capture/frame gates and lazily by the targets, all read anew. The targets of the
 /// last collection come back for reuse rather than as copies.
 #[derive(Default)]
 struct HelperCache {
@@ -9013,7 +12975,7 @@ fn analyze_helper(
     if g.is_variadic {
         return Err(HelperAnalysis::Refused(RejectReason::Variadic));
     }
-    // The frame gate is [`helper_targets`]'.
+    // The capture/frame gates are [`helper_targets`]'.
     if body_unsafe(&g.body.0) {
         return Err(HelperAnalysis::Refused(RejectReason::UnsafeBody));
     }
@@ -9025,8 +12987,7 @@ fn analyze_helper(
             return Err(HelperAnalysis::RefusedLater(RejectReason::UnsupportedReturnShape));
         }
     };
-    let shape = crate::deinline_safety::CaptureSafety::new(&g.body);
-    if !shape.complete() || shape.nodes() > 2048 {
+    if !crate::deinline_safety::CaptureSafety::helper_within_shape_budget(&g.body) {
         return Err(HelperAnalysis::RefusedLater(RejectReason::ShapeBudget));
     }
     let pat = if falls_off { canon(&returning_nil(&body)) } else { canon(&body) };
@@ -9047,9 +13008,10 @@ fn analyze_helper(
             }
         }
         // value: every leaf must be a single value-return (the result),
-        // or a return from inside a loop (`loop_return_split`).
+        // or a return from inside a loop (`loop_return_split`,
+        // `loop_exit_shape`).
         TKind::Value => {
-            if !value_leaf_shape(&pat) && loop_exit_at.is_none() {
+            if !value_leaf_shape(&pat) && loop_exit_at.is_none() && !loop_exit_shape(&pat) {
                 return Err(HelperAnalysis::RefusedLater(RejectReason::UnsupportedReturnShape));
             }
         }
@@ -9075,7 +13037,8 @@ fn analyze_helper(
     // Below the readability floor, a helper is matched only where line
     // info shows its copies, all of them in a function or none (E1).
     let inlined = g.bytecode_proto_id.is_some_and(|proto| lines.is_some_and(|lines| lines.copies.inlined_anywhere(proto)));
-    let evidence = anchor_score(&pat, &g.parameters) + LOOP_EXIT_ANCHORS * usize::from(loop_exit_at.is_some()) < 2;
+    let exits_loop = loop_exit_at.is_some() || kind == TKind::Value && !value_leaf_shape(&pat);
+    let evidence = anchor_score(&pat, &g.parameters) + LOOP_EXIT_ANCHORS * usize::from(exits_loop) < 2;
     if evidence && !inlined {
         return Err(HelperAnalysis::RefusedLater(RejectReason::LowAnchorScore));
     }
@@ -9144,7 +13107,7 @@ fn analyze_helper(
     // The parameters a value leaf hands back as they are, and the one
     // every leaf does, if any.
     let mut leaves = Vec::new();
-    if kind == TKind::Value && loop_exit_at.is_none() {
+    if kind == TKind::Value && loop_exit_at.is_none() && value_leaf_shape(&pat) {
         value_leaves(&pat, &mut leaves);
     }
     let returned_param = |leaf: &RValue| match leaf {
@@ -9153,8 +13116,13 @@ fn analyze_helper(
     };
     let identity_params: Vec<RcLocal> =
         g.parameters.iter().filter(|p| leaves.iter().filter_map(returned_param).any(|l| l == **p)).cloned().collect();
-    let returns_parameter = match identity_params.as_slice() {
-        [param] if leaves.iter().all(|leaf| returned_param(leaf).as_ref() == Some(param)) => Some(param.clone()),
+    // One the body writes too: the copy's local for it holds the value.
+    let returns_parameter = match leaves.split_first() {
+        Some((RValue::Local(param), rest))
+            if g.parameters.contains(param) && rest.iter().all(|leaf| matches!(leaf, RValue::Local(other) if other == param)) =>
+        {
+            Some(param.clone())
+        }
         _ => None,
     };
     // Called for no result, a value helper runs its discard body.
@@ -9178,6 +13146,7 @@ fn analyze_helper(
         captures: &captures,
         proto: g.bytecode_proto_id,
         lines,
+        own_lines: g.source_lines,
     };
     let mut target = common.target(kind, pat, &body);
     target.evidence = evidence;
@@ -9222,14 +13191,37 @@ fn analyze_helper(
             twin
         })
         .filter(|twin| twin.hosted.is_some());
+    // A select returning a call, evaluated in place where one value is
+    // taken (`p / (not c and 1 or part:GetScale())`), by a twin returning
+    // its `and`/`or` form: not `single_valued`, [`hosted_spread`] takes no
+    // other site.
+    // With a prefix, the copy's select is folded into the statement using
+    // it (`local n = tonumber(x); t.k = not n and 0.7 or ...`).
+    let select_twin = (kind == TKind::Value && loop_exit_at.is_none())
+        .then(|| select_return(&target.pat, &params))
+        .flatten()
+        .map(|(pattern, truthy)| {
+            let (value_anchor, prefix_len) = value_anchor_of(kind, &pattern, None);
+            let mut twin = common.target(kind, pattern, &body);
+            twin.value_anchor = value_anchor;
+            twin.prefix_len = prefix_len;
+            twin.single_valued = target.single_valued;
+            twin.evidence = target.evidence;
+            twin.hosted_only = twin.pat.len() == 1;
+            twin.select_truthy = truthy;
+            twin.hosted = hosted_pattern(&twin);
+            twin
+        })
+        .filter(|twin| !twin.hosted_only || twin.hosted.is_some());
     // Copies whose constant arguments Luau folded match a variant of their
     // own, which line evidence admits.
     let folded = g.bytecode_proto_id.is_some_and(|proto| lines.is_some_and(|lines| lines.copies.constants_in_copies_anywhere(proto)));
-    let fold_twin = pure.filter(|_| folded).and_then(|pure| fold_variant(&target, &common, &body, pure));
+    let fold_twin = pure.and_then(|pure| fold_variant(&target, &common, &body, pure, folded));
     let mut found = vec![target];
     found.extend(discard_target);
     found.extend(variants);
     found.extend(hosted_twin);
+    found.extend(select_twin);
     found.extend(fold_twin);
     Ok(found)
 }
@@ -9243,7 +13235,7 @@ fn analyze_helper(
 /// its matches with the calls of the helper already rebuilt there must be
 /// exactly the helper's copies there. Only where the pattern has such a
 /// value, other than one it returns whole.
-fn fold_variant(t: &Target, common: &TargetCommon, raw: &[Statement], pure: &std::rc::Rc<fold::PureHelpers>) -> Option<Target> {
+fn fold_variant(t: &Target, common: &TargetCommon, raw: &[Statement], pure: &std::rc::Rc<fold::PureHelpers>, folded: bool) -> Option<Target> {
     if t.loop_exit_at.is_some() || t.cps_loop_return {
         return None;
     }
@@ -9252,27 +13244,31 @@ fn fold_variant(t: &Target, common: &TargetCommon, raw: &[Statement], pure: &std
         value_leaves(&t.pat, &mut roots);
     }
     // Whether `value` holds a value computed from parameters only that a
-    // literal may stand for.
-    fn folds(value: &RValue, t: &Target, pure: &fold::PureHelpers, roots: &[RValue]) -> bool {
+    // literal may stand for, where line info shows the copies refer to
+    // number constants (`folded`), or a select a constant truth decides
+    // ([`parameter_select`]), which loads none.
+    fn folds(value: &RValue, t: &Target, pure: &fold::PureHelpers, roots: &[RValue], folded: bool) -> bool {
         if matches!(value, RValue::Closure(_)) {
             return false;
         }
         let is_param = |local: &RcLocal| t.params.contains(local);
-        let site = !matches!(value, RValue::Literal(_) | RValue::Local(_))
+        let site = (folded || text_concat(value))
+            && !matches!(value, RValue::Literal(_) | RValue::Local(_))
             && fold::foldable(value, &is_param, pure)
             && t.params.iter().any(|param| fold::reads(value, param) > 0)
             && !roots.iter().any(|root| rvalue_exact_eq(root, value));
-        site || !value.visit_rvalues(&mut |child| !folds(child, t, pure, roots))
+        site || parameter_select(value, &t.params).is_some() || !value.visit_rvalues(&mut |child| !folds(child, t, pure, roots, folded))
     }
-    fn block_folds(stmts: &[Statement], t: &Target, pure: &fold::PureHelpers, roots: &[RValue]) -> bool {
+    fn block_folds(stmts: &[Statement], t: &Target, pure: &fold::PureHelpers, roots: &[RValue], folded: bool) -> bool {
         stmts.iter().any(|statement| {
-            !visit_stmt_rvalues(statement, &mut |value| !folds(value, t, pure, roots))
-                || nested_blocks(statement).iter().any(|block| block_folds(&block.lock().0, t, pure, roots))
+            !visit_stmt_rvalues(statement, &mut |value| !folds(value, t, pure, roots, folded))
+                || nested_blocks(statement).iter().any(|block| block_folds(&block.lock().0, t, pure, roots, folded))
         })
     }
-    if !block_folds(&t.pat, t, pure, &roots) {
+    if !block_folds(&t.pat, t, pure, &roots, folded) {
         return None;
     }
+    let folds_truth = block_folds(&t.pat, t, pure, &roots, false);
     let mut variant = common.target(t.kind, t.pat.clone(), raw);
     variant.value_anchor = t.value_anchor;
     variant.prefix_len = t.prefix_len;
@@ -9285,9 +13281,19 @@ fn fold_variant(t: &Target, common: &TargetCommon, raw: &[Statement], pure: &std
     variant.optional_params = Vec::new();
     variant.evidence = true;
     variant.fold = Some(pure.clone());
+    variant.folds_truth = folds_truth;
     variant.fold_roots = roots;
     variant.hosted = hosted_pattern(&variant);
     Some(variant)
+}
+
+/// `x .. "text"` or `"text" .. x`: a concatenation with nonempty text of the
+/// helper's own, which Luau folds with a constant string argument (`label
+/// .. " is not a number"` with `"Gold"`), the text then in the copy.
+fn text_concat(value: &RValue) -> bool {
+    matches!(value, RValue::Binary(binary)
+        if binary.operation == BinaryOperation::Concat
+            && [&binary.left, &binary.right].iter().any(|side| matches!(side.as_ref(), RValue::Literal(Literal::String(text)) if !text.is_empty())))
 }
 
 /// Where a value pattern's result sits at its sites ([`ValueAnchor`]), and
@@ -9411,6 +13417,7 @@ struct TargetCommon<'a> {
     captures: &'a std::rc::Rc<crate::deinline_safety::CaptureSafety>,
     proto: Option<usize>,
     lines: Option<&'a std::rc::Rc<Evidence>>,
+    own_lines: crate::source_lines::SourceLines,
 }
 
 impl TargetCommon<'_> {
@@ -9419,8 +13426,18 @@ impl TargetCommon<'_> {
     /// defaults for the caller to set.
     fn target(&self, kind: TKind, pat: Vec<Statement>, raw: &[Statement]) -> Target {
         let params = self.params;
-        let specializable = branch_conditions_read_any(&pat, params);
+        let reshaped = branch_conditions_read_any(&pat, params)
+            || (kind == TKind::Void && specializable_leading_concat(&pat, params, self.captures));
+        // Folded declarations change where a copy starts only from the first,
+        // and only where line info, if any, shows copies with a number the
+        // helper lacks.
+        let (foldable, head_folds) = foldable_statements(&pat, params);
+        let head_folds = head_folds && self.lines.zip(self.proto).is_none_or(|(lines, proto)| {
+            lines.copies.new_numbers_in_copies(proto, &pattern_numbers(&pat))
+        });
+        let specializable = reshaped || head_folds;
         let (truth_params, optional_params) = truth_tested_params(&pat, params, self.parameters);
+        let specialized_floor = if reshaped || !truth_params.is_empty() { 0 } else { pat.len() - foldable };
         let mut locals: FxHashSet<RcLocal> = FxHashSet::default();
         collect_declared_locals(&pat, &mut locals);
         for p in params {
@@ -9456,6 +13473,7 @@ impl TargetCommon<'_> {
             leading: Default::default(),
             free_cells: Default::default(),
             specializable,
+            specialized_floor,
             truth_params,
             optional_params,
             specializations: Default::default(),
@@ -9480,6 +13498,9 @@ impl TargetCommon<'_> {
             fold: None,
             fold_roots: Vec::new(),
             lines: self.lines.cloned(),
+            own_lines: self.own_lines,
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: self.captures.clone(),
             search: Default::default(),
         }
@@ -9656,7 +13677,7 @@ fn classify_returns(body: &[Statement]) -> Option<(TKind, bool)> {
     }
     if !has_void {
         let pattern = canon(body);
-        if value_leaf_shape(&pattern) || loop_return_split(&pattern).is_some() {
+        if value_leaf_shape(&pattern) || loop_return_split(&pattern).is_some() || loop_exit_shape(&pattern) {
             return Some((TKind::Value, false));
         }
     }
@@ -9677,19 +13698,6 @@ const LOOP_EXIT_ANCHORS: usize = 2;
 /// (`value_leaf_shape`). Returns the loop's index in `pattern`. Its copies
 /// store the value and leave the loop through a flag ([`match_value_loop`]).
 fn loop_return_split(pattern: &[Statement]) -> Option<usize> {
-    fn exits_once(stmts: &[Statement], found: &mut bool) -> bool {
-        stmts.iter().all(|statement| match statement {
-            Statement::Return(ret) => {
-                *found = true;
-                ret.values.len() == 1 && is_truncatable_return_value(&ret.values[0])
-            }
-            Statement::If(branch) => {
-                exits_once(&branch.then_block.lock().0, found) && exits_once(&branch.else_block.lock().0, found)
-            }
-            // A `return` two loops deep leaves through two flags.
-            other => !statement_has_return(other),
-        })
-    }
     let at = pattern.iter().position(|statement| {
         matches!(statement, Statement::GenericFor(_) | Statement::NumericFor(_) | Statement::While(_))
             && statement_has_return(statement)
@@ -10185,6 +14193,31 @@ pub(crate) fn collect_written(stmts: &[Statement], out: &mut FxHashSet<RcLocal>)
     }
 }
 
+/// The locals evaluating `value` reads the values of: a closure captures by
+/// reference a cell, read when the closure runs, so only its copies count
+/// (`{ Disconnect = function() done = true end }` reads no `done`).
+fn reads_on_evaluation(value: &RValue) -> Vec<&RcLocal> {
+    let mut by_reference: FxHashMap<RcLocal, usize> = FxHashMap::default();
+    let mut count = |value: &RValue| {
+        if let RValue::Closure(closure) = value {
+            for upvalue in &closure.upvalues {
+                if let Upvalue::Ref(local) = upvalue {
+                    *by_reference.entry(local.clone()).or_default() += 1;
+                }
+            }
+        }
+    };
+    count(value);
+    value.traverse_rvalues_ref(&mut count);
+    value.values_read().into_iter().filter(|read| match by_reference.get_mut(*read) {
+        Some(left) if *left > 0 => {
+            *left -= 1;
+            false
+        }
+        _ => true,
+    }).collect()
+}
+
 fn collect_written_in_closures(rv: &RValue, out: &mut FxHashSet<RcLocal>) {
     match rv {
         RValue::Closure(c) => collect_written(&c.function.0.lock().body.0, out),
@@ -10599,6 +14632,351 @@ mod tests {
         Statement::Call(Call::new(global("print"), vec![string("x")]))
     }
 
+    #[test]
+    fn stable_capture_snapshot_normalization_recovers_helper_calls() {
+        let (events, note, label) = (local("events"), local("note"), local("label"));
+        let snapshot = RcLocal::default();
+        let insert = |table: &RcLocal, value| Statement::Call(Call::new(
+            Index::new(global("table"), string("insert")).into(), vec![table.clone().into(), value]));
+        let mut declaration = helper_with(&note, std::slice::from_ref(&label), vec![
+            assign_local(&snapshot, events.clone().into(), true),
+            global_call("before", vec![]).into(),
+            insert(&snapshot, label.clone().into()),
+            global_call("after", vec![]).into(),
+        ]);
+        declaration.as_assign_mut().unwrap().right[0].as_closure_mut().unwrap()
+            .upvalues.push(Upvalue::Ref(events.clone()));
+        let mut body = Block(vec![
+            assign_local(&events, Table::default().into(), true), declaration,
+            global_call("before", vec![]).into(), insert(&events, string("entry")),
+            global_call("after", vec![]).into(),
+        ]);
+        deinline(&mut body);
+        let output = body.to_string();
+        assert!(output.contains("note(\"entry\") -- inferred equivalent call"), "{output}");
+        assert_eq!(count_local_reads(&body.0, &snapshot), 0);
+    }
+
+    #[test]
+    fn stable_capture_snapshot_normalization_keeps_import_and_effect_order() {
+        let (source, alias, callee, helper) = (local("source"), local("v"), local("callee"), local("helper"));
+        let mut declaration = helper_decl(&helper, vec![
+            assign_local(&alias, source.clone().into(), true),
+            assign_local(&callee, Index::new(global("table"), string("insert")).into(), true),
+            global_call("change", vec![]).into(),
+            Call::new(callee.clone().into(), vec![alias.clone().into(), string("entry")]).into(),
+        ]);
+        declaration.as_assign_mut().unwrap().right[0].as_closure_mut().unwrap()
+            .upvalues.push(Upvalue::Ref(source.clone()));
+        let mut body = Block(vec![assign_local(&source, Table::default().into(), true), declaration]);
+        let captures = crate::deinline_safety::CaptureSafety::new(&body);
+        assert!(normalize_stable_capture_snapshots(&mut body, &captures));
+        let output = body.to_string();
+        assert!(!output.contains("local v ="), "{output}");
+        assert!(output.find("local callee = table.insert").unwrap() < output.find("change()").unwrap(), "{output}");
+        assert!(output.contains("callee(source, \"entry\")"), "{output}");
+        let captures = crate::deinline_safety::CaptureSafety::new(&body);
+        assert!(!normalize_stable_capture_snapshots(&mut body, &captures));
+    }
+
+    #[test]
+    fn stable_closure_snapshot_normalization_recovers_helper_calls() {
+        for (shared, orphan) in [(false, false), (true, false), (false, true)] {
+            let (events, refresh, target, first, second) =
+                (local("events"), local("refresh"), local("target"), local("first"), local("second"));
+            let snapshot = RcLocal::default();
+            let literal = |target: &RcLocal, event_capture| closure_of(73, shared,
+                vec![Upvalue::Copy(target.clone()), event_capture], vec![return_one(bin(
+                    target.clone().into(), BinaryOperation::Concat,
+                    RValue::Unary(Unary { node_origin: Default::default(), value: Box::new(events.clone().into()),
+                        operation: UnaryOperation::Length }),
+                ))]);
+            let insert = |value| Statement::Call(Call::new(
+                Index::new(global("table"), string("insert")).into(), vec![events.clone().into(), value]));
+            let mut closure = literal(&target, Upvalue::Ref(events.clone()));
+            closure.as_closure_mut().unwrap().node_origin = crate::node_origins::Origin::synthesized("closure_snapshot_fixture");
+            let child = closure.as_closure().unwrap().function.clone();
+            let child_before = child.lock().body.to_string();
+            let mut call = insert(snapshot.clone().into());
+            call.as_call_mut().unwrap().reconstruction_event = 73;
+            let mut declaration = helper_with(&refresh, std::slice::from_ref(&target), vec![
+                assign_local(&snapshot, closure, true), call,
+            ]);
+            let helper = declaration.as_assign_mut().unwrap().right[0].as_closure_mut().unwrap();
+            helper.upvalues.push(Upvalue::Ref(events.clone()));
+            let function = helper.function.clone();
+            let mut orphans = Vec::new();
+            let mut body = Block(vec![assign_local(&events, Table::default().into(), true)]);
+            if orphan { orphans.push((refresh.clone(), helper.clone())); }
+            else { body.0.push(declaration); }
+            for (target, value) in [(&first, "x"), (&second, "y")] {
+                body.0.push(assign_local(target, string(value), true));
+                body.0.push(insert(literal(target, Upvalue::Copy(events.clone()))));
+            }
+            deinline_with_orphans(&mut body, &mut orphans);
+            let rebuilt = body.0.iter().filter_map(Statement::as_call).filter(|call| {
+                call.rebuilt.is_some() && matches!(&*call.value, RValue::Local(local) if local == &refresh)
+            }).count();
+            assert_eq!(rebuilt, if !shared && !orphan { 2 } else { 0 }, "{body}");
+            assert_eq!(child.lock().body.to_string(), child_before);
+            let helper = function.lock();
+            if orphan {
+                assert_eq!(helper.body.len(), 2);
+            } else {
+                let [Statement::Call(call)] = helper.body.0.as_slice() else { panic!("{}", helper.body) };
+                assert_eq!(call.reconstruction_event, 73);
+                let closure = call.arguments[1].as_closure().unwrap();
+                assert!(Arc::ptr_eq(&closure.function.0, &child.0));
+                assert_eq!(closure.upvalues, vec![Upvalue::Copy(target.clone()), Upvalue::Ref(events.clone())]);
+                assert!(closure.node_origin.0.as_ref().unwrap().inlined);
+                assert_eq!(closure.function.lock().closure_constant.is_some(), shared);
+            }
+        }
+    }
+
+    #[test]
+    fn stable_closure_snapshot_normalization_preserves_unproved_snapshots() {
+        for mode in ["source_write", "closure_write", "named", "protected", "multiple_reads",
+            "multiple_writes", "captured", "intervening", "retained_helper", "incomplete"] {
+            let source = local("source");
+            let snapshot = if mode == "named" { local("callback") } else { RcLocal::default() };
+            if mode == "protected" { snapshot.0.0.lock().4.conditional_result = true; }
+            let closure = closure_of(73, false, vec![Upvalue::Copy(source.clone())],
+                vec![return_one(source.clone().into())]);
+            if mode == "retained_helper" {
+                closure.as_closure().unwrap().function.lock().retain_for_reconstruction = true;
+            }
+            let mut arguments = vec![snapshot.clone().into()];
+            if mode == "multiple_reads" { arguments.push(snapshot.clone().into()); }
+            let mut body = Block(vec![assign_local(&source, string("before"), true),
+                assign_local(&snapshot, closure, true), global_call("store", arguments).into()]);
+            match mode {
+                "source_write" => body.0.push(assign_local(&source, string("after"), false)),
+                "closure_write" => body.0.push(return_one(closure_of(74, false, vec![Upvalue::Ref(source.clone())],
+                    vec![assign_local(&source, string("after"), false)]))),
+                "multiple_writes" => body.0.push(assign_local(&snapshot, global("other"), false)),
+                "captured" => body.0.push(return_one(closure_of(74, false, vec![Upvalue::Copy(snapshot.clone())],
+                    vec![return_one(snapshot.clone().into())]))),
+                "intervening" => body.0.insert(2, global_call("change", vec![]).into()),
+                _ => {}
+            }
+            let captures = if mode == "incomplete" { crate::deinline_safety::CaptureSafety::exhausted_for_tests() }
+                else { crate::deinline_safety::CaptureSafety::new(&body) };
+            let before = body.to_string();
+            assert!(!normalize_stable_capture_snapshots(&mut body, &captures), "{mode}");
+            assert_eq!(body.to_string(), before, "{mode}");
+        }
+    }
+
+    #[test]
+    fn stable_capture_snapshot_normalization_preserves_unproved_snapshots() {
+        for mode in ["source_write", "closure_write", "copy_destination", "ref_destination",
+            "named", "protected", "multiple_reads", "multiple_writes", "import", "incomplete"] {
+            let (source, helper) = (local("source"), local("helper"));
+            let alias = if mode == "named" { local("saved") } else { RcLocal::default() };
+            if mode == "protected" { alias.0.0.lock().4.conditional_result = true; }
+            let initializer = if mode == "import" { global("external") } else { source.clone().into() };
+            let mut statements = vec![assign_local(&alias, initializer, true),
+                global_call("change", vec![]).into(), return_one(alias.clone().into())];
+            if mode == "multiple_reads" {
+                statements[2] = Return::new(vec![alias.clone().into(), alias.clone().into()]).into();
+            }
+            if mode == "multiple_writes" {
+                statements.insert(2, assign_local(&alias, string("changed"), false));
+            }
+            if mode == "closure_write" {
+                statements.insert(1, assign_local(&source, string("changed"), false));
+            }
+            if mode.ends_with("_destination") {
+                let capture = if mode == "copy_destination" { Upvalue::Copy(alias.clone()) } else { Upvalue::Ref(alias.clone()) };
+                statements[2] = return_one(Closure { node_origin: Default::default(),
+                    function: ByAddress(Arc::new(Mutex::new(Function {
+                        body: Block(vec![return_one(alias.clone().into())]), ..Function::default()
+                    }))), upvalues: vec![capture],
+                }.into());
+            }
+            let mut declaration = helper_decl(&helper, statements);
+            declaration.as_assign_mut().unwrap().right[0].as_closure_mut().unwrap()
+                .upvalues.push(Upvalue::Ref(source.clone()));
+            let mut body = Block(vec![assign_local(&source, Table::default().into(), true), declaration]);
+            if mode == "source_write" { body.0.push(assign_local(&source, Table::default().into(), false)); }
+            let captures = if mode == "incomplete" { crate::deinline_safety::CaptureSafety::exhausted_for_tests() }
+                else { crate::deinline_safety::CaptureSafety::new(&body) };
+            let before = body.to_string();
+            assert!(!normalize_stable_capture_snapshots(&mut body, &captures), "mode {mode}");
+            assert_eq!(body.to_string(), before, "mode {mode}");
+        }
+    }
+
+    #[test]
+    fn stable_capture_snapshot_normalization_skips_shared_and_cyclic_bodies() {
+        for cyclic in [false, true] {
+            let source = local("source");
+            let snapshot = RcLocal::default();
+            let function = ByAddress(Arc::new(Mutex::new(Function {
+                body: Block(vec![assign_local(&snapshot, source.clone().into(), true),
+                    return_one(snapshot.clone().into())]), ..Function::default()
+            })));
+            let closure = Closure { node_origin: Default::default(), function: function.clone(),
+                upvalues: vec![Upvalue::Ref(source.clone())] };
+            let mut body = Block(vec![assign_local(&source, Table::default().into(), true),
+                assign_local(&local("first"), closure.clone().into(), true)]);
+            if cyclic {
+                function.lock().body.0.push(return_one(closure.clone().into()));
+            } else {
+                body.0.push(assign_local(&local("second"), closure.clone().into(), true));
+            }
+            let captures = crate::deinline_safety::CaptureSafety::new(&body);
+            assert!(captures.complete());
+            assert!(!captures.unique_function_bodies());
+            let changed = normalize_stable_capture_snapshots(&mut body, &captures);
+            let retained = matches!(&function.lock().body[0], Statement::Assign(assign)
+                if assign.left[0].as_local() == Some(&snapshot));
+            // Release the test-only self-cycle before asserting or dropping it.
+            if cyclic { function.lock().body.0.pop(); }
+            assert!(!changed && retained, "cyclic={cyclic}");
+        }
+    }
+
+    #[test]
+    fn seeded_specialization_folds_proved_imports_without_mutating_the_helper() {
+        for (same_callee, orphan) in [(false, false), (true, false), (true, true)] {
+            let (note, label, error) = (local("note"), local("label"), local("raise"));
+            let helper = helper_with(&note, std::slice::from_ref(&label), vec![
+                global_call("record", vec![label.clone().into()]).into(),
+                if_stmt(bin(global("failure"), BinaryOperation::Equal, label.clone().into()), vec![
+                    assign_local(&error, global("error"), true),
+                    Call::new(error.into(), vec![bin(string("fault:"), BinaryOperation::Concat,
+                        label.clone().into()), number(0.0)]).into(),
+                ], vec![]),
+            ]);
+            let function = helper.as_assign().unwrap().right[0].as_closure().unwrap().function.clone();
+            {
+                let mut body = function.lock();
+                let record = body.body[0].as_call_mut().unwrap();
+                record.node_origin = crate::node_origins::Origin::synthesized("specialization_fixture");
+                record.reconstruction_event = 73;
+            }
+            let before = function.lock().body.to_string();
+            let mut orphans = Vec::new();
+            let mut body = Block::default();
+            if orphan {
+                orphans.push((note.clone(), helper.as_assign().unwrap().right[0].as_closure().unwrap().clone()));
+            } else {
+                body.0.push(helper);
+            }
+            body.0.extend([
+                global_call("record", vec![string("entry")]).into(),
+                if_stmt(bin(global("failure"), BinaryOperation::Equal, string("entry")), vec![
+                    global_call(if same_callee { "error" } else { "anotherError" }, vec![string("fault:entry"), number(0.0)]).into(),
+                ], vec![]),
+            ]);
+            if orphan { deinline_with_orphans(&mut body, &mut orphans); } else { deinline(&mut body); }
+            let output = body.to_string();
+            assert_eq!(output.contains("note(\"entry\") -- inferred equivalent call"), same_callee && !orphan, "{output}");
+            let function = function.lock();
+            assert_eq!(function.body.to_string(), before, "same_callee={same_callee}, orphan={orphan}");
+            let record = function.body[0].as_call().unwrap();
+            let origin = record.node_origin.0.as_ref().unwrap();
+            assert_eq!(record.reconstruction_event, 73);
+            assert_eq!(origin.synthesized, Some("specialization_fixture"));
+            assert!(!origin.cloned && !origin.inlined);
+        }
+    }
+
+    #[test]
+    fn specialized_concat_snapshot_recovers_discarded_calls_without_mutating_the_helper() {
+        let (events, f, parameter, snapshot) = (local("events"), local("f"), local("p"), RcLocal::default());
+        let concat = |value| bin(string("f"), BinaryOperation::Concat, value);
+        let insert = |value| Call::new(Index::new(global("table"), string("insert")).into(),
+            vec![events.clone().into(), value]);
+        let mut declaration = helper_with(&f, std::slice::from_ref(&parameter), vec![
+            assign_local(&snapshot, concat(parameter.clone().into()), true),
+            insert(snapshot.clone().into()).into(), return_one(parameter.clone().into()),
+        ]);
+        let closure = declaration.as_assign_mut().unwrap().right[0].as_closure_mut().unwrap();
+        closure.upvalues.push(Upvalue::Ref(events.clone()));
+        let function = closure.function.clone();
+        function.lock().body[1].as_call_mut().unwrap().reconstruction_event = 73;
+        let original = function.lock().body.to_string();
+        let mut body = Block(vec![assign_local(&events, Table::default().into(), true), declaration,
+            insert(concat(number(0.0))).into(), insert(concat(number(1.0))).into(),
+            return_one(events.clone().into())]);
+        deinline(&mut body);
+        let output = body.to_string();
+        for value in [0, 1] {
+            assert!(output.contains(&format!("f({value}) -- inferred equivalent call")), "{output}");
+        }
+        let function = function.lock();
+        assert_eq!(function.body.to_string(), original);
+        assert_eq!(function.body[1].as_call().unwrap().reconstruction_event, 73);
+    }
+
+    #[test]
+    fn specialized_concat_snapshot_refuses_unknown_and_observable_operands() {
+        let (parameter, snapshot, events) = (local("p"), RcLocal::default(), local("events"));
+        let concat = |value| bin(string("f"), BinaryOperation::Concat, value);
+        let insert = |value| Statement::Call(Call::new(Index::new(global("table"), string("insert")).into(),
+            vec![events.clone().into(), value]));
+        let pattern = vec![assign_local(&snapshot, concat(parameter.clone().into()), true), insert(snapshot.clone().into())];
+        let mut target = void_target(canon(&pattern), [snapshot].into_iter().collect());
+        target.params.insert(parameter.clone());
+        target.param_order = vec![parameter];
+        target.specializable = true;
+        target.specialized_floor = 0;
+        target.captures = std::rc::Rc::new(crate::deinline_safety::CaptureSafety::new(&Block(pattern)));
+        assert!(try_unify_specialized_site(&target, &[insert(concat(number(7.0)))], None).is_some());
+        for value in [local("unknown").into(), Table::default().into(), Literal::Nil.into(), Literal::Boolean(true).into(),
+            global("external"), global_call("effect", vec![]).into(), number(std::f64::consts::PI),
+            number(f64::INFINITY), number(f64::NAN), Literal::Vector(1.0, 2.0, 3.0).into()]
+        {
+            assert!(try_unify_specialized_site(&target, &[insert(concat(value.clone()))], None).is_none(), "{value}");
+        }
+        // The fresh strict retry must still reject a different effect.
+        assert!(try_unify_specialized_site(&target,
+            &[global_call("anotherInsert", vec![events.into(), concat(number(7.0))]).into()], None).is_none());
+    }
+
+    #[test]
+    fn specialized_concat_snapshot_preserves_unproved_bindings_and_orphans() {
+        for mode in ["named", "protected", "copy", "ref", "reassigned", "multiple_reads", "orphan", "incomplete"] {
+            let parameter = local("p");
+            let snapshot = if mode == "named" { local("saved") } else { RcLocal::default() };
+            if mode == "protected" { snapshot.0.0.lock().4.conditional_result = true; }
+            let concat = |value| bin(string("f"), BinaryOperation::Concat, value);
+            let mut arguments = vec![snapshot.clone().into()];
+            if mode == "multiple_reads" { arguments.push(snapshot.clone().into()); }
+            let pattern = vec![assign_local(&snapshot, concat(parameter.clone().into()), true),
+                global_call("consume", arguments).into()];
+            let mut full = Block(pattern.clone());
+            if mode == "reassigned" { full.0.push(assign_local(&snapshot, string("later"), false)); }
+            if mode == "copy" || mode == "ref" {
+                full.0.push(return_one(Closure { node_origin: Default::default(),
+                    function: ByAddress(Arc::new(Mutex::new(Function {
+                        body: Block(vec![return_one(snapshot.clone().into())]), ..Function::default()
+                    }))), upvalues: vec![if mode == "copy" { Upvalue::Copy(snapshot.clone()) } else { Upvalue::Ref(snapshot.clone()) }],
+                }.into()));
+            }
+            let mut target = void_target(canon(&pattern), [snapshot].into_iter().collect());
+            target.params.insert(parameter.clone());
+            target.param_order = vec![parameter.clone()];
+            target.specializable = true;
+            target.specialized_floor = 0;
+            target.captures = std::rc::Rc::new(if mode == "incomplete" {
+                crate::deinline_safety::CaptureSafety::exhausted_for_tests()
+            } else { crate::deinline_safety::CaptureSafety::new(&full) });
+            if mode == "orphan" { target.orphan = Some(None); }
+            let before = Block(target.pat.clone()).to_string();
+            let candidate = [global_call("consume", vec![concat(number(7.0))]).into()];
+            assert!(try_unify_specialized_site(&target, &candidate, None).is_none(), "{mode}");
+            assert_eq!(Block(target.pat.clone()).to_string(), before, "{mode}");
+            // Exercise the committed motion boundary even when seeding was refused.
+            let mut specialized = canon(&target.pat);
+            specialize_block(&mut specialized, &[(parameter, number(7.0))].into_iter().collect());
+            assert!(!fold_specialized_leading_concat(&target, &mut specialized), "{mode}");
+        }
+    }
+
     /// Plan E2: with a fold context, a pattern value computed from
     /// parameters only records an equation against a site number (or a
     /// call of a pure helper on constants) instead of failing; `^`, a
@@ -10634,16 +15012,36 @@ mod tests {
         let mut b = Bindings::default();
         assert!(unify_rvalue(&with, &one_minus_k, &site_call, &mut b).is_ok());
         assert!(matches!(b.equations.as_slice(), [(_, Literal::Number(value))] if value.to_bits() == (6.0f64 / 60.0).to_bits()));
-        // Refused: `k ^ 2`, `math.floor(k)`, a value reading no parameter,
-        // a string site.
+        // A power Luau folded (`k ^ 2` as 9): an equation.
         let pow = RValue::Binary(Binary::new(local_value(&k), number(2.0), BinaryOperation::Pow));
+        let mut b = Bindings::default();
+        assert!(unify_rvalue(&with, &pow, &number(9.0), &mut b).is_ok());
+        assert_eq!(b.equations.len(), 1);
+        // `math.pow(10, k)` as 100 is an equation; a copy still calling it
+        // with constants saw none (`math.pow(10, id(2))`): no copy.
+        let math_pow = |exponent: RValue| RValue::Call(Call::new(RValue::Index(Index::new(global("math"), string("pow"))), vec![number(10.0), exponent]));
+        let mut b = Bindings::default();
+        assert!(unify_rvalue(&with, &math_pow(local_value(&k)), &number(100.0), &mut b).is_ok());
+        assert_eq!(b.equations.len(), 1);
+        for ctx in [&with, &without] {
+            assert!(unify_rvalue(ctx, &math_pow(local_value(&k)), &math_pow(number(2.0)), &mut Bindings::default()).is_err());
+            assert!(unify_rvalue(ctx, &math_pow(number(2.0)), &math_pow(number(2.0)), &mut Bindings::default()).is_ok());
+        }
+        // Refused: `math.floor(k)`, a value reading no parameter, a string
+        // site of a concatenation with no text of its own.
         let floor = RValue::Call(Call::new(RValue::Index(Index::new(global("math"), string("floor"))), vec![local_value(&k)]));
         let constant = RValue::Binary(Binary::new(number(1.0), number(2.0), BinaryOperation::Sub));
-        for pattern in [&pow, &floor, &constant] {
+        for pattern in [&floor, &constant] {
             assert!(unify_rvalue(&with, pattern, &number(9.0), &mut Bindings::default()).is_err());
         }
+        let bare = RValue::Binary(Binary::new(local_value(&k), local_value(&k), BinaryOperation::Concat));
+        assert!(unify_rvalue(&with, &bare, &string("ab"), &mut Bindings::default()).is_err());
+        // A text the copy holds where the helper concatenates its own text
+        // (`"a" .. k` as `"ab"`): an equation.
         let concat = RValue::Binary(Binary::new(string("a"), local_value(&k), BinaryOperation::Concat));
-        assert!(unify_rvalue(&with, &concat, &string("ab"), &mut Bindings::default()).is_err());
+        let mut b = Bindings::default();
+        assert!(unify_rvalue(&with, &concat, &string("ab"), &mut b).is_ok());
+        assert!(matches!(b.equations.as_slice(), [(_, Literal::String(text))] if text == b"ab"));
     }
 
     /// A rebuilt call leaving out parameters the body reads gets `nil` for
@@ -10711,6 +15109,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: false,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -10735,6 +15134,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         }
@@ -10919,7 +15321,6 @@ mod tests {
         };
 
         let output = rebuilt(helper_body(RValue::Literal(Literal::Nil)), site(leave(), Vec::new()));
-        // The value moves into the one statement reading it.
         assert!(output.contains("print(findItem(list, key))"), "{output}");
         assert!(!output.contains("break"), "{output}");
 
@@ -10932,7 +15333,6 @@ mod tests {
             ))
         };
         let output = rebuilt(helper_body(string("none")), site(leave(), vec![fallback(&found)]));
-        // The value moves into the one statement reading it.
         assert!(output.contains("print(findItem(list, key))"), "{output}");
 
         // A store that keeps looping is not a `return`.
@@ -11512,6 +15912,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: true,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -11536,6 +15937,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         };
@@ -11609,6 +16013,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: true,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -11633,6 +16038,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         };
@@ -11696,6 +16104,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: false,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -11720,6 +16129,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         };
@@ -11798,6 +16210,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: false,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -11822,6 +16235,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         };
@@ -12158,6 +16574,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: false,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -12182,6 +16599,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         };
@@ -12268,6 +16688,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: false,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -12292,6 +16713,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         }
@@ -12440,6 +16864,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: false,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -12464,6 +16889,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         }
@@ -12507,6 +16935,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: false,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -12531,6 +16960,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         }
@@ -12948,6 +17380,24 @@ mod tests {
     /// F4 FIX 1: `rvalue_exact_eq` is sign-of-zero / NaN bit-exact, unlike the
     /// derived `==` the return-folding and arg-consistency gates previously used.
     #[test]
+    fn interpolated_constant_strings_go_into_the_text() {
+        let text = |value: &str| RValue::Literal(Literal::String(value.as_bytes().to_vec()));
+        let format = |template: &str, arguments: Vec<RValue>| crate::MethodCall::new(text(template), "format".to_string(), arguments);
+        let x = local("x");
+        // A string with `%` goes in escaped; a number stays a hole.
+        let folded = interpolated_constants(&format("%* of %%%* (%*)", vec![RValue::Local(x.clone()), text("50%"), RValue::Literal(Literal::Number(1.0))]));
+        let Some(RValue::MethodCall(folded)) = folded else { panic!("{folded:?}") };
+        assert!(matches!(folded.value.as_ref(), RValue::Literal(Literal::String(t)) if t == b"%* of %%50%% (%*)"));
+        assert_eq!(folded.arguments.len(), 2);
+        // Every hole a string: the text itself.
+        assert!(matches!(interpolated_constants(&format("a%*b%%", vec![text("c")])), Some(RValue::Literal(Literal::String(t))) if t == b"acb%"));
+        // The holes of a pattern's text in a copy's.
+        let holes = interpolation_holes(&format("#%* to %* (%*)", vec![RValue::Local(x.clone()), RValue::Local(x.clone()), RValue::Local(x.clone())]),
+            &format("#%* to spr.stop (50%% off)", vec![RValue::Literal(Literal::Number(1.0))])).expect("aligned");
+        assert_eq!(holes, vec![None, Some(b"spr.stop".to_vec()), Some(b"50% off".to_vec())]);
+    }
+
+    #[test]
     fn rvalue_exact_eq_signed_zero_and_nan() {
         assert!(!rvalue_exact_eq(&number(0.0), &number(-0.0)));
         assert!(rvalue_exact_eq(&number(0.0), &number(0.0)));
@@ -12959,6 +17409,30 @@ mod tests {
             &bin(number(1.0), BinaryOperation::Add, number(0.0)),
             &bin(number(1.0), BinaryOperation::Add, number(-0.0)),
         ));
+    }
+
+    #[test]
+    fn call_matching_retains_native_paths_and_required_callee_grouping() {
+        let params = FxHashSet::default();
+        let locals = FxHashSet::default();
+        let ctx = MatchCtx { params: &params, locals: &locals, captures: None, fold: None };
+        let call = |flags: u8| {
+            let mut call = Call::new(Index::new(global("Vector3"), string("new")).into(), vec![number(1.0), number(2.0), number(3.0)]);
+            call.builtin_fastcall = (flags & 1 != 0).then_some((54, 2));
+            call.group_callee = flags & 2 != 0;
+            call
+        };
+        for left in 0..4 {
+            for right in 0..4 {
+                assert_eq!(unify_call(&ctx, &call(left), &call(right), &mut Bindings::default()).is_ok(), left == right);
+                for scalar in [false, true] {
+                    let value = |flags| if scalar { RValue::Select(Select::Call(call(flags))) } else { RValue::Call(call(flags)) };
+                    let (left_value, right_value) = (value(left), value(right));
+                    assert_eq!(rvalue_exact_eq(&left_value, &right_value), left == right);
+                    assert_eq!(unify_rvalue(&ctx, &left_value, &right_value, &mut Bindings::default()).is_ok(), left == right);
+                }
+            }
+        }
     }
 
     /// F4 FIX 1 in the return-folding gate: an early `return +0.0` must not be
@@ -13268,6 +17742,70 @@ mod tests {
                 .origin,
             Some(origin)
         );
+    }
+
+    #[test]
+    fn canonical_windows_are_lazy_and_match_the_uncached_form_after_splices() {
+        let make = |kind: usize| match kind % 8 {
+            0 => Statement::Empty(Empty {}),
+            1 => print_x(),
+            2 => void_return(),
+            3 => return_one(number(1.0)),
+            4 => if_stmt(global("condition"), vec![return_one(number(2.0))], vec![]),
+            5 => if_stmt(global("condition"), vec![print_x()], vec![print_x()]),
+            6 => if_stmt(global("condition"), vec![if_stmt(global("inner"), vec![return_one(number(3.0))], vec![])], vec![]),
+            _ => Statement::While(While::new(global("running"), Block(vec![print_x(), void_return()]))),
+        };
+        for seed in 0..64usize {
+            let mut statements: Vec<_> = (0..8).map(|i| make(seed.rotate_right(i as u32) + i)).collect();
+            let mut returned_only = CanonCache::default();
+            let tail = returned_only.returned(&statements, 6);
+            assert_eq!(format!("{:?}", &*tail), format!("{:?}", canon(&statements[6..])));
+            assert_eq!(returned_only.returned_nodes(&statements[6..]), statements[6..].iter().map(dbg_stmt_node_count).sum::<usize>());
+            assert!(returned_only.middle.is_none() && returned_only.last.is_empty() && returned_only.nodes.is_empty(),
+                "a returned suffix must not normalize or count the unrelated prefix");
+            let mut cache = CanonCache::default();
+            let singleton = cache.canonical(&statements, 5, 1);
+            assert_eq!(format!("{singleton:?}", singleton = &*singleton), format!("{:?}", canon(&statements[5..6])));
+            assert!(cache.middle.is_none(), "a singleton must not normalize unrelated statements");
+            for revision in 0..3 {
+                let original = format!("{statements:?}");
+                for start in 0..statements.len() {
+                    cache.clear();
+                    for width in 1..=statements.len() - start {
+                        let got = cache.canonical(&statements, start, width);
+                        let expected = canon(&statements[start..start + width]);
+                        assert_eq!(format!("{:?}", &*got), format!("{expected:?}"), "seed={seed} start={start} width={width}");
+                    }
+                    let first = cache.returned(&statements, start);
+                    let again = cache.returned(&statements, start);
+                    assert_eq!(cache.returned_nodes(&statements[start..]), statements[start..].iter().map(dbg_stmt_node_count).sum::<usize>());
+                    assert!(std::rc::Rc::ptr_eq(&first.statements, &again.statements));
+                    assert_eq!(format!("{:?}", &*first), format!("{:?}", canon(&statements[start..])));
+                }
+                assert_eq!(format!("{statements:?}"), original, "matching must leave the source tree alone");
+                let replacement = vec![make(seed + revision), make(seed + revision + 3)];
+                statements.splice(2..5, replacement);
+                cache.spliced(&statements, 2, 3, 2);
+            }
+        }
+    }
+
+    #[test]
+    fn returned_prefix_cache_includes_misses_and_is_invalidated_on_edit() {
+        let mut statements = vec![print_x(), return_one(number(1.0))];
+        let mut cache = CanonCache::default();
+        assert!(cache.returned_prefix(&statements, 0).is_none());
+        assert!(matches!(cache.returned_prefix, Some(None)));
+        statements[1] = Return::new(vec![number(7.0), number(1.0)]).into();
+        cache.spliced(&statements, 1, 1, 1);
+        let first = cache.returned_prefix(&statements, 0).unwrap();
+        let again = cache.returned_prefix(&statements, 0).unwrap();
+        assert!(std::rc::Rc::ptr_eq(&first, &again));
+        assert_eq!(first.1, vec![number(7.0)]);
+        cache.clear();
+        let next = cache.returned_prefix(&statements, 1).unwrap();
+        assert_eq!(next.0.len(), 1);
     }
 
     #[test]
@@ -13623,7 +18161,7 @@ mod tests {
             ],
             vec![assign_local(&r, local_value(&x), false)],
         )];
-        let rewritten = alias_result_leaves(&region, &r).expect("then-leaf is the alias shape");
+        let rewritten = alias_result_leaves(&region, &r, true).expect("then-leaf is the alias shape");
         let Statement::If(f) = &rewritten[0] else {
             panic!()
         };
@@ -13650,14 +18188,66 @@ mod tests {
             vec![assign_local(&r, number(1.0), false)],
             vec![assign_local(&r, local_value(&x), false)],
         )];
-        assert!(alias_result_leaves(&plain, &r).is_none());
+        assert!(alias_result_leaves(&plain, &r, true).is_none());
         // RESULT read before its write -> refused (left unchanged)
         let read_first = vec![if_stmt(
             local_value(&c),
             vec![print_local(&r), assign_local(&r, number(1.0), false), print_local(&r)],
             vec![assign_local(&r, local_value(&x), false)],
         )];
-        assert!(alias_result_leaves(&read_first, &r).is_none());
+        assert!(alias_result_leaves(&read_first, &r, true).is_none());
+    }
+
+    #[test]
+    fn merged_result_keeps_default_on_unwritten_branch() {
+        let result = local("result");
+        let candidate = local("candidate");
+        let condition = local("condition");
+        let original = vec![
+            assign_local(&result, number(10.0), false),
+            assign_local(&candidate, add_one(&result), true),
+            if_stmt(local_value(&condition),
+                vec![assign_local(&result, local_value(&candidate), false)], vec![]),
+        ];
+        let before = Block(original.clone()).to_string();
+        let rewritten = alias_result_leaves(&original, &result, true).expect("merged default");
+        let Statement::Assign(first) = &rewritten[0] else { panic!() };
+        assert!(first.prefix);
+        let LValue::Local(temp) = &first.left[0] else { panic!() };
+        assert_ne!(temp, &result);
+        assert_eq!(count_local_reads(&rewritten[1..2], temp), 1);
+        assert!(!block_reads_local(&rewritten, &result));
+        let Statement::If(branch) = &rewritten[2] else { panic!() };
+        let otherwise = branch.else_block.lock();
+        assert!(matches!(otherwise.0.as_slice(), [Statement::Assign(assign)]
+            if matches!(assign.left.as_slice(), [LValue::Local(local)] if local == &result)
+                && matches!(assign.right.as_slice(), [RValue::Local(local)] if local == temp)));
+        assert_eq!(Block(original.clone()).to_string(), before, "shared input blocks stay untouched");
+        assert!(alias_result_leaves(&original, &result, false).is_none(),
+            "a captured result cannot delay its intermediate store");
+    }
+
+    #[test]
+    fn merged_result_refuses_preexisting_reads_nonterminal_writes_and_loop_exits() {
+        let result = local("result");
+        let condition = local("condition");
+        let tail = if_stmt(local_value(&condition),
+            vec![assign_local(&result, number(20.0), false)], vec![]);
+        for prefix in [
+            vec![print_local(&result), assign_local(&result, number(10.0), false)],
+            vec![assign_local(&result, add_one(&result), false)],
+            vec![assign_local(&result, number(10.0), false), assign_local(&result, number(11.0), false)],
+            vec![assign_local(&result, number(10.0), false),
+                if_stmt(local_value(&condition), vec![crate::Continue {}.into()], vec![])],
+        ] {
+            let mut region = prefix;
+            region.push(tail.clone());
+            assert!(alias_result_leaves(&region, &result, true).is_none(), "{}", Block(region));
+        }
+        let mut compound = assign_local(&result, number(10.0), false);
+        let Statement::Assign(assign) = &mut compound else { panic!() };
+        assign.compound = true;
+        assert!(alias_result_leaves(&[compound, tail], &result, true).is_none());
     }
 
     #[test]
@@ -13693,6 +18283,7 @@ mod tests {
             leading: std::cell::OnceCell::from(crate::evaluation_order::LeadingReads::default()),
             free_cells: std::cell::OnceCell::from(Vec::new()),
             specializable: false,
+            specialized_floor: 0,
             truth_params: Vec::new(),
             optional_params: Vec::new(),
             specializations: Default::default(),
@@ -13717,6 +18308,9 @@ mod tests {
             fold: None,
             fold_roots: Vec::new(),
             lines: None,
+            own_lines: Default::default(),
+            select_truthy: Vec::new(),
+            folds_truth: false,
             captures: Default::default(),
             search: Default::default(),
         };
@@ -13774,6 +18368,7 @@ mod tests {
             captures: &Default::default(),
             proto: None,
             lines: None,
+            own_lines: Default::default(),
         };
         let mut target = common.target(kind, canon(body), body);
         let mut leaves = Vec::new();
@@ -14009,6 +18604,125 @@ mod tests {
         )
     }
 
+    fn guarded_select_target_and_site() -> (Target, Vec<Statement>, [RcLocal; 5]) {
+        let (parameter, argument, m, n, result) =
+            (local("parameter"), local("argument"), local("m"), local("n"), local("result"));
+        let predicate = |value: &RcLocal| call1(global("predicate"), local_value(value));
+        let produce = |value: &RcLocal| call1(global("produce"), local_value(value));
+        let touch = |value: &RcLocal| Statement::Call(global_call("touch", vec![local_value(value)]));
+        let pattern = vec![
+            assign_local(&m, bin(predicate(&parameter), BinaryOperation::And, produce(&parameter)), true),
+            if_stmt(local_value(&m), vec![touch(&m), return_one(boolean(true))], vec![return_one(boolean(false))]),
+        ];
+        let site = vec![if_stmt(predicate(&argument), vec![
+            assign_local(&n, produce(&argument), true),
+            if_stmt(local_value(&n), vec![touch(&n), assign_local(&result, boolean(true), false)],
+                vec![assign_local(&result, boolean(false), false)]),
+        ], vec![assign_local(&result, boolean(false), false)])];
+        let mut target = value_prefix_target(&pattern);
+        target.params.insert(parameter.clone());
+        target.param_order = vec![parameter.clone()];
+        target.single_valued = true;
+        target.pat_nodes = target.pat.iter().map(dbg_stmt_node_count).sum();
+        target.captures = std::rc::Rc::new(crate::deinline_safety::CaptureSafety::new(
+            &Block(target.pat.iter().chain(&site).cloned().collect())));
+        (target, site, [parameter, argument, m, n, result])
+    }
+
+    #[test]
+    fn guarded_select_matches_effects_and_falsy_producers_without_mutating_bodies() {
+        for literal in [None, Some(Literal::Nil), Some(Literal::Boolean(false)), Some(Literal::Boolean(true))] {
+            let (mut target, mut site, [_, argument, _, n, result]) = guarded_select_target_and_site();
+            if let Some(literal) = literal {
+                let Statement::Assign(assign) = &mut target.pat[0] else { unreachable!() };
+                let RValue::Binary(select) = &mut assign.right[0] else { unreachable!() };
+                select.right = Box::new(literal.clone().into());
+                let Statement::If(branch) = &mut site[0] else { unreachable!() };
+                let mut then = branch.then_block.lock();
+                let Statement::Assign(assign) = &mut then[0] else { unreachable!() };
+                assign.right[0] = literal.into();
+            }
+            let before = (format!("{:?}", target.pat), format!("{site:?}"));
+            let unified = try_unify_site(&target, &site, None).expect("the guard keeps predicate/producer/touch order");
+            assert!(matches!(unified.args.as_slice(), [RValue::Local(read)] if read == &argument));
+            assert_eq!(unified.result, Some(result));
+            assert!(unified.callee_locals.contains(&n), "caller liveness must still track the removed binder");
+            assert_eq!(before, (format!("{:?}", target.pat), format!("{site:?}")));
+        }
+    }
+
+    #[test]
+    fn guarded_select_rejects_unproved_scope_bindings_arms_and_budget() {
+        for mode in ["fallthrough", "else_reads_temp", "or", "source_self_read", "site_self_read",
+            "source_reassigned", "site_reassigned", "source_copy", "source_ref", "site_copy", "site_ref",
+            "parallel", "compound", "site_reassignment", "outer_else", "call_metadata", "incomplete", "budget", "orphan"]
+        {
+            let (mut target, mut site, [_, _, m, n, _]) = guarded_select_target_and_site();
+            let mut extra = Vec::new();
+            match mode {
+                "fallthrough" | "else_reads_temp" => {
+                    let Statement::If(branch) = &target.pat[1] else { unreachable!() };
+                    if mode == "fallthrough" { branch.then_block.lock().0.pop(); }
+                    else { branch.else_block.lock().0 = vec![return_one(local_value(&m))]; }
+                }
+                "or" | "source_self_read" | "parallel" | "compound" => {
+                    let Statement::Assign(assign) = &mut target.pat[0] else { unreachable!() };
+                    if mode == "parallel" { assign.parallel = true; }
+                    else if mode == "compound" { assign.compound = true; }
+                    else {
+                        let RValue::Binary(select) = &mut assign.right[0] else { unreachable!() };
+                        if mode == "or" { select.operation = BinaryOperation::Or; }
+                        else { select.left = Box::new(local_value(&m)); }
+                    }
+                }
+                "site_self_read" | "site_reassignment" | "outer_else" | "call_metadata" => {
+                    let Statement::If(branch) = &mut site[0] else { unreachable!() };
+                    match mode {
+                        "site_self_read" => branch.condition = local_value(&n),
+                        "site_reassignment" => {
+                            let mut then = branch.then_block.lock();
+                            let Statement::Assign(assign) = &mut then[0] else { unreachable!() };
+                            assign.prefix = false;
+                        }
+                        "outer_else" => {
+                            let mut otherwise = branch.else_block.lock();
+                            let Statement::Assign(assign) = &mut otherwise[0] else { unreachable!() };
+                            assign.right[0] = boolean(true);
+                        }
+                        _ => {
+                            let RValue::Call(call) = &mut branch.condition else { unreachable!() };
+                            call.group_callee = true;
+                        }
+                    }
+                }
+                "source_reassigned" | "site_reassigned" => extra.push(assign_local(
+                    if mode == "source_reassigned" { &m } else { &n }, boolean(false), false)),
+                "source_copy" | "source_ref" | "site_copy" | "site_ref" => {
+                    let captured = if mode.starts_with("source") { &m } else { &n };
+                    extra.push(return_one(Closure {
+                        node_origin: Default::default(),
+                        function: ByAddress(Arc::new(Mutex::new(Function {
+                            body: Block(vec![return_one(local_value(captured))]), ..Function::default()
+                        }))),
+                        upvalues: vec![if mode.ends_with("copy") { Upvalue::Copy(captured.clone()) } else { Upvalue::Ref(captured.clone()) }],
+                    }.into()));
+                }
+                "budget" => { assert!(!target.search.spend(usize::MAX)); }
+                "orphan" => target.orphan = Some(None),
+                "incomplete" => {},
+                _ => unreachable!(),
+            }
+            target.captures = std::rc::Rc::new(if mode == "incomplete" {
+                crate::deinline_safety::CaptureSafety::exhausted_for_tests()
+            } else {
+                crate::deinline_safety::CaptureSafety::new(&Block(target.pat.iter().chain(&site).chain(&extra).cloned().collect()))
+            });
+            let mut bindings = Bindings::default();
+            assert!(unify_block(&target, &target.pat, &site, &mut bindings).is_err(), "{mode}");
+            assert!(bindings.params.is_empty() && bindings.locals.is_empty() && bindings.result.is_none(), "{mode}: failed fallback leaked bindings");
+        }
+    }
+
     #[test]
     fn a_return_after_an_if_with_two_open_ends_closes_both() {
         let (v, m) = (local("value"), local("metatable"));
@@ -14063,6 +18777,56 @@ mod tests {
         deinline(&mut block);
         let output = block.to_string();
         assert!(output.contains("return isCallable(x)"), "{output}");
+    }
+
+    #[test]
+    fn embedded_helper_effects_cannot_move_after_a_lookup_that_runs_code() {
+        let (cell, callee) = (local("cell"), local("callee"));
+        let import = || field(global("Shared"), "max");
+        let capture = return_one(RValue::Closure(Closure {
+            node_origin: Default::default(),
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                body: Block(vec![return_one(local_value(&cell))]), ..Function::default()
+            }))),
+            upvalues: vec![Upvalue::Ref(cell.clone())],
+        }));
+        // A script table's __index can observe either the call or the
+        // captured-cell store before fetching Shared.max or a script global.
+        for prefix in [print_x(), assign_local(&cell, number(9.0), false)] {
+            let body = [prefix.clone(), return_one(number(1.0))];
+            let mut target = value_prefix_target_k(&body);
+            target.captures = std::rc::Rc::new(crate::deinline_safety::CaptureSafety::new(&Block(vec![capture.clone(), prefix.clone()])));
+            // A constant import (math.max, print) is resolved when the script loads.
+            for fetch in [import(), global("handler"), local_value(&callee), field(global("math"), "max"), global("print")] {
+                let safe = !matches!(&fetch, RValue::Global(global) if global.0 == b"handler")
+                    && !matches!(&fetch, RValue::Index(index) if matches!(&*index.left, RValue::Global(g) if g.0 == b"Shared"));
+                let site = [prefix.clone(), return_one(RValue::Call(Call::new(fetch, vec![number(1.0), number(2.0)])))];
+                let prefix_site = prefix_may_unify(&target, &site[..1]).expect("matching prefix");
+                let hit = match_embedded_value(&site, 0, 1, &target, None, false, &mut Liveness::default(), &prefix_site);
+                assert_eq!(hit.is_some(), safe);
+            }
+        }
+        // An uncaptured local store has no effect the lookup can observe.
+        let prefix = assign_local(&cell, number(9.0), false);
+        let target = value_prefix_target_k(&[prefix.clone(), return_one(number(1.0))]);
+        let site = [prefix, return_one(RValue::Call(Call::new(import(), vec![number(1.0), number(2.0)])))];
+        let prefix_site = prefix_may_unify(&target, &site[..1]).unwrap();
+        assert!(match_embedded_value(&site, 0, 1, &target, None, false, &mut Liveness::default(), &prefix_site).is_some());
+
+        // The lookup can also mutate a cell read by a pure prefix. Keep its
+        // snapshot before the lookup, including when two uses retain the copy.
+        let saved = local("saved");
+        let prefix = assign_local(&saved, local_value(&cell), true);
+        let sum = || bin(local_value(&saved), BinaryOperation::Add, local_value(&saved));
+        for captured in [false, true] {
+            let mut target = value_prefix_target_k(&[prefix.clone(), return_one(sum())]);
+            if captured {
+                target.captures = std::rc::Rc::new(crate::deinline_safety::CaptureSafety::new(&Block(vec![capture.clone()])));
+            }
+            let site = [prefix.clone(), return_one(RValue::Call(Call::new(import(), vec![sum(), number(2.0)])))];
+            let prefix_site = prefix_may_unify(&target, &site[..1]).unwrap();
+            assert_eq!(match_embedded_value(&site, 0, 1, &target, None, false, &mut Liveness::default(), &prefix_site).is_some(), !captured);
+        }
     }
 
     #[test]
@@ -14145,7 +18909,9 @@ mod tests {
         ]);
         deinline(&mut block);
         let output = block.to_string();
-        assert!(output.contains("print(f(v, true))"), "{output}");
+        // `local v = input` goes into the call: `print` before it is a
+        // constant import, which nothing `input` runs can change.
+        assert!(output.contains("print(f(input, true))"), "{output}");
     }
 
     #[test]

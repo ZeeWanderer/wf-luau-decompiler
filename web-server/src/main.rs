@@ -14,7 +14,9 @@
 //! At most `MAX_CONCURRENT_JOBS` requests run at once. Later requests wait in a
 //! bounded FIFO queue, with their bodies still unread, until a slot frees; only
 //! a full queue or an expired wait is answered with 503 and `Retry-After`.
+use std::borrow::Cow;
 use std::io;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,7 +27,7 @@ use axum::{
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::post,
-    Extension, Json, Router,
+    Extension, Router,
 };
 use base64::prelude::*;
 use http_body::Body as _;
@@ -73,6 +75,8 @@ const QUEUE_LIMIT_ENV: &str = "TOVEK_QUEUE_LIMIT";
 /// How long a request may wait for a job slot before it is turned away.
 const DEFAULT_QUEUE_TIMEOUT: Duration = Duration::from_secs(120);
 const QUEUE_TIMEOUT_ENV: &str = "TOVEK_QUEUE_TIMEOUT_SECS";
+/// Decompile threads; unset or 0 means one per CPU ([`decompile_threads`]).
+const THREADS_ENV: &str = "TOVEK_THREADS";
 /// Seconds a client that was turned away should wait before retrying.
 const RETRY_AFTER_SECS: &str = "1";
 
@@ -163,6 +167,15 @@ fn parse_queue_limit(value: &str) -> io::Result<usize> {
         format!("{QUEUE_LIMIT_ENV} must be a non-negative 32-bit integer")))
 }
 
+/// `TOVEK_THREADS`, else 0: one thread per CPU. Each running thread holds
+/// the working memory of the script it decompiles (about 6 MiB in a large
+/// batch), so fewer threads trade speed for peak memory.
+fn decompile_threads() -> io::Result<usize> {
+    env_setting(THREADS_ENV, 0, |value| value.parse::<usize>().map_err(|_| io::Error::new(
+        io::ErrorKind::InvalidInput,
+        format!("{THREADS_ENV} must be a non-negative integer"))))
+}
+
 /// An unset variable means the default; a set but invalid one stops startup.
 fn env_setting<T>(name: &str, default: T, parse: impl FnOnce(&str) -> io::Result<T>) -> io::Result<T> {
     match std::env::var(name) {
@@ -202,7 +215,7 @@ fn main() -> Result<(), io::Error> {
     // Every decompile runs on a blocking thread and rayon's workers: both get
     // the decompile stack, or a long `elseif` chain overflows it and aborts
     // the server (a 900-arm chain did with the default 2 MiB).
-    let _ = luau_lifter::configure_thread_pool(0);
+    let _ = luau_lifter::configure_thread_pool(decompile_threads()?);
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .thread_stack_size(luau_lifter::DECOMPILE_STACK_BYTES)
@@ -239,6 +252,7 @@ async fn serve() -> Result<(), io::Error> {
     // Run the web server
     let listener = TcpListener::bind(BIND_ADDR).await?;
     info!("🚀 Listening on {}", listener.local_addr()?);
+    info!("Decompiling on {} threads ({THREADS_ENV} to change).", rayon::current_num_threads());
     axum::serve(listener, app).await
 }
 
@@ -370,11 +384,12 @@ async fn decompile_batch(
         // Parsing/base64 and JSON response encoding can be large CPU jobs too;
         // keep the complete job off Tokio's asynchronous executor.
         let items = parse_batch_request(&headers, &body)?;
+        // JSON items own their decoded bytecode; MDB1 items share the body.
+        drop(body);
         let results = decompile_parsed_batch(items);
         let ok_count = results.iter().filter(|r| r.ok).count();
         info!("Batch decompiled {} scripts ({ok_count} ok).", results.len());
-        let response = BatchResponse { count: results.len(), ok_count, results };
-        Ok(Json(response).into_response())
+        Ok(batch_response(results, ok_count))
     }).await?
 }
 
@@ -388,8 +403,46 @@ where
         // spawn_blocking continues even if the HTTP future is cancelled.
         // The worker must retain admission until it releases its input/work.
         let _permit = permit;
+        let _running = RunningJob::start();
         work()
     }).await
+}
+
+/// Jobs running now: the last one to finish returns the memory they freed.
+static RUNNING_JOBS: AtomicUsize = AtomicUsize::new(0);
+const IDLE_RELEASE_DELAY: Duration = Duration::from_millis(500);
+
+struct RunningJob;
+
+impl RunningJob {
+    fn start() -> Self {
+        RUNNING_JOBS.fetch_add(1, Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for RunningJob {
+    fn drop(&mut self) {
+        if RUNNING_JOBS.fetch_sub(1, Ordering::SeqCst) == 1 {
+            // Once the response is out and no job started meanwhile: never in
+            // a request's path, and not between back-to-back requests.
+            tokio::runtime::Handle::current().spawn(async {
+                tokio::time::sleep(IDLE_RELEASE_DELAY).await;
+                if RUNNING_JOBS.load(Ordering::SeqCst) == 0 {
+                    let _ = tokio::task::spawn_blocking(release_freed_memory).await;
+                }
+            });
+        }
+    }
+}
+
+/// mimalloc keeps what a thread frees in that thread's heap for reuse, and an
+/// idle thread never gives it back: after a large batch the server would hold
+/// its peak memory while idle. Collect every decompile thread's heap.
+fn release_freed_memory() {
+    // SAFETY: mi_collect only frees memory no live allocation uses.
+    rayon::broadcast(|_| unsafe { libmimalloc_sys::mi_collect(true) });
+    unsafe { libmimalloc_sys::mi_collect(true) };
 }
 
 // ---------------------------------------------------------------------------
@@ -414,7 +467,7 @@ enum ParsedItem {
 }
 
 #[derive(Deserialize)]
-struct JsonBatchRequest {
+struct JsonBatchRequest<'a> {
     /// Decode key applied to every script (default [`DEFAULT_KEY`]).
     #[serde(default)]
     key: Option<u8>,
@@ -424,25 +477,72 @@ struct JsonBatchRequest {
     flags: Option<String>,
     #[serde(default, alias = "dontReuseVar")]
     dont_reuse_var: Option<bool>,
-    scripts: Vec<JsonBatchItem>,
+    #[serde(borrow)]
+    scripts: Vec<JsonBatchItem<'a>>,
 }
 
 #[derive(Deserialize)]
-struct JsonBatchItem {
+struct JsonBatchItem<'a> {
     /// Client-chosen correlation token, echoed back verbatim.
     #[serde(default)]
     id: Option<String>,
     #[serde(default, alias = "scriptName")]
     script_name: Option<String>,
-    /// base64-encoded bytecode.
-    bytecode: String,
+    /// base64-encoded bytecode, borrowed from the body unless it has escapes.
+    #[serde(borrow)]
+    bytecode: Cow<'a, str>,
 }
 
-#[derive(Serialize)]
-struct BatchResponse {
-    count: usize,
-    ok_count: usize,
-    results: Vec<BatchResultItem>,
+/// `{"count":N,"ok_count":K,"results":[...]}`, each result serialized on its
+/// own as the response is built, freeing its source right away instead of
+/// holding every source next to the whole response.
+fn batch_response(results: Vec<BatchResultItem>, ok_count: usize) -> Response {
+    let mut parts = Vec::with_capacity(results.len() + 2);
+    parts.push(Bytes::from(format!(r#"{{"count":{},"ok_count":{ok_count},"results":["#, results.len())));
+    for (index, result) in results.into_iter().enumerate() {
+        let mut part = Vec::new();
+        if index != 0 {
+            part.push(b',');
+        }
+        serde_json::to_writer(&mut part, &result).expect("a batch result serializes");
+        parts.push(Bytes::from(part));
+    }
+    parts.push(Bytes::from_static(b"]}"));
+    let length = parts.iter().map(|part| part.len() as u64).sum();
+    Response::builder()
+        .header(CONTENT_TYPE, "application/json")
+        .body(Body::new(Parts { parts: parts.into_iter(), remaining: length }))
+        .expect("a batch response builds")
+}
+
+/// A response body sent part by part, each freed once written.
+struct Parts {
+    parts: std::vec::IntoIter<Bytes>,
+    remaining: u64,
+}
+
+impl http_body::Body for Parts {
+    type Data = Bytes;
+    type Error = std::convert::Infallible;
+
+    fn poll_frame(
+        mut self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Bytes>, Self::Error>>> {
+        let part = self.parts.next();
+        if let Some(part) = &part {
+            self.remaining -= part.len() as u64;
+        }
+        std::task::Poll::Ready(part.map(|part| Ok(http_body::Frame::data(part))))
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.remaining == 0
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        http_body::SizeHint::with_exact(self.remaining)
+    }
 }
 
 #[derive(Serialize)]

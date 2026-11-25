@@ -44,6 +44,7 @@ pub struct BindingReport {
     pub id: u64,
     pub before: String,
     pub after: String,
+    pub name_tier: crate::NameTier,
     pub kind: &'static str,
     pub scope: Option<usize>,
     pub status: &'static str,
@@ -72,6 +73,7 @@ pub struct Report {
 
 struct Node {
     local: RcLocal,
+    name_tier: crate::NameTier,
     before: String,
     kind: &'static str,
     scope: Option<usize>,
@@ -156,8 +158,8 @@ struct Graph {
     /// The locals `merge(table, props)` calls start from.
     merge_bases: Vec<u64>,
     /// `local a, b = helper(...)` calls the de-inliner rebuilt: (helper,
-    /// result locals).
-    rebuilt_results: Vec<(u64, Vec<Option<u64>>)>,
+    /// result locals, the constant arguments by position).
+    rebuilt_results: Vec<(u64, Vec<Option<u64>>, Vec<Option<RValue>>)>,
     /// The function each local is declared as, read only for the helpers of
     /// `rebuilt_results`.
     closures: BTreeMap<u64, Arc<Mutex<Function>>>,
@@ -185,7 +187,8 @@ fn generated_stem(name: &str) -> Option<(usize, usize)> {
 /// for `scope:Computed(..)`, `value` for `scope:Value(..)`): strong role
 /// evidence, such as the property it is bound to, names it better.
 fn weak(node: &Node) -> bool {
-    node.kind == "local" && matches!(node.before.trim_end_matches(|c: char| c.is_ascii_digit()), "computed" | "value")
+    node.name_tier == crate::NameTier::TypeFallback
+        || node.kind == "local" && matches!(node.before.trim_end_matches(|c: char| c.is_ascii_digit()), "computed" | "value")
 }
 
 /// The name `node` carries before any counter a namer added (`part` for
@@ -196,7 +199,8 @@ fn base_name(node: &Node) -> &str {
 
 /// The lowest priority that renames `node`'s current name.
 fn rename_floor(node: &Node) -> u8 {
-    if weak(node) { 80 } else { 40 }
+    if node.name_tier == crate::NameTier::TypeFallback { 21 }
+    else if weak(node) { 80 } else { 40 }
 }
 
 fn useful(name: &str) -> bool {
@@ -456,11 +460,13 @@ impl Graph {
             let type_evidence = data.1.as_ref().filter(|_| self.options.emit_report).map(|hint| TypeEvidence {
                 representation: hint.clone(), origin: "recorded_bytecode_local_type_naming_hint",
             }).into_iter().collect();
+            let name_tier = data.4.name_tier;
             drop(data);
             self.nodes.insert(
                 id,
                 Node {
                     local: local.clone(),
+                    name_tier,
                     before,
                     kind: "external",
                     scope: None,
@@ -778,7 +784,8 @@ impl Graph {
                                 arguments: call.arguments.last().is_none_or(|arg| !matches!(arg, RValue::Call(_) | RValue::MethodCall(_) | RValue::VarArg(_))).then_some(call.arguments.len()),
                                 destinations: assign.left.iter().map(|v| v.as_local().map(RcLocal::stable_id)).collect() });
                             if call.rebuilt.is_some() && assign.prefix && let Some(callee) = local_id(&call.value) {
-                                self.rebuilt_results.push((callee, assign.left.iter().map(|v| v.as_local().map(RcLocal::stable_id)).collect()));
+                                self.rebuilt_results.push((callee, assign.left.iter().map(|v| v.as_local().map(RcLocal::stable_id)).collect(),
+                                    call.arguments.iter().map(|a| matches!(a, RValue::Literal(_)).then(|| a.clone())).collect()));
                             }
                         }
                     }
@@ -1093,11 +1100,11 @@ impl Graph {
     /// any other role evidence of the result decides first.
     fn name_rebuilt_results(&mut self) {
         let mut returned: BTreeMap<(u64, usize), Vec<Option<u64>>> = BTreeMap::new();
-        for (callee, destinations) in std::mem::take(&mut self.rebuilt_results) {
+        for (callee, destinations, constants) in std::mem::take(&mut self.rebuilt_results) {
             if !self.resolvable_function(callee) {
                 continue;
             }
-            let Some(function) = self.closures.get(&callee) else { continue };
+            let Some(function) = self.closures.get(&callee).cloned() else { continue };
             let budget = self.options.node_budget;
             let slots = returned
                 .entry((callee, destinations.len()))
@@ -1107,8 +1114,8 @@ impl Graph {
                 let Some(destination) = *destination else { continue };
                 let source = slots[slot];
                 let name = source
-                    .and_then(|id| self.nodes.get(&id))
-                    .map(|node| base_name(node).to_string())
+                    .and_then(|id| constant_lookup_name(&function.lock(), id, &constants))
+                    .or_else(|| source.and_then(|id| self.nodes.get(&id)).map(|node| base_name(node).to_string()))
                     .filter(|name| useful(name))
                     .or_else(|| {
                         let helper = &self.nodes.get(&callee)?.before;
@@ -1225,7 +1232,11 @@ impl Graph {
                 continue;
             }
             index.insert(Cow::Owned(candidate.clone()), node);
-            node.local.0.lock().0 = Some(candidate.clone());
+            {
+                let mut local = node.local.0.lock();
+                local.0 = Some(candidate.clone());
+                local.4.name_tier = crate::NameTier::Evidence;
+            }
             if emit { statuses.insert(id, "renamed"); }
             self.report.renamed += 1;
         }
@@ -1403,6 +1414,7 @@ impl Graph {
                     id,
                     before: node.before,
                     after,
+                    name_tier: node.local.0.lock().4.name_tier,
                     kind: node.kind,
                     scope: node.scope,
                     status: statuses[&id],
@@ -1672,6 +1684,40 @@ impl<'a> NameIndex<'a> {
 /// same one of its own locals (never a parameter) on every `return` that
 /// gives the slot a value other than `nil`. Nested functions' returns are
 /// theirs; `budget` bounds the statements visited.
+/// The name the value of `local` (declared at `function`'s top) takes
+/// with the call's constant arguments for its parameters: a lookup by a
+/// parameter (`local child = instance:FindFirstChild(childName)`) called
+/// with `"Drop"` gives `drop`, as the copy's own `FindFirstChild("Drop")`
+/// named it before the call was rebuilt.
+fn constant_lookup_name(function: &Function, local: u64, constants: &[Option<RValue>]) -> Option<String> {
+    fn substitute(value: &mut RValue, parameters: &[RcLocal], constants: &[Option<RValue>], changed: &mut bool) {
+        if let RValue::Local(read) = value
+            && let Some(at) = parameters.iter().position(|parameter| parameter == read)
+            && let Some(Some(constant)) = constants.get(at)
+        {
+            *value = constant.clone();
+            *changed = true;
+            return;
+        }
+        if !matches!(value, RValue::Closure(_)) {
+            value.visit_rvalues_mut(&mut |child| { substitute(child, parameters, constants, changed); true });
+        }
+    }
+    if constants.iter().all(Option::is_none) {
+        return None;
+    }
+    let mut value = function.body.0.iter().find_map(|statement| match statement {
+        Statement::Assign(assign) if assign.prefix => match (assign.left.as_slice(), assign.right.as_slice()) {
+            ([LValue::Local(declared)], [value]) if declared.stable_id() == local => Some(value.clone()),
+            _ => None,
+        },
+        _ => None,
+    })?;
+    let mut changed = false;
+    substitute(&mut value, &function.parameters, constants, &mut changed);
+    changed.then(|| crate::name_locals::rvalue_hint(&value)).flatten()
+}
+
 fn returned_locals(function: &Function, slots: usize, budget: usize) -> Vec<Option<u64>> {
     #[derive(Clone, Copy, PartialEq)]
     enum Slot {
@@ -2585,6 +2631,18 @@ mod tests {
         assert_eq!(receiver.to_string(), "self");
         assert_eq!(report.renamed, 0);
         assert_eq!(report.bindings[0].status, "source_protected");
+    }
+
+    #[test]
+    fn consumer_role_overrides_only_a_weak_type_name() {
+        for (tier, expected) in [(crate::NameTier::TypeFallback, "title"), (crate::NameTier::Evidence, "str")] {
+            let parameter = local("str");
+            parameter.0.lock().4.name_tier = tier;
+            let block = function(vec![parameter.clone()], vec![record("Title", &parameter)]);
+            let report = run(&block);
+            assert_eq!(parameter.to_string(), expected);
+            assert_eq!(report.bindings[0].name_tier, crate::NameTier::Evidence);
+        }
     }
 
     #[test]

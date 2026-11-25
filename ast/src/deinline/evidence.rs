@@ -30,6 +30,10 @@ pub struct Copies {
     /// `(caller, outer, inner)`: a copy of `inner` inside a copy of `outer`
     /// in the caller's code.
     pub nested: FxHashSet<(u32, u32, u32)>,
+    /// `(caller, helper)` -> the copies of the helper inside copies of
+    /// other helpers in the caller's code: still there while those copies
+    /// are ([`admitted`]).
+    pub nested_copies: FxHashMap<(u32, u32), u32>,
     /// Fully folded copies (plan E2): `(caller, helper, value bits)` -> the
     /// copies of a one-line arithmetic helper that are one load of the
     /// number constant with those bits, its whole computation folded
@@ -54,6 +58,9 @@ pub struct Copies {
     folded: FxHashSet<(u32, u32)>,
     /// The helpers of `folded`.
     folded_helpers: FxHashSet<u32>,
+    /// Per helper, the number constants its copies refer to anywhere, read
+    /// off `copy_refs` by [`enter`].
+    copy_numbers: FxHashMap<u32, FxHashSet<u64>>,
 }
 
 /// The fully folded copies of one helper producing one constant in one
@@ -127,6 +134,14 @@ impl Copies {
         u32::try_from(helper).is_ok_and(|helper| self.folded_helpers.contains(&helper))
     }
 
+    /// Whether copies of `helper` refer to a number constant other than
+    /// those of `own`, the helper's: one its constant arguments folded
+    /// (`10000` for `math.pow(10, places)`).
+    pub fn new_numbers_in_copies(&self, helper: usize, own: &FxHashSet<u64>) -> bool {
+        u32::try_from(helper).ok().and_then(|helper| self.copy_numbers.get(&helper))
+            .is_some_and(|numbers| numbers.iter().any(|bits| !own.contains(bits)))
+    }
+
     /// Whether some function holds a copy of `helper`.
     pub fn inlined_anywhere(&self, helper: usize) -> bool {
         u32::try_from(helper).is_ok_and(|helper| self.inlined.contains(&helper))
@@ -146,6 +161,15 @@ pub(crate) struct Probed {
     pub(crate) folded_left: u32,
 }
 
+/// Whether `seen` matches and rebuilt calls are the copies of `helper` in
+/// `caller`: the outermost ones, or those with the ones inside copies of
+/// other helpers too, which stay where those copies stay.
+pub(crate) fn counts_agree(copies: &Copies, caller: usize, helper: usize, seen: usize) -> bool {
+    let outermost = copies.copies(Some(caller), helper) as usize;
+    let nested = copies.nested_copies.get(&(caller as u32, helper as u32)).copied().unwrap_or(0) as usize;
+    seen == outermost || (nested > 0 && seen == outermost + nested)
+}
+
 /// The count oracle: for each probed pair, whether its helper is rebuilt in
 /// that function now. Only where its matches, with the calls already
 /// rebuilt there, are exactly its copies there: then each match is a copy
@@ -161,7 +185,7 @@ pub(crate) fn admitted(copies: &Copies, probed: &[Probed]) -> Vec<bool> {
         .iter()
         .map(|p| match (p.caller, p.helper) {
             (Some(caller), Some(helper)) => {
-                p.hits > 0 && p.folded_left == 0 && p.hits + p.rebuilt == copies.copies(Some(caller), helper) as usize
+                p.hits > 0 && p.folded_left == 0 && counts_agree(copies, caller, helper, p.hits + p.rebuilt)
             }
             _ => false,
         })
@@ -237,6 +261,9 @@ pub fn enter(copies: Option<Copies>) -> Scope {
         copies.inlined = copies.copies.keys().map(|&(_, helper)| helper).collect();
         copies.folded = copies.copy_refs.keys().map(|&(caller, helper, _)| (caller, helper)).collect();
         copies.folded_helpers = copies.folded.iter().map(|&(_, helper)| helper).collect();
+        for &(_, helper, bits) in copies.copy_refs.keys() {
+            copies.copy_numbers.entry(helper).or_default().insert(bits);
+        }
         Rc::new(copies)
     });
     let previous = STATE.with(|state| state.replace(copies));

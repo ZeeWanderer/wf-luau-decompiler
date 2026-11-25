@@ -1,0 +1,749 @@
+//! The matching semantic fixtures run at O0/O1/O2 in semantic_roundtrip.py.
+//! These bytes pin their positive/negative presentation cases at O2; compile
+//! with Luau c2ec0d4e5ca50796ba174a7565298f59aa572268 and
+//! `--binary -O2 -g1 --fflags=false` from docs/failure_fixtures/semantic_roundtrip.
+
+const MERGED: &[u8] = include_bytes!("fixtures/deinline_merged_result_branches.luaubc");
+const CONTROL: &[u8] = include_bytes!("fixtures/late_control_flow_shapes.luaubc");
+const WHILE: &[u8] = include_bytes!("fixtures/while_inlined_condition.luaubc");
+const EVENT: &[u8] = include_bytes!("fixtures/event_parameter_roles.luaubc");
+const VECTOR: &[u8] = include_bytes!("fixtures/deinline_vector_arguments.luaubc");
+const COPY_CAPTURE: &[u8] = include_bytes!("fixtures/deinline_copy_capture_rebound.luaubc");
+const COPY_BEFORE_CAPTURE: &[u8] = include_bytes!("fixtures/deinline_copy_written_before_capture.luaubc");
+const COPY_PER_SITE: &[u8] = include_bytes!("fixtures/deinline_copy_per_site.luaubc");
+const LOOP_EXIT_HELPERS: &[u8] = include_bytes!("fixtures/deinline_loop_exit_helpers.luaubc");
+const TABLE_SHAPE: &[u8] = include_bytes!("fixtures/table_shape_from_stores.luaubc");
+const OVER_PADDING: &[u8] = include_bytes!("fixtures/table_shape_over_padding_limit.luaubc");
+const SCOPED_OVER_LIMIT: &[u8] = include_bytes!("fixtures/scoped_declarations_over_limit.luaubc");
+const FOLDED_ARGUMENTS: &[u8] = include_bytes!("fixtures/deinline_folded_constant_arguments.luaubc");
+const STORED_AND_FOLDED: &[u8] = include_bytes!("fixtures/deinline_stored_and_folded_sites.luaubc");
+const WRITTEN_OUT_BESIDE_COPY: &[u8] = include_bytes!("fixtures/deinline_written_out_beside_copy.luaubc");
+const SELECT_IN_EXPRESSION: &[u8] = include_bytes!("fixtures/deinline_select_helper_in_expression.luaubc");
+const CLOSURE_FACTORY: &[u8] = include_bytes!("fixtures/deinline_closure_factory_in_constructor.luaubc");
+const FIELDS_SIZED_BY_STORES: &[u8] = include_bytes!("fixtures/table_fields_sized_by_stores.luaubc");
+const SELECT_TRUTHY_ARGUMENTS: &[u8] = include_bytes!("fixtures/deinline_select_with_truthy_arguments.luaubc");
+const RETURNS_WRITTEN_PARAMETER: &[u8] = include_bytes!("fixtures/deinline_returns_written_parameter.luaubc");
+const SELECT_FOLDED_FOR_TRUTH: &[u8] = include_bytes!("fixtures/deinline_select_folded_for_truth.luaubc");
+const ENTRY_STORE: &[u8] = include_bytes!("fixtures/deinline_entry_store_in_argument_constructor.luaubc");
+const DEFAULT_ARGUMENT: &[u8] = include_bytes!("fixtures/deinline_default_argument_folded.luaubc");
+const CALL_TAIL: &[u8] = include_bytes!("fixtures/terminal_call_tail_and_chain_head.luaubc");
+const RETURNED_LOCALS: &[u8] = include_bytes!("fixtures/deinline_returned_locals_share_result.luaubc");
+const CLOSURE_ON_ONE_LINE: &[u8] = include_bytes!("fixtures/deinline_copy_creating_closure_on_one_line.luaubc");
+const ONE_LINE_HELPER: &[u8] = include_bytes!("fixtures/store_address_read_at_store.luaubc");
+const NESTED_COPIES: &[u8] = include_bytes!("fixtures/deinline_nested_and_adjacent_copies.luaubc");
+const RETURNED_LOCAL_LEAVES: &[u8] = include_bytes!("fixtures/deinline_returned_local_leaves.luaubc");
+const TYPEOF_DEFAULT: &[u8] = include_bytes!("fixtures/deinline_typeof_default_left_out.luaubc");
+const TRUTHY_ARMS: &[u8] = include_bytes!("fixtures/deinline_select_with_truthy_arms.luaubc");
+const SEEDED_CONSTANTS: &[u8] = include_bytes!("fixtures/deinline_seeded_constant_arguments.luaubc");
+const LOOP_CAPTURE: &[u8] = include_bytes!("fixtures/deinline_loop_variable_captured.luaubc");
+const INTERLEAVED_DECLARATION: &[u8] = include_bytes!("fixtures/deinline_caller_declaration_inside_copy.luaubc");
+const JOINED_GUARDS: &[u8] = include_bytes!("fixtures/deinline_guards_joined_across_nested_copies.luaubc");
+const ARGUMENT_TEMP_INTO_HOST: &[u8] = include_bytes!("fixtures/deinline_argument_temp_into_host.luaubc");
+const LITERAL_ARGUMENT: &[u8] = include_bytes!("fixtures/deinline_literal_argument.luaubc");
+const LITERAL_ARGUMENT_UPVALUE: &[u8] = include_bytes!("fixtures/deinline_literal_argument_upvalue.luaubc");
+const LITERAL_ARGUMENT_TWINS: &[u8] = include_bytes!("fixtures/deinline_literal_argument_twins.luaubc");
+const TUPLE_THROUGH_BRANCHES: &[u8] = include_bytes!("fixtures/deinline_tuple_through_branches.luaubc");
+const TUPLE_LITERAL_RESULT_LATER: &[u8] = include_bytes!("fixtures/deinline_tuple_literal_result_declared_later.luaubc");
+const GUARD_CHAIN_TRUTH_SELECT: &[u8] = include_bytes!("fixtures/deinline_guard_chain_truth_select.luaubc");
+const NEGATED_COMPARISON: &[u8] = include_bytes!("fixtures/expr_deinline_negated_comparison.luaubc");
+const SPECIALIZED_RETURNED_VALUE: &[u8] = include_bytes!("fixtures/deinline_specialized_returned_value.luaubc");
+const INTERPOLATED_CONSTANT_STRINGS: &[u8] = include_bytes!("fixtures/deinline_interpolated_constant_strings.luaubc");
+const GUARDED_TAIL_AND_TABLES: &[u8] = include_bytes!("fixtures/deinline_guarded_tail_and_table_arguments.luaubc");
+const TUPLE_FLIPPED_GUARD: &[u8] = include_bytes!("fixtures/deinline_tuple_flipped_guard.luaubc");
+const FOLDED_TEXT_ARGUMENT: &[u8] = include_bytes!("fixtures/deinline_folded_text_argument.luaubc");
+const CONSTANT_KEYED_LOCALS: &[u8] = include_bytes!("fixtures/deinline_constant_keyed_locals.luaubc");
+const HOSTED_SPECIALIZED_VALUE: &[u8] = include_bytes!("fixtures/deinline_hosted_specialized_value.luaubc");
+const VALUE_CHAIN: &[u8] = include_bytes!("fixtures/value_chain_and_or_clamp.luaubc");
+const VALUE_CHAIN_KEEPS_TARGET: &[u8] = include_bytes!("fixtures/value_chain_keeps_target.luaubc");
+const SAME_LINE_COPIES: &[u8] = include_bytes!("fixtures/deinline_census_same_line_copies.luaubc");
+const PROBE_EMBEDDED_HOST: &[u8] = include_bytes!("fixtures/deinline_probe_embedded_host.luaubc");
+const VOID_GUARD_POLARITY: &[u8] = include_bytes!("fixtures/deinline_void_guard_polarity.luaubc");
+const ONE_VALUED_CALLS: &[u8] = include_bytes!("fixtures/one_valued_call_parentheses.luaubc");
+const OWN_LOCAL_LOOP_EXIT: &[u8] = include_bytes!("fixtures/deinline_own_local_loop_exit.luaubc");
+const VARARG_FORWARDING: &[u8] = include_bytes!("fixtures/deinline_vararg_forwarding.luaubc");
+const POW_SPECIALIZATION: &[u8] = include_bytes!("fixtures/deinline_pow_specialization.luaubc");
+const LOOKUP_NAMES_AND_SETTER_FLAGS: &[u8] = include_bytes!("fixtures/deinline_lookup_names_and_setter_flags.luaubc");
+const INERT_DECLARATION_BETWEEN_TEMPS: &[u8] = include_bytes!("fixtures/deinline_inert_declaration_between_temps.luaubc");
+const WRITTEN_LITERAL_KEEPS_FOLDED_COPY: &[u8] = include_bytes!("fixtures/deinline_written_literal_keeps_folded_copy.luaubc");
+const EXPLICIT_ARRAY_KEYS_WITH_RECORD: &[u8] = include_bytes!("fixtures/table_explicit_array_keys_with_record.luaubc");
+const GUARD_IS_THE_HELPERS_OWN: &[u8] = include_bytes!("fixtures/deinline_guard_is_the_helpers_own.luaubc");
+const COOLDOWN_TIMESTAMP: &[u8] = include_bytes!("fixtures/naming_cooldown_timestamp_from_zero.luaubc");
+const DECLARED_ARGUMENT: &[u8] = include_bytes!("fixtures/deinline_declared_argument_stays_declared.luaubc");
+
+fn decompile(bytecode: &[u8]) -> String {
+    luau_lifter::try_decompile_bytecode_with_options(bytecode, 1, None, Default::default())
+        .expect("fixture decompiles")
+}
+
+#[test]
+fn a_table_its_later_stores_size_prints_empty() {
+    let source = decompile(TABLE_SHAPE);
+    // Luau sizes `local t = {}` from the stores after it: no `nil` items.
+    assert!(source.contains("local function collect(p, p2, p3) -- 2 equivalent calls inferred from this helper\n\tlocal v = {}\n"), "{source}");
+    assert!(source.contains("local function fill(p) -- 1 equivalent call inferred from this helper\n\tlocal v3 = {}\n"), "{source}");
+    assert!(source.contains("local function shuffled(p) -- 1 equivalent call inferred from this helper\n\tlocal v4 = {}\n\tv4[2] = p\n"), "{source}");
+}
+
+#[test]
+fn fields_the_stores_size_stay_stores_without_nil_padding() {
+    let source = decompile(FIELDS_SIZED_BY_STORES);
+    // Luau sizes `local v = {}` from all the field stores after it.
+    assert!(source.starts_with("local v = {}\nv.DisplayName = \"Premium\"\n"), "{source}");
+    assert!(!source.contains("] = nil,"), "{source}");
+}
+
+#[test]
+fn copies_folded_for_constant_arguments_are_calls_again() {
+    let source = decompile(FOLDED_ARGUMENTS);
+    // Dropped arms, folded arithmetic and comparisons, stores folded into
+    // the constructor, and spread arms: each copy is its call.
+    for call in ["local v = collect(1, nil, 3) -- inferred equivalent call",
+        "local v2 = collect(\"x\", \"y\", \"z\") -- inferred equivalent call",
+        "local v3 = fill(3) -- inferred equivalent call",
+        "local v4 = counted(4) -- inferred equivalent call"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn stored_results_reference_captures_and_folded_flags_are_calls_again() {
+    let source = decompile(STORED_AND_FOLDED);
+    // The argument's closure writes the caller's local it captures by
+    // reference; `update(false)` folded to `if v then ... end`; results go
+    // into locals the caller has, or into one nothing reads after.
+    for call in ["\ttrack({ -- inferred equivalent call\n",
+        "\t\t\tupdate(false) -- inferred equivalent call\n",
+        "\tv3, v2 = basis(-i, i + 1) -- inferred equivalent call\n",
+        "\tprint(basis(i, 3), v2) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn only_the_copy_line_info_shows_becomes_a_call() {
+    let source = decompile(WRITTEN_OUT_BESIDE_COPY);
+    // The copy keeps `lerp`'s lines; the same arithmetic written out does not.
+    assert!(source.contains("\t\twavelength = lerp(wavelength, data.EndWavelength, p) -- inferred equivalent call\n"), "{source}");
+    assert!(source.contains("((data.Amplitude or 0) - startAmplitude) * p) * p2\n"), "{source}");
+}
+
+#[test]
+fn a_select_returning_a_call_is_a_call_where_one_value_is_taken() {
+    let source = decompile(SELECT_IN_EXPRESSION);
+    // `not c and 1 or part:GetScale()` is the copy of `if c then return
+    // part:GetScale() end return 1` taking one value.
+    assert!(source.contains("\tlocal v2 = p / getScale() -- inferred equivalent call\n"), "{source}");
+}
+
+#[test]
+fn returned_locals_sharing_the_result_are_a_call() {
+    let source = decompile(RETURNED_LOCALS);
+    // `local cached = ...; return cached` / `return found`, each computed in
+    // the result's register by the copy.
+    for call in ["function torsoOf(player)
+	local humanoid = findHumanoid(player) -- inferred equivalent call
+",
+        "function healthOf(player)
+	local humanoid = findHumanoid(player) -- inferred equivalent call
+"]
+    {
+        assert!(source.contains(call), "{call}
+{source}");
+    }
+}
+
+#[test]
+fn line_info_shows_copies_of_one_line_helpers() {
+    // A copy making the helper's inner closure on its one line is the
+    // helper's; a one-line helper copied right below its definition is too.
+    let closure = decompile(CLOSURE_ON_ONE_LINE);
+    assert!(closure.contains("local function setScale(p, p2) -- 2 equivalent calls inferred from this helper
+"), "{closure}");
+    let swap = decompile(ONE_LINE_HELPER);
+    assert_eq!(swap.matches("= swap() -- inferred equivalent call").count(), 3, "{swap}");
+}
+
+#[test]
+fn a_call_tail_stays_one_return_after_the_if() {
+    let source = decompile(CALL_TAIL);
+    // The shared tail is not duplicated into a guard.
+    assert_eq!(source.matches("return self.Hooks:After(self) or self.Response").count(), 1, "{source}");
+    assert!(source.contains("	if self.Response == nil then
+"), "{source}");
+    assert!(source.contains("	return tonumber(value:match(\"(%d+)$\")) or 1e999
+"), "{source}");
+}
+
+#[test]
+fn a_default_folded_for_a_constant_or_a_left_out_argument_is_a_call() {
+    let source = decompile(DEFAULT_ARGUMENT);
+    // `(radius or 8) * 2` folded to `12` and to `16`.
+    for call in ["\nnewCorner(frame, 6) -- inferred equivalent call\n", "\nnewCorner(frame) -- inferred equivalent call\n",
+        "\nlocal corner = newCorner(frame, 3) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn a_store_folded_into_the_argument_constructor_is_a_call() {
+    let source = decompile(ENTRY_STORE);
+    for call in ["\npushSet(\"Honey\", { -- inferred equivalent call\n", "\npushSet(\"Quest\", { -- inferred equivalent call\n"] {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+    // The constructor no call took keeps its entries; the store after it stays.
+    assert!(source.contains("local plain = { moving = false }\nplain.Name = \"plain\"\n"), "{source}");
+}
+
+#[test]
+fn a_select_a_left_out_flag_folded_is_a_call() {
+    let source = decompile(SELECT_FOLDED_FOR_TRUTH);
+    // `failed and rgb(...) or rgb(...)` kept as its second arm: a setter's
+    // flag, passed `false` as an inferred one is.
+    assert!(source.contains("\t\tsetStatus(\"ok\", false) -- inferred equivalent call\n"), "{source}");
+    assert!(source.contains("\t\tsetStatus(\"bad\", true) -- inferred equivalent call\n"), "{source}");
+}
+
+#[test]
+fn a_helper_returning_a_parameter_it_writes_is_a_call() {
+    let source = decompile(RETURNS_WRITTEN_PARAMETER);
+    for call in ["safeLookup(v, data.Mode, \"none\"), -- inferred equivalent call\n",
+        "Speed = safeLookup(v, data.Speed, v.Slow), -- inferred equivalent call\n",
+        "Owner = getUserId(data.Owner) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn a_select_on_parameters_is_a_call_where_its_arguments_are_truthy() {
+    let source = decompile(SELECT_TRUTHY_ARGUMENTS);
+    // `v < 0 and 0 or v > 1 and 1 or v` is `clamp(v, 0, 1)`; after a
+    // prefix the select folds into the store using it.
+    for call in ["return clamp(value or 1, 0, 1) * 2 -- inferred equivalent call\n",
+        "return 1 - clamp(value or 0, 0, 1) -- inferred equivalent call\n",
+        "Spin = clampUnit(p.Spin, 0, 2, 0.5) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+    // Line info shows no copy of `clamp` in `clampUnit`: its own bounds
+    // checks stay as written.
+    assert!(source.contains("local function clamp(p, p2, p3) -- 2 equivalent calls"), "{source}");
+}
+
+#[test]
+fn a_function_literal_writing_captured_parameters_is_its_factory_call() {
+    let source = decompile(CLOSURE_FACTORY);
+    // Each copy declared a local per captured parameter; the calls end in
+    // no `nil`.
+    for call in ["Cutscene = makeCutscene(\"House\") } -- inferred equivalent call\n",
+        "Cutscene = makeCutscene(\"Tree\", 2, nil, \"Pos2\") -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+    // The module table is called through, not inlined: no `({ ... }).Init()`.
+    assert!(source.contains("\nlocal v3 = v2.Init()\n"), "{source}");
+}
+
+#[test]
+fn an_allocation_past_nil_padding_is_spelled_table_create() {
+    let source = decompile(OVER_PADDING);
+    assert!(source.starts_with("local function build(p)\n\tlocal v = {}\n"), "{source}");
+    // The call Luau inlined with a constant `false` allocates and stores nothing.
+    assert!(source.contains("print(#table.create(4100))"), "{source}");
+}
+
+#[test]
+fn flattened_do_blocks_come_back_over_the_local_limit() {
+    let source = decompile(SCOPED_OVER_LIMIT);
+    assert_eq!(source.matches("\ndo\n").count(), 210, "{source}");
+    assert!(source.contains("\ndo\n\tlocal v3 = v + 209\n\tlocal function c209(p)\n"), "{source}");
+}
+
+#[test]
+fn helpers_returning_from_a_loop_after_a_guard_are_rebuilt() {
+    let source = luau_lifter::try_decompile_bytecode_with_options(
+        LOOP_EXIT_HELPERS, 1, None, Default::default(),
+    ).expect("loop-exit helpers decompile");
+    // Each copy stores and breaks (or clears a flag) where the helper returns.
+    for line in ["print(repeated(1), repeated(2), repeated(3))", "print(tested(1), tested(2), tested(3))",
+        "print(find(v, true), nil, find({}, 1))"]
+    {
+        assert!(source.contains(line), "{line}
+{source}");
+    }
+    // The helper's loop returns where the source does, not `break` and a return after it.
+    assert!(!source.contains("break"), "{source}");
+}
+
+#[test]
+fn a_value_capture_written_only_before_any_closure_keeps_its_helper_calls() {
+    let source = luau_lifter::try_decompile_bytecode_with_options(
+        COPY_BEFORE_CAPTURE, 1, None, Default::default(),
+    ).expect("copy written before capture decompiles");
+    // The inlined `ensure` assigns `scale` twice, both before any closure
+    // copies it: every copy holds the value `tweenTo` captured.
+    assert_eq!(source.matches("tweenTo(").count(), 5, "{source}");
+}
+
+#[test]
+fn a_site_copying_with_no_write_since_the_helper_rebuilds_its_call() {
+    let source = luau_lifter::try_decompile_bytecode_with_options(
+        COPY_PER_SITE, 1, None, Default::default(),
+    ).expect("per-site copy proof decompiles");
+    // `cframe` is written after both closures copy it, never between them.
+    assert!(source.contains("Origin = originFor("), "{source}");
+}
+
+#[test]
+fn a_value_capture_is_not_the_current_value_after_register_reuse() {
+    let source = luau_lifter::try_decompile_bytecode_with_options(
+        COPY_CAPTURE, 1, None, Default::default(),
+    ).expect("copied capture regression decompiles");
+    // The helper returns the creation-time snapshot: its one call is rebuilt
+    // where the source makes it. The later inlined region returns the
+    // phi-selected input and stays a select, not a second `captured()`.
+    assert_eq!(source.matches("captured()").count(), 2, "{source}");
+    assert!(source.contains("if p2 then v else p"), "{source}");
+}
+
+#[test]
+fn vector_constant_arguments_rebuild_reflect_without_folding_library_calls() {
+    let source = luau_lifter::try_decompile_bytecode_with_options(
+        VECTOR, 1, None, Default::default(),
+    ).expect("vector argument regression decompiles");
+    let reflected = source.split("local function reflected(").nth(1).unwrap()
+        .split("\nend").next().unwrap();
+    assert_eq!(reflected.matches("reflect(").count(), 2, "{source}");
+    assert!(reflected.contains("-- inferred equivalent call"), "{source}");
+    assert!(source.contains("scaled(p.create(1, 2, 3))"), "mutable lookup must stay a call: {source}");
+}
+
+#[test]
+fn rebuilt_head_test_recovers_while_and_keeps_its_call_comment() {
+    let source = luau_lifter::try_decompile_bytecode_with_options(
+        WHILE, 1, None, Default::default(),
+    ).expect("inlined while condition decompiles");
+    assert!(source.contains("while alive(p) do -- inferred equivalent call"), "{source}");
+    assert!(source.contains("while not done() do -- inferred equivalent call"), "{source}");
+}
+
+#[test]
+fn character_event_parameter_is_not_named_after_parent_store() {
+    let source = luau_lifter::try_decompile_bytecode_with_options(
+        EVENT, 1, None, Default::default(),
+    ).expect("event role regression decompiles");
+    assert!(source.contains("Connect(function(character)"), "{source}");
+    assert!(source.contains(".Parent = character"), "{source}");
+}
+
+#[test]
+fn merged_default_rebuilds_only_when_the_result_cell_is_unobserved() {
+    let source = luau_lifter::try_decompile_bytecode_with_options(
+        MERGED, 1, None, Default::default(),
+    ).expect("merged-result regression decompiles");
+    let stamp = source.split("local function stamp(").nth(1).unwrap()
+        .split("local function observed(").next().unwrap();
+    assert_eq!(stamp.matches("adjusted(").count(), 1, "{source}");
+    // Function bodies are indented; the first unindented end closes observed.
+    let observed = source.split("local function observed(").nth(1).unwrap()
+        .split("\nend").next().unwrap();
+    assert!(!observed.contains("adjusted("), "a captured result must stay inline:\n{source}");
+    assert!(observed.contains("observed:"), "{source}");
+}
+
+#[test]
+fn late_loops_recover_repeat_and_keep_continue_sensitive_while() {
+    let source = luau_lifter::try_decompile_bytecode_with_options(
+        CONTROL, 1, None, Default::default(),
+    ).expect("late control-flow regression decompiles");
+    let bottom = source.split("local function bottom(").nth(1).unwrap()
+        .split("bottom({},").next().unwrap();
+    assert!(bottom.contains("repeat") && bottom.contains("until "), "{source}");
+    let continued = source.split("while true do").nth(1).unwrap()
+        .split("print(\"continue\"").next().unwrap();
+    assert!(continued.contains("continue") && continued.contains("if done() then"), "{source}");
+    let guard = source.split("local function guarded(").nth(1).unwrap()
+        .split("local function bottom(").next().unwrap();
+    assert!(!guard.contains("else"), "the small returning guard needs no else:\n{source}");
+}
+
+#[test]
+fn nested_and_adjacent_copies_are_all_calls() {
+    let source = decompile(NESTED_COPIES);
+    // Copies side by side on the helper's line, their constant arguments
+    // between them, and the last one an argument itself.
+    assert!(source.contains("local v2 = vec(nextNumber(-2, 2), nextNumber(-2, 2), nextNumber(-2, 2)) -- inferred equivalent call
+"), "{source}");
+    assert!(source.contains("local v3 = vec(nextNumber(-4, 4), nextNumber(-4, 4), nextNumber(-4, 4)) -- inferred equivalent call
+"), "{source}");
+    // A copy opening with copies inside it, its own first line folded away.
+    assert!(source.contains("return p + v2.x + v3.z, wobble(p, 3) -- inferred equivalent call
+"), "{source}");
+    assert!(source.contains("local function nextNumber(p, p2) -- 7 equivalent calls inferred from this helper
+"), "{source}");
+}
+
+#[test]
+fn a_returned_local_stored_at_every_leaf_is_a_value_helper() {
+    let source = decompile(RETURNED_LOCAL_LEAVES);
+    // Each copy stores the helper's leaves into its result: declared, then
+    // a local the caller has, down an `and` chain.
+    assert!(source.contains("	return IsFinite(data.x) and IsFinite(data.y) and IsFinite(data.z) -- inferred equivalent call
+"), "{source}");
+    assert!(source.contains("local function IsFinite(p): boolean -- 3 equivalent calls inferred from this helper
+"), "{source}");
+    assert!(source.contains("		if IsFiniteVector3(item) then -- inferred equivalent call
+"), "{source}");
+}
+
+#[test]
+fn copies_folding_a_type_tested_default_are_calls() {
+    let source = decompile(TYPEOF_DEFAULT);
+    // The default left out (`typeof(nil)` folded), and one passed, which
+    // the copy shows where the helper returns it.
+    assert!(source.contains("	Board = pickAsset(\"login\", \"board\"), -- inferred equivalent call
+"), "{source}");
+    assert!(source.contains("	Missing = pickAsset(\"shop\", \"icon\"), -- inferred equivalent call
+"), "{source}");
+    assert!(source.contains("	Named = pickAsset(\"shop\", \"icon\", \"fallback\") -- inferred equivalent call
+"), "{source}");
+}
+
+#[test]
+fn a_select_with_truthy_arms_keeps_its_condition_and_is_a_call() {
+    let source = decompile(TRUTHY_ARMS);
+    assert!(source.contains("return p + (p2 + getRandom(p3)) * 2, p - (p2 + getRandom(p3)), (p2 + getRandom(p3)) / 2 -- inferred equivalent call
+"), "{source}");
+    assert!(!source.contains("not p3 and 0"), "{source}");
+}
+
+#[test]
+fn copies_folded_for_constant_arguments_are_calls_with_them() {
+    let source = decompile(SEEDED_CONSTANTS);
+    assert!(source.contains("logEvent(p, \"STOP\", \"recovery_failed\") -- inferred equivalent call
+"), "{source}");
+    assert!(source.contains("logEvent(p, \"MOVE\", \"distance\") -- inferred equivalent call
+"), "{source}");
+}
+
+#[test]
+fn a_helper_capturing_its_loop_variable_is_called_in_that_iteration() {
+    let source = decompile(LOOP_CAPTURE);
+    assert!(source.contains("= getValue(\"a\") + getValue(\"b\") * getValue(\"c\") -- inferred equivalent call
+"), "{source}");
+}
+
+#[test]
+fn a_caller_declaration_inside_a_copy_leaves_it_whole() {
+    let source = decompile(INTERLEAVED_DECLARATION);
+    assert!(source.contains("return math.max(v, 0, hashInt(value, 7) % 10000 / 10000 - 0.5) * p -- inferred equivalent call
+"), "{source}");
+    assert!(source.contains("local v3 = hashInt(value, 41) % 10000 / 10000 * 0.22 + 1 -- inferred equivalent call
+"), "{source}");
+}
+
+#[test]
+fn guards_joined_across_nested_copies_are_calls() {
+    let source = decompile(JOINED_GUARDS);
+    assert!(source.contains("	addContentId(v, \"rbxassetid://1\") -- inferred equivalent call
+	addContentId(v, 2) -- inferred equivalent call
+"), "{source}");
+    assert!(source.contains("	addContentId(v, p) -- inferred equivalent call
+"), "{source}");
+}
+
+#[test]
+fn an_argument_temp_goes_into_a_call_inside_an_expression() {
+    let source = decompile(ARGUMENT_TEMP_INTO_HOST);
+    assert!(source.contains("return math.max(v, 0, hashInt(p.Id, 7) % 10000 / 10000 - 0.5) * p2 -- inferred equivalent call
+"), "{source}");
+    assert!(!source.contains("local id"), "{source}");
+}
+
+#[test]
+fn a_function_literal_argument_called_in_a_copy_is_passed_again() {
+    let source = decompile(LITERAL_ARGUMENT);
+    for call in ["\treturn activate(\"Garden\", function() -- inferred equivalent call\n\t\tprint(\"garden\", p)\n\t\treturn teleport(p) -- inferred equivalent call\n\tend)\n",
+        "\tlocal v = activate(\"Plot\", function() -- inferred equivalent call\n\t\tprint(\"plot\", p)\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn a_literal_argument_capturing_an_upvalue_is_passed_again() {
+    let source = decompile(LITERAL_ARGUMENT_UPVALUE);
+    for call in ["\t\treturn activate(\"Shop\", function() -- inferred equivalent call\n\t\t\treturn teleportToNpc(\"Emilia\")\n\t\tend)\n",
+        "\t\treturn activate(\"Pot\", function() -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn twin_literal_arguments_of_copies_inlined_twice_are_calls() {
+    let source = decompile(LITERAL_ARGUMENT_TWINS);
+    // Inside the handlers, and in the chunk's copies of them, where the
+    // twins are one shared constant (one binding).
+    for call in ["\t\treturn activate(\"Shop\", function() -- inferred equivalent call\n",
+        "\t\treturn activate(\"Pot\", function() -- inferred equivalent call\n",
+        "print(activate(\"Shop\", fn), activate(\"Pot\", function() -- inferred equivalent call\n",
+        "end), activate(\"Shop\", fn)) -- inferred equivalent call"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn a_tuple_through_branches_with_a_result_declared_in_one_is_a_call() {
+    let source = decompile(TUPLE_THROUGH_BRANCHES);
+    assert_eq!(source.matches("= parseOptionalPositiveInteger(").count(), 3, "{source}");
+    assert!(source.contains("\tlocal optionalPositiveInteger, v = parseOptionalPositiveInteger(p) -- inferred equivalent call\n"), "{source}");
+}
+
+#[test]
+fn a_tuple_literal_result_declared_further_down_goes_with_its_call() {
+    let source = decompile(TUPLE_LITERAL_RESULT_LATER);
+    assert!(source.contains("local size, offset, v3 = setupFlag(v) -- inferred equivalent call\nlocal size2, offset2, v4 = setupFlag(v2) -- inferred equivalent call\n"), "{source}");
+    assert!(!source.contains("= 0.745\n"), "{source}");
+}
+
+#[test]
+fn joined_guards_and_a_negation_given_as_its_truth_are_a_call() {
+    let source = decompile(GUARD_CHAIN_TRUTH_SELECT);
+    assert!(source.contains("\t\t\tif not stillCurrent() then -- inferred equivalent call\n\t\t\t\treturn\n"), "{source}");
+    // Inside literals passed to `defer` and kept aside too: scanned once back.
+    assert_eq!(source.matches("if not stillCurrent() then -- inferred equivalent call").count(), 4, "{source}");
+}
+
+#[test]
+fn a_comparison_turned_over_is_a_negated_call() {
+    let source = decompile(NEGATED_COMPARISON);
+    assert!(source.contains("\t\tif isWordChar(v) or v == \"-\" then -- inferred equivalent call\n"), "{source}");
+    assert!(!source.contains("== nil"), "{source}");
+}
+
+#[test]
+fn a_returned_copy_of_a_specialization_is_a_call() {
+    let source = decompile(SPECIALIZED_RETURNED_VALUE);
+    for call in ["\t\t\treturn compareNumbers(p.Rank, p2.Rank, true) -- inferred equivalent call\n",
+        "\t\t\treturn compareNumbers(p.Quality or 0, p2.Quality or 0, true) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn constant_strings_folded_into_an_interpolated_string_are_arguments() {
+    let source = decompile(INTERPOLATED_CONSTANT_STRINGS);
+    for call in ["\t\tassertType(2, \"spr.target\", \"number\", p2) -- inferred equivalent call\n",
+        "\t\tassertType(2, \"spr.stop\", \"string|nil\", value) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn a_guarded_tail_table_arguments_and_a_kept_result_are_calls() {
+    let source = decompile(GUARDED_TAIL_AND_TABLES);
+    for call in ["\tsetStatusWithSummary(p, p4, v2) -- inferred equivalent call\n",
+        "\t\tinvokeAction(v2, \"fetch\", {}, \"Fetched\") -- inferred equivalent call\n",
+        "invokeAction(v2, \"set\", { minutes = minutes }, string.format(",
+        "print(invokeAction(v2, \"fail\", {}, \"Failed\")) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn a_tuple_copy_keeping_its_guard_turned_over_is_a_call() {
+    let source = decompile(TUPLE_FLIPPED_GUARD);
+    assert_eq!(source.matches("local v, v2 = parse(value) -- inferred equivalent call\n").count(), 2, "{source}");
+}
+
+#[test]
+fn a_text_argument_folded_into_the_helper_s_text_is_a_call() {
+    let source = decompile(FOLDED_TEXT_ARGUMENT);
+    for call in ["local reward, v = parseReward(\"Gold\", value) -- inferred equivalent call\n",
+        "local reward2, v2 = parseReward(\"Gem\", value2) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn locals_a_constant_argument_made_constant_are_folded_in_the_copy() {
+    let source = decompile(CONSTANT_KEYED_LOCALS);
+    for call in ["refreshDesired(p, \"Enabled\", data.Enabled) -- inferred equivalent call\n",
+        "refreshDesired(p, \"Rate\", data.Rate) or v3 -- inferred equivalent call\n",
+        "refreshDesired(p, \"Brightness\", data.Brightness) or v3 -- inferred equivalent call\n",
+        "setVisible(false) -- inferred equivalent call\n",
+        "setVisible(true) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn a_specialized_copy_of_the_returned_value_alone_is_a_call_in_place() {
+    let source = decompile(HOSTED_SPECIALIZED_VALUE);
+    for call in ["\t\topenGifts(1) -- inferred equivalent call", "\t\topenGifts(2), -- inferred equivalent call", "\t\topenGifts(5) -- inferred equivalent call"] {
+        assert!(source.contains(call), "{call}\n{source}");
+    }
+}
+
+#[test]
+fn an_and_or_chain_testing_its_value_reads_as_that_value() {
+    let source = decompile(VALUE_CHAIN);
+    for line in ["\treturn p2 < p3 and p2 or p3 < p and p or p3\n",
+        "\t\tv = clamp(-v2, v2, v) -- inferred equivalent call\n",
+        "\treturn clamp(0, 1, math.floor(total * 100 + 0.5) / 100) -- inferred equivalent call\n",
+        "\tlocal v2 = clamp(v + -1.4, v + 1.4, p2.y) -- inferred equivalent call\n",
+        "\t\tcurrent = clamp(p, p2, v.DefaultZoom) or v.DefaultZoom -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(line), "{line}\n{source}");
+    }
+}
+
+#[test]
+fn a_select_kept_in_its_default_reads_as_and_or() {
+    let source = decompile(VALUE_CHAIN_KEEPS_TARGET);
+    for line in ["\treturn success and result or p3\n",
+        "safeEnum(v, data.Mode, v.Loop), -- inferred equivalent call\n",
+        "Mode = safeEnum(v, data.FlipbookMode), -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(line), "{line}\n{source}");
+    }
+}
+
+#[test]
+fn copies_line_info_counts_on_one_line_are_calls() {
+    let source = decompile(SAME_LINE_COPIES);
+    for line in ["v.new(randomRange(-0.08, 0.08), randomRange(0, 0.08), randomRange(-0.08, 0.08)) -- inferred equivalent call\n",
+        "\tlocal v4 = randomRange(0, 6.283185307179586) -- inferred equivalent call\n",
+        "\treturn randomVector(data, data2), randomRange(0.5, 1.5) -- inferred equivalent call\n"]
+    {
+        assert!(source.contains(line), "{line}\n{source}");
+    }
+}
+
+#[test]
+fn a_copy_opening_where_another_is_embedded_is_counted() {
+    let source = decompile(PROBE_EMBEDDED_HOST);
+    let line = "\treturn NormalizeAngle(p + NormalizeAngle(p2 - p) / 2) -- inferred equivalent call\n";
+    assert!(source.contains(line), "{line}\n{source}");
+}
+
+#[test]
+fn a_void_copy_matches_its_helper_in_either_polarity() {
+    let source = decompile(VOID_GUARD_POLARITY);
+    for line in ["\tpositionClone(object, cframe) -- inferred equivalent call\n", "\tpositionClone(object, cframe .. \"!\") -- inferred equivalent call\n"] {
+        assert!(source.contains(line), "{line}\n{source}");
+    }
+}
+
+#[test]
+fn a_call_giving_one_value_drops_its_adjusting_parentheses() {
+    let source = decompile(ONE_VALUED_CALLS);
+    for line in ["print(fib(10))\n", "print(select(\"#\", fib(5)), fib(3))\n", "local v = { fib(4), fib(6) }\n",
+        "(math.max(fib(7), 3)))"]
+    {
+        assert!(source.contains(line), "{line}\n{source}");
+    }
+}
+
+#[test]
+fn a_helper_returning_its_own_local_after_a_loop_exit_is_a_call() {
+    let source = decompile(OWN_LOCAL_LOOP_EXIT);
+    let line = "\tprint(find(v, list[1]), find(v, list[2]), total(list2[1]), total(list2[2])) -- inferred equivalent call\n";
+    assert!(source.contains(line), "{line}\n{source}");
+}
+
+#[test]
+fn a_copy_spreading_the_varargs_forwards_them() {
+    let source = decompile(VARARG_FORWARDING);
+    for line in ["onParameterChanged(\"Stats\", i, ...) -- inferred equivalent call\n", "onParameterChanged(\"Passives\", i, ...) -- inferred equivalent call\n"] {
+        assert!(source.contains(line), "{line}\n{source}");
+    }
+}
+
+#[test]
+fn copies_whose_power_folded_solve_it_back() {
+    let source = decompile(POW_SPECIALIZATION);
+    assert!(source.contains("-- 4 equivalent calls inferred from this helper\n\tlocal v = math.pow(10, p2)\n"), "{source}");
+    for line in [
+        "return round(p2, 2) -- inferred equivalent call\n",
+        "p2 = round(p2 / 100, 4) -- inferred equivalent call\n",
+        "p2 = round(p2, 4) -- inferred equivalent call\n",
+        "return round(p, 3) -- inferred equivalent call\n",
+    ] {
+        assert!(source.contains(line), "{line}\n{source}");
+    }
+}
+
+#[test]
+fn rebuilt_lookups_take_the_constant_name_and_setters_keep_false() {
+    let source = decompile(LOOKUP_NAMES_AND_SETTER_FLAGS);
+    for line in [
+        "local drop = findChild(instance, \"Drop\", \"Assets/Drop\") -- inferred equivalent call\n",
+        "setHighlight(instance2, false) -- inferred equivalent call\n",
+        "setHighlight(instance, true) -- inferred equivalent call\n",
+    ] {
+        assert!(source.contains(line), "{line}\n{source}");
+    }
+}
+
+#[test]
+fn an_inert_declaration_between_temps_and_copy_moves_with_the_call() {
+    let source = decompile(INERT_DECLARATION_BETWEEN_TEMPS);
+    for line in [
+        "report({ -- inferred equivalent call\n",
+        "return { active = countActive(), loops = v3.loops, cycles = v3.cycles } -- inferred equivalent call\n",
+        "local function summary() -- 1 equivalent call inferred from this helper\n\treturn { active = countActive(), loops = v3.loops } -- inferred equivalent call\n",
+    ] {
+        assert!(source.contains(line), "{line}\n{source}");
+    }
+}
+
+#[test]
+fn a_written_literal_call_keeps_the_copy_its_builtins_folded() {
+    let source = decompile(WRITTEN_LITERAL_KEEPS_FOLDED_COPY);
+    assert!(source.contains("local function round(value, p)\n\tlocal v = (math.pow)(10, p)\n"), "{source}");
+    assert!(source.contains("print((math.round)(\"1.23456\" * 100) / 100, round(v, 3))"), "{source}");
+}
+
+#[test]
+fn explicit_array_keys_beside_a_record_key_do_not_use_the_hash_part() {
+    let source = decompile(EXPLICIT_ARRAY_KEYS_WITH_RECORD);
+    assert!(source.contains("SellRewards = {\n\t{\n\t\t{ Asset = \"Gold\", Amount = 25 }"), "{source}");
+    assert!(source.contains("Secret = {"), "{source}");
+}
+
+#[test]
+fn a_copy_inside_the_helpers_own_guard_is_the_whole_guard() {
+    let source = decompile(GUARD_IS_THE_HELPERS_OWN);
+    assert_eq!(source.matches("assertSignalLike(object) -- inferred equivalent call").count(), 2, "{source}");
+    assert!(!source.contains("assertSignalLike()"), "{source}");
+}
+
+#[test]
+fn a_clock_timestamp_starting_at_zero_is_named_for_the_time_it_holds() {
+    let source = decompile(COOLDOWN_TIMESTAMP);
+    assert!(source.contains("local lastTime = 0"), "{source}");
+    assert!(source.contains("os.clock() - lastTime < p"), "{source}");
+}
+
+#[test]
+fn a_guarded_argument_keeps_its_local_and_a_function_its_blank_line() {
+    let source = decompile(DECLARED_ARGUMENT);
+    assert!(source.contains("		local humanoid = item and item.Humanoid
+
+		if not (isAlive(humanoid) and "), "{source}");
+    assert!(source.contains("if isAlive(item.Humanoid) and item.X > 0 then -- inferred equivalent call"), "{source}");
+    assert!(source.contains("end
+
+local function near(items, p)"), "{source}");
+}

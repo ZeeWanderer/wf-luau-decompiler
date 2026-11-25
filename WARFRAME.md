@@ -1,6 +1,6 @@
 # Warframe Frontend
 
-Based on Tovek v2.6.1. `wf-luau-decompiler` reads opcode-normalized Warframe Luau
+Based on Tovek v2.7. `wf-luau-decompiler` reads opcode-normalized Warframe Luau
 from a file or standard input and writes reconstructed source to standard output.
 
 ```sh

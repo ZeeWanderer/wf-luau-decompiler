@@ -531,6 +531,15 @@ fn capture_may_print_shared(
     }
 }
 
+/// Roblox's readonly constructor can spell constants directly. A generic
+/// FASTCALL proves compiler configuration, not an immutable runtime binding.
+fn vector_spelling(globals: &ast::ChunkGlobals, roblox_client: bool) -> ast::materialize_vectors::VectorSpelling {
+    use ast::materialize_vectors::VectorSpelling;
+    if roblox_client && !globals.dynamic_environment && !globals.unspellable
+        && !globals.written.contains(b"Vector3".as_slice())
+    { VectorSpelling::Vector3New } else { VectorSpelling::Snapshot }
+}
+
 fn pristine_libraries(globals: &ast::ChunkGlobals) -> ast::library_constants::Libraries {
     if globals.dynamic_environment {
         return Default::default();
@@ -748,13 +757,14 @@ fn try_decompile_bytecode_internal(
     options: DecompileOptions,
     emit_upvalue_analysis: bool,
 ) -> Result<DecompileArtifact, DecompileFailure> {
-    try_decompile_with_parser(bytecode, script_name, options, emit_upvalue_analysis, &|| {
+    try_decompile_with_parser(bytecode, encode_key == 203, script_name, options, emit_upvalue_analysis, &|| {
         deserializer::deserialize(bytecode, encode_key)
     })
 }
 
 fn try_decompile_with_parser<'a>(
     bytecode: &[u8],
+    roblox_client: bool,
     script_name: Option<&str>,
     options: DecompileOptions,
     emit_upvalue_analysis: bool,
@@ -769,7 +779,7 @@ fn try_decompile_with_parser<'a>(
             // Returning from an attempt drops its AST, analyses and thread-local
             // scopes before the next one starts. Recursive retries kept all of
             // that state alive until the final attempt finished.
-            match decompile_bytecode_internal(bytecode, parse, script_name, options, emit_upvalue_analysis, sharing)? {
+            match decompile_bytecode_internal(bytecode, parse, roblox_client, script_name, options, emit_upvalue_analysis, sharing)? {
                 DecompileAttempt::Complete(artifact) => return Ok(artifact),
                 DecompileAttempt::Retry(next) => sharing = next,
                 DecompileAttempt::RetryCompact => options.compact_style = true,
@@ -795,6 +805,7 @@ enum DecompileAttempt {
 fn decompile_bytecode_internal<'a>(
     bytecode: &[u8],
     parse: &impl Fn() -> Result<Bytecode<'a>, String>,
+    roblox_client: bool,
     script_name: Option<&str>,
     options: DecompileOptions,
     emit_upvalue_analysis: bool,
@@ -830,6 +841,7 @@ fn decompile_bytecode_internal<'a>(
                 .map_err(DecompileFailure::message)?;
             validate_source_spellings(&chunk).map_err(DecompileFailure::message)?;
             bytecode_validate::validate(&chunk).map_err(DecompileFailure::message)?;
+            bytecode_validate::admit_open_call_order(&chunk).map_err(DecompileFailure::message)?;
             if std::env::var_os("MEDAL_DUMP_TYPES").is_some() {
                 debug_dump_types(&chunk);
             }
@@ -862,9 +874,26 @@ fn decompile_bytecode_internal<'a>(
                     ast::reconstruction_search::enter(lines)
                 }
             } else { ast::reconstruction_search::enter_truncated() };
+            // In-place updates print as one variable (`offset += 1`) only in a
+            // function that line info shows holds no inlined copy and that Luau
+            // inlined nowhere: a copy and its helper must keep one shape to
+            // unify. Without line info that is unknown, so nothing changes.
+            let self_updates: Vec<bool> = match &inlined_copies {
+                Some(copies) => {
+                    let mut holds = vec![false; chunk.functions.len()];
+                    for &(caller, _) in &copies.present {
+                        if let Some(slot) = holds.get_mut(caller as usize) { *slot = true; }
+                    }
+                    (0..chunk.functions.len()).map(|proto| !holds[proto] && !inlined_prototypes[proto]).collect()
+                }
+                // A lone prototype has no helper to have inlined.
+                None if chunk.functions.len() == 1 => vec![true],
+                None => vec![false; chunk.functions.len()],
+            };
             let _inlined_copies = ast::deinline::evidence::enter(inlined_copies);
             let capture_effects = capture_effects::CaptureEffects::build(&chunk);
             let globals = std::sync::Arc::new(chunk_globals(&chunk));
+            let vector_spelling = vector_spelling(&globals, roblox_client);
             // A global no identifier spells is written `getfenv(1)["name"]`,
             // which needs the standard `getfenv` reading the environment the
             // global is read from: code naming getfenv or setfenv may
@@ -900,6 +929,12 @@ fn decompile_bytecode_internal<'a>(
                     let mut ast_func = ast_func.lock();
                     ast_func.parameter_annotations = annotations;
                     ast_func.parameter_name_hints = hints;
+                    let lines = upvalue_analysis::decode_source_lines(proto);
+                    if lines.iter().any(Option::is_some) {
+                        ast_func.source_lines = ast::source_lines::SourceLines::of(
+                            std::iter::once(proto.line_defined as u32).chain(lines.into_iter().flatten())
+                        );
+                    }
                     typed_local_hints_from_bytecode(
                         proto.type_info.as_ref(),
                         &chunk.userdata_type_names,
@@ -983,6 +1018,7 @@ fn decompile_bytecode_internal<'a>(
                     // serial tail into a rayon region without an equivalent re-base.
                     ast::set_local_id_base(id_base + func_idx as u64 * ID_STRIDE);
                     let function_id = function.id;
+                    let live_self_updates = self_updates.get(function_id).copied().unwrap_or(false);
                     let readonly_upvalues = capture_effects.readonly.get(function_id)
                         .map(Vec::as_slice).unwrap_or(&[]);
                     let written_slots = capture_effects.refusal.is_none().then_some(capture_effects.written.as_slice());
@@ -1011,6 +1047,7 @@ fn decompile_bytecode_internal<'a>(
                             readonly_upvalues,
                             written_slots,
                             sharing,
+                            live_self_updates,
                         )
                     });
 
@@ -1104,6 +1141,7 @@ fn decompile_bytecode_internal<'a>(
             {
                 ptime!(S_LINK_UPVALUES);
                 link_upvalues(&mut body, &mut upvalues);
+                ast::link_upvalues::link_orphans(&mut chunk_orphans, &mut upvalues);
                 // Copies of one shared closure constant its cache makes anew
                 // on every run, then literals whose captured constant Luau
                 // folded, read it again.
@@ -1128,6 +1166,9 @@ fn decompile_bytecode_internal<'a>(
                 }
             };
             dump_stage("linked", &body);
+            // `r = c and x or d and y or r` from the jumps Luau compiles it
+            // to, before the de-inliners compare helpers with their copies.
+            ast::conditional_expressions::fold_value_chains(&mut body);
             // Reverse continuation cloning introduced while structuring inlined
             // early returns.  This is the structured cross-jumping half of P1:
             // exact common tails are shared before the statement de-inliner tries
@@ -1152,7 +1193,9 @@ fn decompile_bytecode_internal<'a>(
                 {
                     let _t = crate::prof::Timer::new(&crate::prof::S_DEINLINE);
                     let span = ast::telemetry::Span::ast("S_DEINLINE", &body, true);
-                    ast::deinline::deinline_orphans_in(&mut body, &mut chunk_orphans, nested_orphans);
+                    // A literal kept aside back in the tree is scanned again.
+                    while ast::deinline::deinline_orphans_in_with_literal_numbers(&mut body, &mut chunk_orphans,
+                        nested_orphans, !options.assume_standard_libraries) {}
                     span.finish_ast(&body, true);
                 }
                 // Replacing an inlined region by a call can make formerly
@@ -1232,8 +1275,9 @@ fn decompile_bytecode_internal<'a>(
                     script_name,
                     NameLocalOptions {
                         dont_reuse_var: options.dont_reuse_var,
+                        vector_spelling,
                     },
-                    emit_upvalue_analysis,
+                    emit_upvalue_analysis && options.emit_binding_provenance,
                 )
             };
             dump_stage("named", &body);
@@ -1246,6 +1290,9 @@ fn decompile_bytecode_internal<'a>(
                 ptime!(S_RECOVER_METHODS);
                 ast::recover_methods::recover_methods(&mut body);
             }
+            // `local v = a; if v then v = f(x) end`, left by a call rebuilt in
+            // the branch, as `local v = a and f(x)` before temps fold.
+            ast::conditional_expressions::fold_self_guards(&mut body);
             {
                 ptime!(S_INLINE_TEMPS_1);
                 ast::inline_temps::inline_single_use_temps(&mut body);
@@ -1368,6 +1415,11 @@ fn decompile_bytecode_internal<'a>(
                 ast::flatten_guards::flatten_terminal_tail_guards(&mut body);
             }
             dump_stage("final_guards", &body);
+            // Presentation-only control flow runs after every helper matcher.
+            // It keeps lexical declarations scoped and never complements a
+            // comparison or moves a continue across a loop condition.
+            ast::cleanup_control_flow::cleanup_control_flow(&mut body);
+            dump_stage("final_control_flow", &body);
             // Luau has no `goto` or labels.  The structurer uses them only as an
             // internal edge representation, so allowing either AST node to reach
             // formatting would produce source that Luau cannot parse.  Keep this
@@ -1393,6 +1445,8 @@ fn decompile_bytecode_internal<'a>(
             }
             // The final naming graph must not keep RcLocal references alive
             // during earlier cleanup (some passes inspect reference counts).
+            // Import cleanup must precede the committed local introductions below.
+            ast::fold_import_callees::fold_import_callees(&mut body);
             let mut local_producers = Vec::new();
             // Lower remaining scalar selects at their evaluation point. Only
             // literal `not` break guards are introduced; comparisons are never
@@ -1414,6 +1468,13 @@ fn decompile_bytecode_internal<'a>(
                 emit_upvalue_analysis.then(|| serde_json::to_value(report).expect("finite select report"))
             } else { None };
             let late_timer = prof::Timer::new(&prof::S_LATE);
+            // Actual calls must survive folding; the constructor spellings of
+            // bytecode constants below deliberately remain foldable.
+            let input_fastcalls = chunk.functions.iter().any(|function| function.instructions.iter().any(|instruction|
+                matches!(instruction, instruction::Instruction::BC { op_code: op_code::OpCode::LOP_FASTCALL
+                    | op_code::OpCode::LOP_FASTCALL1 | op_code::OpCode::LOP_FASTCALL2
+                    | op_code::OpCode::LOP_FASTCALL2K | op_code::OpCode::LOP_FASTCALL3, .. })));
+            ast::preserve_builtin_calls::preserve_builtin_calls(&mut body, options.assume_standard_libraries, input_fastcalls);
             // Repeating decimals as the fractions the compiler folded. Every
             // pass before this one sees the raw literals, as the de-inliner's
             // constant-folded argument recovery (E2) will need.
@@ -1428,13 +1489,20 @@ fn decompile_bytecode_internal<'a>(
             if options.assume_standard_libraries {
                 ast::library_constants::spell_library_constants(&mut body, pristine_libraries(&globals));
             }
+            let mut materialize_vectors = None;
             if chunk.functions.iter().any(|function| function.constants.iter().any(|constant| {
                 matches!(constant, deserializer::constant::Constant::Vector(..)
                     | deserializer::constant::Constant::VectorD(..))
             })) {
-                if let Some(pass) = ast::materialize_vectors::materialize_vectors(&mut body)
+                if let Some(pass) = ast::materialize_vectors::spell_vectors(&mut body, vector_spelling)
                     .map_err(DecompileFailure::message)?
                 {
+                    if emit_upvalue_analysis {
+                        materialize_vectors = Some(serde_json::json!({
+                            "model": pass.rewrite_model, "introduced_locals": pass.introduced_locals,
+                            "introduced_bindings": pass.ledger,
+                        }));
+                    }
                     if options.emit_binding_provenance { local_producers.push(pass); }
                 }
             }
@@ -1450,18 +1518,60 @@ fn decompile_bytecode_internal<'a>(
             }
             ast::forward_declarations::bare_forward_declarations(&mut body);
             ast::compound_bases::fold_compound_bases(&mut body);
-            ast::fold_import_callees::fold_import_callees(&mut body);
-            ast::untruncate_arguments::untruncate_arguments(&mut body);
-            // List stores come from SETLIST alone (an AUX word reading as one
-            // only costs the walk).
+            ast::untruncate_arguments::untruncate_arguments(&mut body, options.assume_standard_libraries);
+            // Preserve unfinished array stores and the original hash allocation.
+            // An AUX word reading as an allocation only costs the walk.
+            let mut table_open_list_snapshots = None;
             if chunk.functions.iter().any(|function| function.instructions.iter().any(|instruction| {
-                matches!(instruction, instruction::Instruction::BC { op_code: op_code::OpCode::LOP_SETLIST, .. })
+                matches!(instruction, instruction::Instruction::BC { op_code: op_code::OpCode::LOP_SETLIST | op_code::OpCode::LOP_NEWTABLE, .. })
             })) {
-                let _span = ast::telemetry::Span::new("S_RESERVE_LIST_SLOTS");
-                ast::rebuild_table_literals::reserve_unfolded_list_slots(&mut body)
-                    .map_err(DecompileFailure::message)?;
+                let _span = ast::telemetry::Span::new("S_RESERVE_TABLE_SLOTS");
+                let reservation = ast::rebuild_table_literals::reserve_unfolded_table_slots(&mut body);
+                if reservation == Err(ast::rebuild_table_literals::OPEN_LIST_TAIL) {
+                    if let Some(pass) = ast::rebuild_table_literals::snapshot_open_list_constructors(&mut body) {
+                        if emit_upvalue_analysis {
+                            table_open_list_snapshots = Some(serde_json::json!({
+                                "model": pass.rewrite_model, "introduced_locals": pass.introduced_locals,
+                                "introduced_bindings": pass.ledger,
+                            }));
+                        }
+                        if options.emit_binding_provenance { local_producers.push(pass); }
+                    }
+                    ast::rebuild_table_literals::reserve_unfolded_table_slots(&mut body)
+                        .map_err(DecompileFailure::message)?;
+                } else if reservation == Err(ast::rebuild_table_literals::LARGE_ALLOCATION)
+                    && !globals.dynamic_environment
+                    && !globals.unspellable
+                    && !globals.written.contains(b"table".as_slice())
+                {
+                    ast::rebuild_table_literals::create_large_allocations(&mut body);
+                    ast::rebuild_table_literals::reserve_unfolded_table_slots(&mut body)
+                        .map_err(DecompileFailure::message)?;
+                } else {
+                    reservation.map_err(DecompileFailure::message)?;
+                }
             }
             drop(late_timer);
+            // Source `do` blocks the output flattened go back where a function
+            // has more locals at once than Luau allows, before the final names
+            // see their scopes.
+            if ast::coalesce_locals::declared_locals_exceed_limit(&body) {
+                ast::coalesce_locals::scope_declarations_over_limit(&mut body);
+            }
+            let name_inference = {
+                ptime!(S_REFINE_NAMES);
+                ast::refine_names::refine_final_names(&body, ast::refine_names::Options {
+                    dont_reuse_var: options.dont_reuse_var,
+                    emit_report: emit_upvalue_analysis && options.emit_binding_provenance,
+                    ..Default::default()
+                })
+            };
+            // Width uses final names; this pass preserves captured writes and
+            // introduces no bindings after the naming graph has been dropped.
+            if !options.compact_style {
+                let _span = ast::telemetry::Span::new("S_READABLE_CONDITIONALS");
+                ast::compact_conditionals::readable_conditionals(&mut body);
+            }
             // Temporaries left apart for the folding passes may, where some
             // did not fold, push a huge function past the local or register
             // limit, as may source locals of `do` blocks the output flattens:
@@ -1494,14 +1604,10 @@ fn decompile_bytecode_internal<'a>(
                 body.0.insert(0, ast::Comment::hot("native").into());
             }
             // No expression/condition mutation is permitted after this point.
-            let name_inference = {
-                ptime!(S_REFINE_NAMES);
-                ast::refine_names::refine_final_names(&body, ast::refine_names::Options {
-                    dont_reuse_var: options.dont_reuse_var,
-                    emit_report: emit_upvalue_analysis,
-                    ..Default::default()
-                })
-            };
+            {
+                let _span = ast::telemetry::Span::new("S_RETURN_TYPES");
+                ast::return_types::annotate(&mut body);
+            }
             let (out, source_occurrences, emission_map) = {
                 ptime!(S_FORMAT);
                 if emit_upvalue_analysis {
@@ -1521,10 +1627,16 @@ fn decompile_bytecode_internal<'a>(
                     &out,
                     &source_occurrences,
                 );
-                analysis.source_recovery = Some(source_recovery::audit(&chunk, &mut body, &analysis.functions));
-                analysis.name_inference = Some(source_recovery::naming_report(name_inference, legacy_naming));
+                // The name audits are detailed reports, as binding provenance
+                // is: a sidecar holds the upvalue facts a tool asks for.
+                if options.emit_binding_provenance {
+                    analysis.source_recovery = Some(source_recovery::audit(&chunk, &mut body, &analysis.functions));
+                    analysis.name_inference = Some(source_recovery::naming_report(name_inference, legacy_naming));
+                }
                 analysis.capture_effects = Some(capture_effects.report());
                 analysis.conditional_lowering = conditional_lowering;
+                analysis.materialize_vectors = materialize_vectors;
+                analysis.table_open_list_snapshots = table_open_list_snapshots;
                 if options.emit_binding_provenance {
                     analysis.binding_provenance = Some(source_recovery::provenance_report(function_traces, &mut body, emission_map, local_producers, call_origins.take_report()));
                 }
@@ -2041,7 +2153,7 @@ fn parameter_type_from_bytecode(
         LBC_TYPE_BOOLEAN => (Some(with_optional("boolean")), Some("flag".to_string())),
         LBC_TYPE_NUMBER => (Some(with_optional("number")), None),
         LBC_TYPE_STRING => (Some(with_optional("string")), None),
-        LBC_TYPE_VECTOR => (Some(with_optional("Vector3")), Some("vector".to_string())),
+        LBC_TYPE_VECTOR => (Some(with_optional("Vector3")), Some("vector3".to_string())),
         // `buf`, not `buffer`: the `buffer` library global is almost always in
         // scope wherever a buffer value is, and would force a `buffer2` suffix.
         LBC_TYPE_BUFFER => (Some(with_optional("buffer")), Some("buf".to_string())),
@@ -2066,12 +2178,11 @@ fn parameter_type_from_bytecode(
 }
 
 fn userdata_type_hint(name: &str) -> Option<String> {
-    // These built-in hints avoid a trailing digit before the namer's numeric
-    // disambiguation suffix (`point2`, rather than `vector22`).
+    // Vector dimensions are semantic; the namer disambiguates them as vector2_2.
     Some(match name {
         "CFrame" => "cframe".to_string(),
         "Color3" => "color".to_string(),
-        "Vector2" => "point".to_string(),
+        "Vector2" => "vector2".to_string(),
         "UDim2" | "UDim" => "udim".to_string(),
         "RaycastResult" => "raycastResult".to_string(),
         "NumberRange" => "range".to_string(),
@@ -2088,7 +2199,7 @@ fn type_hint_from_bytecode(tag: u8, userdata_type_names: &[(u8, &[u8])]) -> Opti
     use deserializer::function::*;
     match tag & !LBC_TYPE_OPTIONAL_BIT {
         LBC_TYPE_BOOLEAN => Some("flag".to_string()),
-        LBC_TYPE_VECTOR => Some("vector".to_string()),
+        LBC_TYPE_VECTOR => Some("vector3".to_string()),
         LBC_TYPE_BUFFER => Some("buf".to_string()),
         LBC_TYPE_THREAD => Some("thread".to_string()),
         LBC_TYPE_FUNCTION => Some("callback".to_string()),
@@ -2375,6 +2486,8 @@ fn decompile_function(
     // (`capture_effects`); `None` when that analysis refused.
     written_slots: Option<&[Vec<bool>]>,
     sharing: ast::coalesce_locals::Sharing,
+    // In-place updates may print as one variable (`offset += 1`).
+    live_self_updates: bool,
 ) -> (
     ByAddress<Arc<Mutex<ast::Function>>>,
     Vec<ast::RcLocal>,
@@ -2482,8 +2595,6 @@ fn decompile_function(
             function: function_identity, message: "CFG simplification exceeded its size-derived iteration budget".into(),
         }), function.provenance.take());
     }
-    // The orphans the SSA inliner kept aside go to the de-inliner.
-    ast_function.lock().orphans = std::mem::take(&mut function.orphans);
     // Values that took a passed cell's place in cleanup are its versions too.
     let adopted_captures = upvalue_to_group.iter()
         .filter(|(local, cell)| local_capture_bindings.contains(*cell) && !local_capture_bindings.contains(*local))
@@ -2511,8 +2622,12 @@ fn decompile_function(
         )
         .with_register_groups(&local_to_group)
         .with_unwritten_cells(&unwritten_cells)
+        .with_live_self_updates(live_self_updates)
         .destruct();
     }
+    // The orphans the SSA inliner kept aside go to the de-inliner, their
+    // captures renamed as the body's locals.
+    ast_function.lock().orphans = std::mem::take(&mut function.orphans);
     // Freeze the trace before speculative structuring clones the CFG. This
     // history contains IDs/strings only and must never keep locals alive.
     if function.provenance.is_some() {
@@ -2899,7 +3014,7 @@ mod v11_fixtures {
                 None,
                 None,
                 None,
-                Some("vector".to_string()),
+                Some("vector3".to_string()),
                 Some("callback".to_string()),
                 Some("cframe".to_string()),
                 Some("color".to_string()),
@@ -2931,7 +3046,7 @@ mod v11_fixtures {
                 LBC_TYPE_BOOLEAN => (Some(annotation("boolean")), Some("flag".into())),
                 LBC_TYPE_NUMBER => (Some(annotation("number")), None),
                 LBC_TYPE_STRING => (Some(annotation("string")), None),
-                LBC_TYPE_VECTOR => (Some(annotation("Vector3")), Some("vector".into())),
+                LBC_TYPE_VECTOR => (Some(annotation("Vector3")), Some("vector3".into())),
                 LBC_TYPE_BUFFER => (Some(annotation("buffer")), Some("buf".into())),
                 LBC_TYPE_THREAD => (Some(annotation("thread")), Some("thread".into())),
                 LBC_TYPE_FUNCTION => (None, Some("callback".into())),
@@ -2941,7 +3056,7 @@ mod v11_fixtures {
                     let hint = match name.as_str() {
                         "CFrame" => "cframe".into(),
                         "Color3" => "color".into(),
-                        "Vector2" => "point".into(),
+                        "Vector2" => "vector2".into(),
                         "UDim2" | "UDim" => "udim".into(),
                         "RaycastResult" => "raycastResult".into(),
                         "NumberRange" => "range".into(),
@@ -3278,7 +3393,8 @@ mod v11_fixtures {
             };
             build_chunk(6, 1, &[name], &[proto], 0)
         };
-        assert!(decompile(&chunk("type"), 1, None).unwrap().contains("type("));
+        let source = decompile(&chunk("type"), 1, None).unwrap();
+        assert!(source.replace("(type)", "type").contains("type("), "{source}");
         let error = decompile(&chunk("typ "), 1, None).unwrap_err();
         assert!(error.contains("a builtin call names another function"), "{error}");
         assert!(decompile(&chunk("typeof"), 1, None).is_err());
@@ -3396,7 +3512,7 @@ mod v11_fixtures {
     }
 
     #[test]
-    fn v14_fastpcall_restores_source_callee_order() {
+    fn v14_fastpcall_preserves_arguments_before_callee_lookup() {
         let strings = ["g", "h", "k", "pcall"];
         let blob = build_chunk(14, 3, &strings, &[fastpcall_proto(true)], 0);
         let out = decompile(&blob, 1, None).expect("v14 FASTPCALL chunk must decompile");
@@ -3405,8 +3521,7 @@ mod v11_fixtures {
 
     #[test]
     fn late_global_callee_without_fastpcall_stays_ordered() {
-        // The same instruction order without FASTPCALL is not an import
-        // fallback: fetching the callee global remains an ordering barrier.
+        // Explicit late lookup keeps argument snapshots without FASTPCALL metadata too.
         let strings = ["g", "h", "k", "pcall"];
         let blob = build_chunk(14, 3, &strings, &[fastpcall_proto(false)], 0);
         let out = decompile(&blob, 1, None).expect("chunk must decompile");

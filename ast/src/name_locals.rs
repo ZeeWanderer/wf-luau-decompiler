@@ -53,6 +53,8 @@ const ARGUMENT_HINT_SCORE: u8 = 30;
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct NameLocalOptions {
     pub dont_reuse_var: bool,
+    /// How vector constants will print; naming keeps that global free.
+    pub vector_spelling: crate::materialize_vectors::VectorSpelling,
 }
 
 /// Turn an arbitrary hint string (a field name, service name, type name, ...)
@@ -260,7 +262,14 @@ fn reads_private_field(value: &RValue, name: &str) -> bool {
 
 fn index_hint(index: &Index) -> Option<String> {
     if let RValue::Literal(Literal::String(key)) = &*index.right {
-        return std::str::from_utf8(key).ok().and_then(sanitize);
+        let key = std::str::from_utf8(key).ok()?;
+        // `local create = vector.create`: a bare constructor verb names its library too.
+        if let (RValue::Global(library), "create" | "new") = (&*index.left, key)
+            && let Ok(library) = std::str::from_utf8(&library.0)
+        {
+            return sanitize(&format!("{key}{}", capitalize_first(library)));
+        }
+        return sanitize(key);
     }
     None
 }
@@ -270,7 +279,7 @@ fn call_hint(call: &Call) -> Option<String> {
 }
 
 /// `call_hint` for a call of `callee`, which may stand in for the local alias
-/// actually called (`Namer::aliased_call_hint`).
+/// actually called (`assignment_hint`).
 fn call_hint_of(callee: &RValue, arguments: &[RValue]) -> Option<String> {
     // require(script.Foo) -> "Foo"; require(script.Parent) -> "parentModule"
     // (the value is a module, not the parent Instance); require(<local>) ->
@@ -431,15 +440,8 @@ fn is_instance_compatible_placeholder(rvalue: &RValue) -> bool {
     matches!(rvalue, RValue::Literal(Literal::Nil))
 }
 
-/// The variable name for a `Type.new(...)` / `Type.fromRGB(...)` constructor,
-/// derived from the receiver type. A type whose name ends in a digit (`Color3`,
-/// `Vector3`, `Vector2`, `UDim2`, `Region3`) is stripped of the trailing digits:
-/// the digit makes a misleading disambiguating suffix — `color3` then collides to
-/// `color32`, which reads as "color thirty-two" rather than "the 3rd color". The
-/// trimmed form chains cleanly as `color`, `color2`, `color3`. `Instance` and
-/// other digit-free types are unaffected.
 /// Whether `name`, the hint of `value`, is only the type a constructor call
-/// builds (`Vector2.new(x, y)` -> `vector`), not a name it was given
+/// builds (`Vector2.new(x, y)` -> `vector2`), not a name it was given
 /// (`Instance.new("Part")` -> `part`).
 fn is_constructor_type_name(value: &RValue, name: &str) -> bool {
     if let RValue::Call(call) | RValue::Select(Select::Call(call)) = value
@@ -452,6 +454,11 @@ fn is_constructor_type_name(value: &RValue, name: &str) -> bool {
 }
 
 fn constructor_type_name(receiver: &RValue) -> Option<String> {
+    // Vector dimensions distinguish types. Numeric stems already use `_2`
+    // for collisions, so vector3 never becomes the misleading vector32.
+    if matches!(global_name(receiver), Some("Vector2" | "Vector3")) {
+        return base_name_of(receiver);
+    }
     // `CFrame` lowercases to the conventional `cframe`, not `cFrame` (matches
     // the bytecode-type hint so the two never produce a `cFrame`/`cframe2` pair).
     if global_name(receiver) == Some("CFrame") {
@@ -486,6 +493,38 @@ fn strip_predicate_prefix(name: &str) -> Option<&str> {
         }
     }
     None
+}
+
+/// The one local every `return` of a function body gives (`return roots`),
+/// its nested functions aside; `None` where a return gives anything else.
+fn only_returned_local(body: &Block) -> Option<RcLocal> {
+    fn visit(block: &Block, found: &mut Option<RcLocal>) -> bool {
+        block.0.iter().all(|statement| {
+            let own = match statement {
+                Statement::Return(ret) => match ret.values.as_slice() {
+                    [RValue::Local(local)] => match found {
+                        Some(other) => other == local,
+                        None => {
+                            *found = Some(local.clone());
+                            true
+                        }
+                    },
+                    _ => false,
+                },
+                _ => true,
+            };
+            own && match statement {
+                Statement::If(branch) => visit(&branch.then_block.lock(), found) && visit(&branch.else_block.lock(), found),
+                Statement::While(node) => visit(&node.block.lock(), found),
+                Statement::Repeat(node) => visit(&node.block.lock(), found),
+                Statement::NumericFor(node) => visit(&node.block.lock(), found),
+                Statement::GenericFor(node) => visit(&node.block.lock(), found),
+                _ => true,
+            }
+        })
+    }
+    let mut found = None;
+    visit(body, &mut found).then_some(found).flatten()
 }
 
 /// The descriptive subject of a factory/getter function name: `getOwnPlot` ->
@@ -1248,6 +1287,14 @@ pub(crate) fn rvalue_hint(rvalue: &RValue) -> Option<String> {
     }
 }
 
+fn assignment_hint(rvalue: &RValue, aliases: &FxHashMap<usize, RValue>) -> Option<String> {
+    rvalue_hint(rvalue).or_else(|| {
+        let (RValue::Call(call) | RValue::Select(Select::Call(call))) = rvalue else { return None; };
+        let RValue::Local(local) = &*call.value else { return None; };
+        call_hint_of(aliases.get(&local_ptr(local))?, &call.arguments)
+    })
+}
+
 // A transform result such as `serialized` describes a value; it does not
 // identify the noun a collection contains. Keep that distinction through local
 // hints and collection consensus, rather than banning suffixes on source names.
@@ -1540,43 +1587,55 @@ fn protected_call_result_hint(rvalue: &RValue) -> Option<String> {
     sanitize(getter_name)
 }
 
+// Naming can see a saved iterator without moving its lookup past the argument.
+fn iterator_global<'a>(rvalue: &'a RValue, aliases: &'a FxHashMap<usize, RValue>) -> Option<&'a [u8]> {
+    let callee = match rvalue {
+        RValue::Local(local) => aliases.get(&local_ptr(local))?,
+        callee => callee,
+    };
+    match callee {
+        RValue::Global(global) => Some(global.0.as_slice()),
+        _ => None,
+    }
+}
+
 /// Names for the variables of a generic `for`, inferred from the iterator.
-fn iterator_names(right: &[RValue]) -> Option<Vec<&'static str>> {
-    fn generator_global(rvalue: &RValue) -> Option<&[u8]> {
+fn iterator_names(right: &[RValue], aliases: &FxHashMap<usize, RValue>) -> Option<Vec<&'static str>> {
+    fn generator_global<'a>(rvalue: &'a RValue, aliases: &'a FxHashMap<usize, RValue>) -> Option<&'a [u8]> {
         match rvalue {
-            RValue::Global(global) => Some(global.0.as_slice()),
+            RValue::Global(_) | RValue::Local(_) => iterator_global(rvalue, aliases),
             RValue::Call(call) | RValue::Select(Select::Call(call)) => {
-                generator_global(&call.value)
+                generator_global(&call.value, aliases)
             }
             _ => None,
         }
     }
-    fn generator_method(rvalue: &RValue) -> Option<&str> {
+    fn generator_method<'a>(rvalue: &'a RValue, aliases: &FxHashMap<usize, RValue>) -> Option<&'a str> {
         match rvalue {
             RValue::MethodCall(method_call) | RValue::Select(Select::MethodCall(method_call)) => {
                 Some(method_call.method.as_str())
             }
             RValue::Call(call) | RValue::Select(Select::Call(call))
-                if generator_global(&call.value)
+                if generator_global(&call.value, aliases)
                     .is_some_and(|name| name == b"ipairs" || name == b"pairs") =>
             {
-                call.arguments.first().and_then(generator_method)
+                call.arguments.first().and_then(|argument| generator_method(argument, aliases))
             }
             RValue::Call(call) | RValue::Select(Select::Call(call)) => {
-                generator_method(&call.value)
+                generator_method(&call.value, aliases)
             }
             _ => None,
         }
     }
     for rvalue in right {
-        if let Some(method) = generator_method(rvalue) {
+        if let Some(method) = generator_method(rvalue, aliases) {
             match method {
                 "GetChildren" => return Some(vec!["i", "child"]),
                 "GetDescendants" => return Some(vec!["i", "descendant"]),
                 _ => {}
             }
         }
-        if let Some(name) = generator_global(rvalue) {
+        if let Some(name) = generator_global(rvalue, aliases) {
             if name == b"ipairs" {
                 return Some(vec!["i", "v"]);
             }
@@ -1587,6 +1646,14 @@ fn iterator_names(right: &[RValue]) -> Option<Vec<&'static str>> {
     }
     None
 }
+
+const IRREGULAR_PLURALS: &[(&str, &str)] = &[
+    ("children", "child"), ("people", "person"), ("indices", "index"),
+    ("vertices", "vertex"), ("matrices", "matrix"), ("analyses", "analysis"),
+    ("crises", "crisis"), ("theses", "thesis"), ("diagnoses", "diagnosis"),
+    ("hypotheses", "hypothesis"), ("parentheses", "parenthesis"),
+    ("feet", "foot"), ("teeth", "tooth"), ("mice", "mouse"), ("geese", "goose"),
+];
 
 /// Singular form of a (presumed) plural collection identifier, used to name a
 /// generic-for element variable after the collection it iterates
@@ -1600,6 +1667,9 @@ fn singularize(name: &str) -> Option<String> {
         return None;
     }
     let lower = name.to_ascii_lowercase();
+    if let Some((_, singular)) = IRREGULAR_PLURALS.iter().find(|(plural, _)| *plural == lower) {
+        return Some((*singular).to_string());
+    }
     // Words that LOOK plural (end in `s`) but aren't, or whose singular our rules
     // would mangle into a non-word (Latin irregulars, `consonant+ie+s`). Refusing
     // them falls back to the default iterator name rather than inventing junk.
@@ -1637,18 +1707,9 @@ fn singularize(name: &str) -> Option<String> {
         "index",
         "this",
         "kudos",
-        // Latin/irregular plurals our drop-`s`/`-es` rules would mangle
-        "indices",
-        "vertices",
-        "matrices",
-        "analyses",
+        // Ambiguous: axes can mean axe or axis; bases can mean base or basis.
         "axes",
-        "crises",
         "bases",
-        "theses",
-        "diagnoses",
-        "hypotheses",
-        "parentheses",
         // singular ends in `ie`, so `ies`->`y` is wrong (movie -> "movy")
         "movies",
         "cookies",
@@ -1706,6 +1767,46 @@ fn singularize(name: &str) -> Option<String> {
     sanitize(&singular)
 }
 
+/// The name of one element of a collection named `collection`: its
+/// singular (`parts` -> `part`), what a map by a key holds (`modulesByName`
+/// -> `module`, `zoneIdToZoneObj` -> `zoneObj`), or the noun a container
+/// word follows (`pointList` -> `point`).
+fn element_name(collection: &str) -> Option<String> {
+    if let Some(singular) = singularize(collection) {
+        return Some(singular);
+    }
+    let base = collection.trim_end_matches(|c: char| c.is_ascii_digit());
+    // A camel-case word boundary at `at`: an upper-case letter after a lower-case one.
+    let boundary = |at: usize| {
+        at > 0
+            && base.as_bytes().get(at).is_some_and(u8::is_ascii_uppercase)
+            && base.as_bytes()[at - 1].is_ascii_lowercase()
+    };
+    if let Some(at) = base.find("By").filter(|&at| boundary(at) && base.as_bytes().get(at + 2).is_some_and(u8::is_ascii_uppercase)) {
+        return element_name(&base[..at]);
+    }
+    if let Some(at) = base.find("To").filter(|&at| boundary(at) && base.as_bytes().get(at + 2).is_some_and(u8::is_ascii_uppercase))
+        && ["Id", "Name", "Key", "Index"].iter().any(|key| base[..at].ends_with(key))
+    {
+        let target = &base[at + 2..];
+        return sanitize(&format!("{}{}", target[..1].to_ascii_lowercase(), &target[1..]));
+    }
+    for suffix in ["List", "Array", "Map", "Dict", "Lookup", "Registry"] {
+        if let Some(stem) = base.strip_suffix(suffix)
+            && boundary(stem.len())
+        {
+            return singularize(stem).or_else(|| sanitize(stem));
+        }
+    }
+    None
+}
+
+/// A collection named for being one alone (`list`, `array2`): its element
+/// is an `item`, a name any usage evidence outranks.
+fn bare_collection(name: &str) -> bool {
+    matches!(name.trim_end_matches(|c: char| c.is_ascii_digit()), "list" | "List" | "array" | "Array")
+}
+
 fn pluralize(name: &str) -> Option<String> {
     if !name.is_ascii() || name.is_empty() {
         return None;
@@ -1722,11 +1823,8 @@ fn pluralize(name: &str) -> Option<String> {
     if let Some(stem) = name.strip_suffix("Entry") {
         return Some(format!("{stem}Entries"));
     }
-    if name == "child" {
-        return Some("children".to_string());
-    }
-    if name == "person" {
-        return Some("people".to_string());
+    if let Some((plural, _)) = IRREGULAR_PLURALS.iter().find(|(_, singular)| *singular == name) {
+        return Some((*plural).to_string());
     }
     let bytes = name.as_bytes();
     if name.ends_with('y')
@@ -1751,10 +1849,10 @@ fn pluralize(name: &str) -> Option<String> {
 
 /// `pairs(x)`/`ipairs(x)`/`next(x)` -> `x`; anything else is returned unchanged.
 /// Used to look through a generic-for iterator wrapper at the real collection.
-fn unwrap_iter_arg(rvalue: &RValue) -> &RValue {
+fn unwrap_iter_arg<'a>(rvalue: &'a RValue, aliases: &FxHashMap<usize, RValue>) -> &'a RValue {
     if let RValue::Call(call) | RValue::Select(Select::Call(call)) = rvalue
-        && let RValue::Global(global) = &*call.value
-        && matches!(global.0.as_slice(), b"pairs" | b"ipairs" | b"next")
+        && let Some(global) = iterator_global(&call.value, aliases)
+        && matches!(global, b"pairs" | b"ipairs" | b"next")
         && let Some(arg) = call.arguments.first()
     {
         return arg;
@@ -1832,8 +1930,8 @@ fn uses_create_element(block: &Block, aliases: &FxHashSet<usize>) -> bool {
     })
 }
 
-/// Locals carrying an OOP "class" signal: the receiver of a `X.__index = ...`
-/// assignment, the 2nd argument of `setmetatable(_, X)`, or the receiver of a
+/// Locals carrying an OOP "class" signal: the 2nd argument of
+/// `setmetatable(_, X)`, or the receiver of a
 /// colon method-call `X:method(...)`. The `collect` table-arm combines this with
 /// an empty-table declaration `local X = {}` to name the class table `class`.
 ///
@@ -1856,19 +1954,6 @@ fn collect_class_signals(block: &mut Block, out: &mut FxHashSet<usize>) {
     }
 
     for statement in &mut block.0 {
-        // `X.__index = ...` — any assignment whose LHS indexes a local with the
-        // key "__index" marks that local as a metatable/class.
-        if let Statement::Assign(assign) = &*statement {
-            for lvalue in &assign.left {
-                if let LValue::Index(index) = lvalue
-                    && let RValue::Local(base) = &*index.left
-                    && index_key(index) == Some("__index")
-                {
-                    out.insert(local_ptr(base));
-                }
-            }
-        }
-
         // Nested rvalues: `setmetatable(_, X)` calls and colon-calls `X:m()`.
         let mut functions = Vec::new();
         statement.post_traverse_values(&mut |value| -> Option<()> {
@@ -2030,6 +2115,13 @@ struct LocalUsage {
     /// A multi-result/vararg assignment may write this slot without an explicit
     /// one-to-one RHS node. Such a write invalidates every value-shape consensus.
     unknown_value_write: bool,
+    /// RHS names must agree before traversal can publish one to other locals.
+    assignment_name: Option<String>,
+    assignment_name_conflict: bool,
+    assignment_sources: u8,
+    incoming_parameter: bool,
+    object_name: Option<String>,
+    object_name_conflict: bool,
     /// Returned from its enclosing block/function.
     returned: bool,
     /// Stored as the value of a callback-shaped table field (`onClose = local`).
@@ -2076,6 +2168,23 @@ struct LocalUsage {
     /// invalidating write flag mirroring the counter facts.
     accumulator_updates: u32,
     accumulator_invalid_write: bool,
+    /// `local = math.max(local, E)` (or `min`) updates, a running extremum
+    /// ([`extremum_update`]): which one, the noun of every `E` where they
+    /// agree, and the invalidating write flag.
+    /// Writes of the local that are an empty table, and stores into it of
+    /// `true` (a set) or of anything else.
+    empty_table_writes: u32,
+    true_fills: u32,
+    other_fill: bool,
+    extremum: Option<&'static str>,
+    extremum_noun: Option<String>,
+    extremum_noun_conflict: bool,
+    extremum_invalid_write: bool,
+    /// Some write starts it at a zero vector ([`is_zero_vector`]).
+    zero_vector_start: bool,
+    /// Written `sum / #list`, by the local divided: a mean when that local
+    /// is a running sum.
+    mean_of: Option<usize>,
     /// `#local` was taken — the local is a sequence.
     length_taken: bool,
     /// `local[<number literal>]` / `local[<numeric-for counter>]` — indexed
@@ -2167,6 +2276,11 @@ fn note_map_key(local: &RcLocal, key: &RValue, usage: &mut FxHashMap<usize, Loca
 
 fn note_collection_fill(local: &RcLocal, value: &RValue, usage: &mut FxHashMap<usize, LocalUsage>) {
     let entry = usage.entry(local_ptr(local)).or_default();
+    if matches!(value, RValue::Literal(Literal::Boolean(true))) {
+        entry.true_fills += 1;
+    } else {
+        entry.other_fill = true;
+    }
     if is_connection_value(value) {
         entry.connection_fills += 1;
         entry
@@ -2203,6 +2317,36 @@ fn is_counter_update(local: &RcLocal, value: &RValue) -> bool {
 /// `local = local + X` (either side) where `X` is not the unit literal a
 /// counter adds: a running sum. `X` may be any expression, including another
 /// numeric literal (`elapsed = elapsed + 0.1`).
+/// `math.max(local, E)` / `math.min(E, local)` (a local alias of either
+/// too): `"max"` or `"min"`, and `E`.
+fn extremum_update<'a>(local: &RcLocal, value: &'a RValue, aliases: &'a FxHashMap<usize, RValue>) -> Option<(&'static str, &'a RValue)> {
+    let (RValue::Call(call) | RValue::Select(Select::Call(call))) = value else { return None };
+    let callee = match call.value.as_ref() {
+        RValue::Local(alias) => aliases.get(&local_ptr(alias))?,
+        callee => callee,
+    };
+    let kind = match static_callee_of(callee)? {
+        (Some("math"), "max") => "max",
+        (Some("math"), "min") => "min",
+        _ => return None,
+    };
+    let is_self = |side: &RValue| matches!(side, RValue::Local(source) if local_ptr(source) == local_ptr(local));
+    match call.arguments.as_slice() {
+        [own, other] | [other, own] if is_self(own) && !is_self(other) => Some((kind, other)),
+        _ => None,
+    }
+}
+
+/// A start a running extremum takes: a number, or `math.huge` either way.
+fn extremum_start(value: &RValue) -> bool {
+    match value {
+        RValue::Literal(Literal::Number(_)) => true,
+        RValue::Unary(unary) => unary.operation == UnaryOperation::Negate && extremum_start(&unary.value),
+        RValue::Index(_) => static_callee_of(value) == Some((Some("math"), "huge")),
+        _ => false,
+    }
+}
+
 fn is_accumulator_update(local: &RcLocal, value: &RValue) -> bool {
     let RValue::Binary(binary) = value else {
         return false;
@@ -2217,17 +2361,102 @@ fn is_accumulator_update(local: &RcLocal, value: &RValue) -> bool {
         || (is_self(&binary.right) && !is_number(&binary.left, 1.0))
 }
 
-fn note_local_write(local: &RcLocal, value: &RValue, usage: &mut FxHashMap<usize, LocalUsage>) {
+/// A zero vector (`Vector3.zero`, `vector.create(0, 0, 0)`, `Vector3.new()`,
+/// through a local alias too, or the constant Luau folds it to): a sum
+/// starts from it as from `0`.
+fn is_zero_vector(value: &RValue, aliases: &FxHashMap<usize, RValue>) -> bool {
+    const VECTORS: [(Option<&str>, &str); 3] = [(Some("Vector3"), "new"), (Some("Vector2"), "new"), (Some("vector"), "create")];
+    match value {
+        RValue::Literal(Literal::Vector(x, y, z)) => [x, y, z].iter().all(|component| **component == 0.0),
+        RValue::Literal(Literal::VectorD(x, y, z)) => [x, y, z].iter().all(|component| **component == 0.0),
+        RValue::Index(index) => matches!(static_callee_of(value), Some((Some("Vector3" | "Vector2" | "vector"), "zero")))
+            && matches!(&*index.left, RValue::Global(_)),
+        RValue::Call(call) | RValue::Select(Select::Call(call)) => {
+            let callee = match &*call.value {
+                RValue::Local(local) => aliases.get(&local_ptr(local)).unwrap_or(&call.value),
+                callee => callee,
+            };
+            static_callee_of(callee).is_some_and(|name| VECTORS.contains(&name))
+                && call.arguments.iter().all(|argument| is_number(argument, 0.0))
+        }
+        _ => false,
+    }
+}
+
+fn keeps_assignment_role(local: &RcLocal, value: &RValue) -> bool {
+    let is_self = |value: &RValue| matches!(value, RValue::Local(source) if source == local);
+    match value {
+        RValue::Local(_) => is_self(value),
+        RValue::Unary(unary) => unary.operation == UnaryOperation::Negate && is_self(&unary.value),
+        RValue::Binary(binary) => matches!(binary.operation,
+            BinaryOperation::Add | BinaryOperation::Sub | BinaryOperation::Mul | BinaryOperation::Div
+            | BinaryOperation::IDiv | BinaryOperation::Mod | BinaryOperation::Pow)
+            && (is_self(&binary.left) || is_self(&binary.right)),
+        // `x = lerp(x, goal, t)`, `s = s:lower()`: the value transformed in place.
+        RValue::Call(call) | RValue::Select(Select::Call(call)) => call.arguments.iter().any(is_self),
+        RValue::MethodCall(call) | RValue::Select(Select::MethodCall(call)) => {
+            is_self(&call.value) || call.arguments.iter().any(is_self)
+        }
+        _ => false,
+    }
+}
+
+fn note_local_write(local: &RcLocal, value: &RValue, aliases: &FxHashMap<usize, RValue>, usage: &mut FxHashMap<usize, LocalUsage>) {
     usage.entry(local_ptr(local)).or_default().count_role_source = count_role_source(value, 0);
     usage.entry(local_ptr(local)).or_default().size_role_source = size_role_source(value, 0);
     let entry = usage.entry(local_ptr(local)).or_default();
+    if let RValue::Table(table) = value {
+        for (key, value) in &table.0 {
+            if let Some(key) = key { note_object_name(key, Some(value), entry); }
+        }
+        if table.0.is_empty() {
+            entry.empty_table_writes += 1;
+        }
+    }
+    // An in-place arithmetic update retains the noun; this is no type/effect proof.
+    if !matches!(value, RValue::Literal(Literal::Nil)) && !keeps_assignment_role(local, value) {
+        entry.assignment_sources = entry.assignment_sources.saturating_add(1);
+        match assignment_hint(value, aliases) {
+            Some(name) => match &entry.assignment_name {
+                None => entry.assignment_name = Some(name),
+                Some(previous) if previous != &name => entry.assignment_name_conflict = true,
+                _ => {}
+            },
+            None => entry.assignment_name_conflict = true,
+        }
+    }
     if is_counter_update(local, value) {
         entry.counter_updates += 1;
     } else if !is_number(value, 0.0) {
         entry.counter_invalid_write = true;
     }
+    if let RValue::Binary(binary) = value
+        && binary.operation == BinaryOperation::Div
+        && let (RValue::Local(sum), RValue::Unary(length)) = (&*binary.left, &*binary.right)
+        && length.operation == UnaryOperation::Length
+    {
+        entry.mean_of = Some(local_ptr(sum));
+    }
+    match extremum_update(local, value, aliases) {
+        // Against a constant it is a bound (`math.max(v, 0)`), not the largest seen.
+        Some((kind, other)) if entry.extremum.is_none_or(|seen| seen == kind) && !matches!(other, RValue::Literal(_)) => {
+            entry.extremum = Some(kind);
+            match (rvalue_hint(other), &entry.extremum_noun) {
+                (Some(noun), None) if !entry.extremum_noun_conflict => entry.extremum_noun = Some(noun),
+                (Some(noun), Some(seen)) if &noun == seen => {}
+                _ => {
+                    entry.extremum_noun = None;
+                    entry.extremum_noun_conflict = true;
+                }
+            }
+        }
+        None if extremum_start(value) => {}
+        _ => entry.extremum_invalid_write = true,
+    }
     if is_accumulator_update(local, value) {
         entry.accumulator_updates += 1;
+    } else if is_zero_vector(value, aliases) {
+        entry.zero_vector_start = true;
     } else if !matches!(value, RValue::Literal(Literal::Number(_)))
         && !is_counter_update(local, value)
     {
@@ -2242,9 +2471,10 @@ fn note_local_write(local: &RcLocal, value: &RValue, usage: &mut FxHashMap<usize
         _ => entry.boolean_invalid_write = true,
     }
 
+    // `local lastUse = 0` before `lastUse = os.clock()`: a number start is "never yet".
     if is_time_read(value) {
         entry.clock_writes += 1;
-    } else if !matches!(value, RValue::Literal(Literal::Nil)) {
+    } else if !matches!(value, RValue::Literal(Literal::Nil | Literal::Number(_))) {
         entry.clock_invalid_write = true;
     }
 }
@@ -2255,6 +2485,7 @@ fn note_unknown_local_write(local: &RcLocal, usage: &mut FxHashMap<usize, LocalU
     entry.accumulator_invalid_write = true;
     entry.boolean_invalid_write = true;
     entry.clock_invalid_write = true;
+    entry.extremum_invalid_write = true;
     entry.unknown_value_write = true;
 }
 
@@ -2294,13 +2525,17 @@ fn note_call_usage(
     callee_aliases: &FxHashMap<usize, RValue>,
     usage: &mut FxHashMap<usize, LocalUsage>,
 ) {
-    if static_callee(call) == Some((Some("string"), "rep"))
+    let callee = match &*call.value {
+        RValue::Local(local) => callee_aliases.get(&local_ptr(local)).unwrap_or(&call.value),
+        callee => callee,
+    };
+    if static_callee_of(callee) == Some((Some("string"), "rep"))
         && call.arguments.first().and_then(string_literal).is_some()
         && let Some(count) = call.arguments.get(1).and_then(|value| count_role_source(value, 0))
     {
         usage.entry(count).or_default().repetition_count = true;
     }
-    if let Some((Some("buffer"), member)) = static_callee(call)
+    if let Some((Some("buffer"), member)) = static_callee_of(callee)
         && crate::naming_api::buffer_arguments(member).first() == Some(&"size")
         && let Some(size) = call.arguments.first().and_then(|value| size_role_source(value, 0))
     {
@@ -2309,7 +2544,7 @@ fn note_call_usage(
     if let RValue::Local(local) = &*call.value {
         usage.entry(local_ptr(local)).or_default().used_as_callee = true;
     }
-    if let RValue::Index(index) = &*call.value
+    if let RValue::Index(index) = callee
         && index_key(index) == Some("insert")
         && let RValue::Global(global) = &*index.left
         && global.0.as_slice() == b"table"
@@ -2334,7 +2569,7 @@ fn note_call_usage(
     // Stable standard-library argument slots (§2.C). These are positional API
     // contracts, not guesses from surrounding syntax, and disagreement is
     // handled by the same conflict-on-consensus gate as other slots.
-    if let RValue::Index(callee) = &*call.value
+    if let RValue::Index(callee) = callee
         && let RValue::Global(namespace) = &*callee.left
         && let Some(member) = string_literal(&callee.right)
     {
@@ -2376,11 +2611,7 @@ fn note_call_usage(
     // Fusion scope plumbing (`innerScope(outerScope, ...)`, `doCleanup(scope)`)
     // and state reads (`peek(state)`), whether called bare, through the
     // library table (`Fusion.peek(state)`) or through a local alias of it.
-    let member = callable_static_name(&call.value).or_else(|| match &*call.value {
-        RValue::Local(local) => callee_aliases.get(&local_ptr(local)).and_then(callable_static_name),
-        _ => None,
-    });
-    if let Some(member) = member {
+    if let Some(member) = callable_static_name(callee) {
         let slot = match member {
             // Fusion's docs name the scope an inner scope is made from
             // `outerScope`; the inner one is the `scope`.
@@ -2396,7 +2627,7 @@ fn note_call_usage(
         }
     }
     // Global builtins with one stable positional contract.
-    if let RValue::Global(global) = &*call.value {
+    if let RValue::Global(global) = callee {
         let slots: &[&str] = match global.0.as_slice() {
             b"ipairs" | b"unpack" => &["list"],
             b"next" => {
@@ -2534,29 +2765,6 @@ const VALUE_TYPE_METHODS: &[&str] = &[
 /// would mislead).
 const CHILD_LOOKUP_METHODS: &[&str] = &["FindFirstChild", "WaitForChild"];
 
-/// Ordered parameter names for a Roblox event's `:Connect` callback. A `None`
-/// slot keeps the param's default name. Only conservative, well-known signatures
-/// are listed; overloaded/arbitrary ones (`Changed`, `OnClientEvent`, ...) are
-/// intentionally absent so we never invent a misleading name.
-fn event_signature(event: &str) -> Option<&'static [Option<&'static str>]> {
-    Some(match event {
-        "Heartbeat" | "RenderStepped" | "PreSimulation" | "PostSimulation" | "PreRender"
-        | "PreAnimation" => &[Some("dt")],
-        "Stepped" => &[Some("time"), Some("dt")],
-        "InputBegan" | "InputEnded" | "InputChanged" => &[Some("input"), Some("gameProcessed")],
-        "ChildAdded" | "ChildRemoved" => &[Some("child")],
-        "DescendantAdded" | "DescendantRemoving" => &[Some("descendant")],
-        "AncestryChanged" => &[None, Some("parent")],
-        "CharacterAdded" | "CharacterRemoving" | "CharacterAppearanceLoaded" => {
-            &[Some("character")]
-        }
-        "PlayerAdded" | "PlayerRemoving" => &[Some("player")],
-        "Triggered" | "PromptTriggered" => &[Some("player")],
-        "Touched" | "TouchEnded" => &[Some("otherPart")],
-        _ => return None,
-    })
-}
-
 /// Record method-call facts: receiver-side (instance/string shape) and
 /// argument-side (a bare-local argument is named after the API slot it fills).
 fn note_method_usage(method_call: &MethodCall, usage: &mut FxHashMap<usize, LocalUsage>) {
@@ -2646,6 +2854,25 @@ fn note_method_arg_usage(method_call: &MethodCall, usage: &mut FxHashMap<usize, 
     {
         note_api_slot(arg, slot, usage);
     }
+    // Roblox methods whose every argument has one documented role.
+    let receiver_tweens = match method_call.value.as_ref() {
+        RValue::Local(receiver) => current_name(receiver)
+            .or_else(|| usage.get(&local_ptr(receiver)).and_then(|entry| entry.assignment_name.clone()))
+            .is_some_and(|name| name.contains("Tween")),
+        RValue::Global(global) => global.0.windows(5).any(|window| window == b"Tween"),
+        _ => false,
+    };
+    let slots: &[&str] = match method {
+        "Raycast" => &["origin", "direction", "raycastParams"],
+        "Create" if args.len() == 3 && receiver_tweens => &["instance", "tweenInfo", "goal"],
+        "BulkMoveTo" => &["parts", "cframes"],
+        _ => &[],
+    };
+    for (argument, slot) in args.iter().zip(slots) {
+        if let RValue::Local(arg) = argument {
+            note_api_slot(arg, slot, usage);
+        }
+    }
     if matches!(method, "HasTag" | "AddTag" | "RemoveTag") && args.len() == 2 {
         if let Some(RValue::Local(arg)) = args.first() {
             note_api_slot(arg, "instance", usage);
@@ -2706,20 +2933,38 @@ fn size_role_source(value: &RValue, depth: usize) -> Option<usize> {
     }
 }
 
+fn note_object_name(key: &RValue, value: Option<&RValue>, entry: &mut LocalUsage) {
+    if string_literal(key) == Some("Name") {
+        match value.and_then(string_literal).and_then(sanitize) {
+            Some(name) => match &entry.object_name {
+                None => entry.object_name = Some(name),
+                Some(previous) if previous != &name => entry.object_name_conflict = true,
+                _ => {}
+            },
+            None => entry.object_name_conflict = true,
+        }
+    } else if !matches!(key, RValue::Literal(_)) {
+        entry.object_name_conflict = true;
+    }
+}
+
 /// Record that a param's value was stored into a named field (`obj.Key = param`):
 /// the destination key names the param. Only a bare `RValue::Local` RHS qualifies
 /// — a wrapped RHS (`obj.CFrame = CFrame.new(p5)`, `obj.X = f(p)`) is a
 /// `Call`/`Index` node, so `p5`/`p` is correctly skipped (it is not *the* value of
 /// that field). A string-literal key only (dynamic `t[i] = p` is excluded). Two
 /// distinct destination keys flag a conflict (refuse, mirroring `note_type_guard`).
-fn note_field_store(lvalue: &LValue, rvalue: &RValue, usage: &mut FxHashMap<usize, LocalUsage>) {
+fn note_field_store(lvalue: &LValue, rvalue: Option<&RValue>, usage: &mut FxHashMap<usize, LocalUsage>) {
     let LValue::Index(index) = lvalue else {
         return;
     };
+    if let RValue::Local(object) = &*index.left {
+        note_object_name(&index.right, rvalue, usage.entry(local_ptr(object)).or_default());
+    }
     let Some(key) = string_literal(&index.right) else {
         return;
     };
-    let RValue::Local(local) = rvalue else {
+    let Some(RValue::Local(local)) = rvalue else {
         return;
     };
     let entry = usage.entry(local_ptr(local)).or_default();
@@ -2929,10 +3174,12 @@ fn gather_usage_in(
             Statement::Call(call) => note_call_usage(call, in_loop, aliases, context.callee_aliases, usage),
             Statement::MethodCall(method_call) => note_method_usage(method_call, usage),
             Statement::Assign(assign) => {
-                for (lvalue, rvalue) in assign.left.iter().zip(assign.right.iter()) {
+                for (index, lvalue) in assign.left.iter().enumerate() {
+                    let rvalue = assign.right.get(index);
                     note_field_store(lvalue, rvalue, usage);
+                    let Some(rvalue) = rvalue else { continue; };
                     if let LValue::Local(local) = lvalue {
-                        note_local_write(local, rvalue, usage);
+                        note_local_write(local, rvalue, context.callee_aliases, usage);
                     }
                     if let crate::LValue::Index(index) = lvalue
                         && let RValue::Local(local) = &*index.left
@@ -2940,6 +3187,8 @@ fn gather_usage_in(
                         if string_literal(&index.right).is_none() {
                             note_collection_fill(local, rvalue, usage);
                             note_map_key(local, &index.right, usage);
+                        } else {
+                            usage.entry(local_ptr(local)).or_default().other_fill = true;
                         }
                         let create_element = is_create_element_call(rvalue, aliases);
                         let entry = usage.entry(local_ptr(local)).or_default();
@@ -2975,7 +3224,7 @@ fn gather_usage_in(
             }
             Statement::GenericFor(generic_for) => {
                 for rvalue in &generic_for.right {
-                    if let RValue::Local(local) = unwrap_iter_arg(rvalue) {
+                    if let RValue::Local(local) = unwrap_iter_arg(rvalue, context.callee_aliases) {
                         usage.entry(local_ptr(local)).or_default().iterated = true;
                     }
                 }
@@ -3000,7 +3249,11 @@ fn gather_usage_in(
 
         // Recurse: closures reset the loop context; loops set it.
         for function in functions {
-            gather_usage_in(&mut function.lock().body, false, context, usage);
+            let mut function = function.lock();
+            for parameter in &function.parameters {
+                usage.entry(local_ptr(parameter)).or_default().incoming_parameter = true;
+            }
+            gather_usage_in(&mut function.body, false, context, usage);
         }
         match &*statement {
             Statement::If(r#if) => {
@@ -3253,12 +3506,6 @@ impl NamingPreparation {
                         }
                     }
                 }
-                for left in &assign.left {
-                    if let LValue::Index(index) = left && let RValue::Local(base) = &*index.left
-                        && index_key(index) == Some("__index") {
-                        self.class_signal_locals.insert(local_ptr(base));
-                    }
-                }
             }
             match statement {
                 Statement::Call(call) => self.call(call),
@@ -3324,6 +3571,8 @@ fn rewind_scope_suffixes(cursors: &mut FxHashMap<String, usize>, released: &str)
 struct Namer {
     rename: bool,
     dont_reuse_var: bool,
+    /// The global vector constants print through (`vector` or `Vector3`).
+    vector_global: &'static str,
     module_hint: Option<String>,
     /// Names that may not currently be assigned to a local: every global
     /// referenced in the program (added once in `collect`, kept reserved
@@ -3405,8 +3654,8 @@ struct Namer {
     /// Chunk-root aliases of a handle's PascalCase member: the name the member
     /// derives and its source spelling (see `root_alias_spelling`).
     root_spellings: FxHashMap<usize, (String, String)>,
-    /// Locals carrying an OOP "class" signal (`X.__index = ..`,
-    /// `setmetatable(_, X)`, or a colon-call `X:m()`). Combined with an empty-
+    /// Locals carrying an OOP "class" signal (`setmetatable(_, X)`
+    /// or a colon-call `X:m()`). Combined with an empty-
     /// table declaration `local X = {}` to name the class table `class`.
     /// See `collect_class_signals`.
     class_signal_locals: FxHashSet<usize>,
@@ -3448,14 +3697,14 @@ impl Namer {
     /// (+lines). Counts are stable between here and that pass (only recover_methods
     /// and a movable-temp inline run in between, neither of which alters a
     /// 3-write temp's read/write counts).
-    fn is_collapse_candidate(&self, local: &RcLocal) -> bool {
+    fn is_collapse_candidate(&self, ptr: usize) -> bool {
         // Both the count gate (what the pass tests) AND the exact adjacency
         // structure must hold. The structural set keeps a 3-write/1-read temp
         // whose use is NOT adjacent (so it never actually collapses) nameable.
-        self.collapse_candidates.contains(&local_ptr(local))
+        self.collapse_candidates.contains(&ptr)
             && self
                 .counts
-                .get(&local_ptr(local))
+                .get(&ptr)
                 .is_some_and(|u| u.reads == 1 && u.writes == 3 && !u.captured)
     }
 
@@ -3470,7 +3719,8 @@ impl Namer {
             evidence.record(ptr, &name, score, self.evidence_rule, std::panic::Location::caller());
         }
         let replace = match self.hints.get(&ptr) {
-            Some(existing) => score > existing.score,
+            Some(existing) => (crate::NameTier::from_priority(score), score)
+                > (crate::NameTier::from_priority(existing.score), existing.score),
             None => true,
         };
         if replace {
@@ -3639,12 +3889,18 @@ impl Namer {
                 && !self
                     .usage
                     .get(&ptr)
-                    .is_some_and(|usage| usage.unknown_value_write)
+                    .is_some_and(|usage| usage.unknown_value_write || usage.incoming_parameter)
             {
                 candidates.push((ptr, name.clone(), 65, "instance_constructor_consensus"));
             }
         }
         for (&ptr, usage) in &self.usage {
+            if !usage.object_name_conflict && !self.is_collapse_candidate(ptr)
+                && !self.movable_temp_locals.contains(&ptr)
+                && let Some(name) = &usage.object_name
+            {
+                candidates.push((ptr, name.clone(), 75, "literal_object_name"));
+            }
             if self.collapse_candidates.contains(&ptr) || self.movable_temp_locals.contains(&ptr) {
                 continue;
             }
@@ -3680,7 +3936,48 @@ impl Namer {
             // A numeric cell that only ever accumulates (`v = v + dt`) is a
             // running sum; a unit-step-only cell stays `count` (above).
             if usage.accumulator_updates > 0 && !usage.accumulator_invalid_write {
-                candidates.push((ptr, "total".to_string(), 40, "accumulator_updates"));
+                // `Vector3.zero` names only a type; summing into it names the role.
+                let score = if usage.zero_vector_start { 61 } else { 40 };
+                candidates.push((ptr, "total".to_string(), score, "accumulator_updates"));
+            }
+            // `local seen = {}` stored only `seen[child] = true`: a set.
+            if usage.true_fills > 0
+                && !usage.other_fill
+                && usage.empty_table_writes > 0
+                && u32::from(usage.assignment_sources) == usage.empty_table_writes
+                && !usage.incoming_parameter
+            {
+                let key = (!usage.unknown_collection_key)
+                    .then(|| self.unanimous_fill_name(&usage.collection_key_sources))
+                    .flatten();
+                // A bare `set` yields to a role (`result`, returned).
+                let (name, score) = match key {
+                    Some(key) => (format!("{}Set", key.name), 44),
+                    None => ("set".to_string(), 34),
+                };
+                if let Some(name) = sanitize_preserve(&name) {
+                    candidates.push((ptr, name, score, "boolean_set"));
+                }
+            }
+            // `best = math.max(best, lifetime(p))`: the largest seen.
+            if let Some(kind) = usage.extremum
+                && !usage.extremum_invalid_write
+                && !usage.incoming_parameter
+            {
+                let name = match &usage.extremum_noun {
+                    Some(noun) if noun.to_ascii_lowercase().starts_with(kind) => noun.clone(),
+                    Some(noun) => format!("{kind}{}", capitalize_first(noun)),
+                    None => format!("{kind}Value"),
+                };
+                if let Some(name) = sanitize_preserve(&name) {
+                    candidates.push((ptr, name, 44, "running_extremum"));
+                }
+            }
+            if usage.assignment_sources == 1
+                && usage.mean_of.and_then(|sum| self.usage.get(&sum))
+                    .is_some_and(|sum| sum.accumulator_updates > 0 && !sum.accumulator_invalid_write)
+            {
+                candidates.push((ptr, "average".to_string(), 45, "mean_of_running_sum"));
             }
             if usage.boolean_writes > 0 && usage.boolean_guarded && !usage.boolean_invalid_write {
                 candidates.push((ptr, "flag".to_string(), 38, "boolean_guard"));
@@ -3979,18 +4276,6 @@ impl Namer {
         sanitize(strip_verb_prefix(crate::name_spelling::strip_private(&name))?)
     }
 
-    /// A call through a local alias of a library member (`local innerScope =
-    /// Fusion.innerScope`) names its result as a call of the member does.
-    fn aliased_call_hint(&self, rvalue: &RValue) -> Option<String> {
-        let (RValue::Call(call) | RValue::Select(Select::Call(call))) = rvalue else {
-            return None;
-        };
-        let RValue::Local(local) = &*call.value else {
-            return None;
-        };
-        call_hint_of(self.callee_aliases.get(&local_ptr(local))?, &call.arguments)
-    }
-
     /// Fusion's `use(state)` and `peek(state)` read a state object's current
     /// value, which reads as the field the state came from (`use(props.Size)`
     /// -> `size`), also behind a default (`use(stats.Level) or 1`).
@@ -4072,15 +4357,24 @@ impl Namer {
     /// iterates (`for index, crop in crops`). Higher priority (47) than the
     /// hardcoded `child`/`descendant` context names because it is derived from a
     /// real source identifier rather than guessed.
+    /// Whether the loop iterates a collection named `list` alone ([`bare_collection`]).
+    fn iterates_bare_collection(&self, right: &[RValue]) -> bool {
+        right.first().is_some_and(|value| match unwrap_iter_arg(value, &self.callee_aliases) {
+            RValue::Local(local) => self.local_known_name(local).as_deref().is_some_and(bare_collection),
+            RValue::Index(index) => index_key(index).is_some_and(bare_collection),
+            _ => false,
+        })
+    }
+
     fn collection_element_name(&self, right: &[RValue]) -> Option<String> {
         for rvalue in right {
-            let name = match unwrap_iter_arg(rvalue) {
+            let name = match unwrap_iter_arg(rvalue, &self.callee_aliases) {
                 RValue::Local(local) => self.local_known_name(local),
                 RValue::Index(index) => index_key(index).map(str::to_string),
                 _ => None,
             };
             if let Some(name) = name
-                && let Some(singular) = singularize(&name)
+                && let Some(singular) = element_name(&name)
             {
                 return Some(singular);
             }
@@ -4190,11 +4484,13 @@ impl Namer {
                     RValue::Global(global) => std::str::from_utf8(&global.0).ok().map(str::to_string),
                     _ => None,
                 };
-                if let Some(collection) = collection
-                    && !is_default_name(&collection)
-                    && let Some(element) = singularize(&collection)
+                if let Some(collection) = &collection
+                    && !is_default_name(collection)
+                    && let Some(element) = element_name(collection)
                 {
                     self.set_hint(local, element, 45);
+                } else if collection.as_deref().is_some_and(bare_collection) {
+                    self.set_hint_str(local, "item", 30);
                 } else if let RValue::Local(collection) = &*index.left
                     && self.usage.get(&local_ptr(collection)).is_some_and(|usage| usage.typeof_conflict && usage.iterated)
                 {
@@ -4660,7 +4956,7 @@ impl Namer {
         let Some(event) = index_key(index) else {
             return;
         };
-        let Some(signature) = event_signature(event) else {
+        let Some(signature) = crate::naming_api::roblox_event_parameters(event) else {
             return;
         };
         let Some(RValue::Closure(closure)) = method_call.arguments.first() else {
@@ -4672,9 +4968,9 @@ impl Namer {
                 continue;
             };
             if let Some(param) = function.parameters.get(i) {
-                // p0 of a known event is high-precision; later slots are weaker
-                // synonyms (gameProcessed/parent/...), so they sit lower.
-                self.set_hint_str(param, name, if i == 0 { 46 } else { 38 });
+                // The event's positional role beats a destination field (48),
+                // which describes where the value is stored, not what it is.
+                self.set_hint_str(param, name, 50);
             }
         }
     }
@@ -4860,6 +5156,7 @@ impl Namer {
         if let Some(name) = lock.source_name().map(str::to_string) {
             let spelled = self.unique(&name, scope, policy);
             lock.set_counted_name(spelled, &name);
+            lock.4.name_tier = crate::NameTier::Source;
             return;
         }
         if let Some(name) = lock.0.clone()
@@ -4867,6 +5164,7 @@ impl Namer {
         {
             let spelled = self.unique(&name, scope, policy);
             lock.set_counted_name(spelled, &name);
+            lock.4.name_tier = crate::NameTier::Evidence;
             return;
         }
         // Late irreducible-control-flow dispatchers deliberately carry semantic
@@ -4887,6 +5185,8 @@ impl Namer {
         if !(self.rename || lock.0.is_none()) {
             return;
         }
+        lock.4.name_tier = self.hints.get(&ptr)
+            .map_or(crate::NameTier::Generated, |hint| crate::NameTier::from_priority(hint.score));
         // An unused local (its only reference is the declaration itself) is named
         // `_`, which is idiomatic and needs no uniqueness handling — UNLESS it is
         // a recovered local function (closure-bound) whose calls were inlined away
@@ -4906,7 +5206,10 @@ impl Namer {
                     let spelled = self.unique(&base, scope, policy);
                     lock.set_counted_name(spelled, &base);
                 }
-                None => lock.0 = Some("_".to_string()),
+                None => {
+                    lock.0 = Some("_".to_string());
+                    lock.4.name_tier = crate::NameTier::Generated;
+                }
             }
             return;
         }
@@ -4951,7 +5254,7 @@ impl Namer {
                     Either::Right(RValue::Literal(crate::Literal::Vector(..) | crate::Literal::VectorD(..))) => {
                         // Literal formatting introduces this builtin even when
                         // the input bytecode contains no GETGLOBAL for it.
-                        globals.push("vector".to_string());
+                        globals.push(self.vector_global.to_string());
                     }
                     Either::Right(RValue::Global(global)) | Either::Left(crate::LValue::Global(global)) => {
                         match std::str::from_utf8(&global.0) {
@@ -5022,6 +5325,14 @@ impl Namer {
                             || usage.field_written
                             || usage.instance_method_seen
                     });
+                // What a function named for what it gives (`getScanRoots`)
+                // returns on every path, a local of its own: `scanRoots`.
+                if let Some(noun) = function.name.as_deref().and_then(helper_result_noun)
+                    && let Some(returned) = only_returned_local(&function.body)
+                    && !function.parameters.contains(&returned)
+                {
+                    self.set_hint(&returned, noun, 40);
+                }
                 self.receiver_like_depth += usize::from(receiver_like);
                 self.collect(&mut function.body, false);
                 self.receiver_like_depth -= usize::from(receiver_like);
@@ -5051,6 +5362,9 @@ impl Namer {
                         if let Some(local) = lvalue.as_local()
                             && let Some(rvalue) = assign.right.get(index)
                         {
+                            let ptr = local_ptr(local);
+                            let conflict = self.usage.get(&ptr).is_some_and(|u| u.incoming_parameter
+                                || u.unknown_value_write || (u.assignment_sources > 1 && u.assignment_name_conflict));
                             self.children_or_result_hint(local);
                             if matches!(rvalue, RValue::Closure(_)) {
                                 self.closure_locals.insert(local_ptr(local));
@@ -5062,11 +5376,11 @@ impl Namer {
                                 if is_root && assign.prefix {
                                     self.module_table_locals.insert(local_ptr(local));
                                 }
-                                if let Some(hint) = table_collection_hint(table) {
+                                if !conflict && let Some(hint) = table_collection_hint(table) {
                                     self.set_hint(local, hint, 90);
                                 }
                                 // An EMPTY table later used as a metatable
-                                // (`X.__index = X` / `setmetatable(_, X)`) or colon-
+                                // (`setmetatable(_, X)`) or colon-
                                 // invoked (`X:method()`) is an OOP class table; name
                                 // it `class`. The empty-table gate is what makes the
                                 // (otherwise broad) class signals sound — a bare `{}`
@@ -5090,7 +5404,7 @@ impl Namer {
                                     .counts
                                     .get(&local_ptr(local))
                                     .is_some_and(|u| u.reads == 1 && u.writes == 1 && !u.captured);
-                                if table.0.is_empty()
+                                if !conflict && table.0.is_empty()
                                     && !inlinable_temp
                                     && self.class_signal_locals.contains(&local_ptr(local))
                                 {
@@ -5107,7 +5421,7 @@ impl Namer {
                             // mirrors it. Naming on a *single*-reassign (`local v; v = X`,
                             // writes == 2) or any multi-read local stays enabled, so the
                             // common hoisted-init names are preserved.
-                            let collapse_candidate = self.is_collapse_candidate(local);
+                            let collapse_candidate = self.is_collapse_candidate(local_ptr(local));
                             if !collapse_candidate {
                                 if let Some(hint) = instance_constructor_hint(rvalue) {
                                     self.note_instance_assignment(local, hint);
@@ -5115,12 +5429,18 @@ impl Namer {
                                     if !is_instance_compatible_placeholder(rvalue) {
                                         self.instance_assignment_conflicts.insert(local_ptr(local));
                                     }
-                                    if let Some(hint) = rvalue_hint(rvalue).or_else(|| self.aliased_call_hint(rvalue)) {
+                                    if let Some(hint) = assignment_hint(rvalue, &self.callee_aliases) {
                                         let role = rvalue_name_role(rvalue, &hint, 0);
                                         if let Some(evidence) = &mut self.evidence {
-                                            evidence.register(local_ptr(local), local.stable_id());
+                                            evidence.register(ptr, local.stable_id());
+                                            if conflict {
+                                                evidence.record(ptr, &hint, 60, self.evidence_rule, std::panic::Location::caller());
+                                                evidence.invalidate(ptr, "conflicting_assignment_names");
+                                            }
                                         }
-                                        self.set_hint_ptr_with_role(local_ptr(local), hint, 60, role);
+                                        if !conflict {
+                                            self.set_hint_ptr_with_role(ptr, hint, 60, role);
+                                        }
                                     }
                                     // A dynamic FindFirstChild/WaitForChild result
                                     // has only the honest hypernym `child`. Keep it
@@ -5128,11 +5448,11 @@ impl Namer {
                                     // collection context), and out of rvalue_hint
                                     // so nested require paths cannot leak it onto
                                     // the module export local.
-                                    if let Some(hint) = dynamic_child_lookup_rvalue_hint(rvalue) {
+                                    if !conflict && let Some(hint) = dynamic_child_lookup_rvalue_hint(rvalue) {
                                         self.set_hint(local, hint, 50);
                                     }
                                 }
-                                if let RValue::Closure(closure) = rvalue
+                                if !conflict && let RValue::Closure(closure) = rvalue
                                     && let Some(name) = closure
                                         .function
                                         .lock()
@@ -5146,7 +5466,7 @@ impl Namer {
                             // §2.7 predicate/boolean naming fires only on DECLARATIONS
                             // (still prefix-gated) and additionally never on a collapse
                             // candidate.
-                            if assign.prefix && !collapse_candidate {
+                            if assign.prefix && !collapse_candidate && !conflict {
                                 // §2.7 Layer A: a predicate-call result reads as the
                                 // predicate's subject (`local v = isFoo(x)` -> `foo`).
                                 // Score 60 = rvalue_hint tier; `call_hint` returns
@@ -5166,7 +5486,11 @@ impl Namer {
                                 // rvalue_hint tier; `call_hint` returns nothing for a
                                 // local-function callee, so this fills the empty slot.
                                 if let Some(name) = self.verb_call_hint(rvalue) {
-                                    self.set_hint(local, name, 60);
+                                    // A lookup helper's hypernym (`findChild` -> `child`)
+                                    // is a fallback: the name a constant argument gives
+                                    // (`refine_names`) or any evidence decides first.
+                                    let score = if matches!(name.as_str(), "child" | "descendant") { 20 } else { 60 };
+                                    self.set_hint(local, name, score);
                                 }
                                 // `TweenService:Create(...)` result -> `tween`
                                 // (`method_call_hint` returns nothing for `:Create`).
@@ -5188,14 +5512,14 @@ impl Namer {
                             {
                                 self.movable_temp_locals.insert(local_ptr(local));
                             }
-                            if assign.prefix && !collapse_candidate {
+                            if assign.prefix && !collapse_candidate && !conflict {
                                 self.declaration_fallback_hints(local, rvalue);
                             }
-                            self.ref_hint(local, rvalue);
+                            if !conflict { self.ref_hint(local, rvalue); }
                             // Generic guarded-lookup children get parent-qualified
                             // (`plantedSeedsClient`) rather than colliding to
                             // `client`/`client2`.
-                            if let Some((name, score)) = self.guarded_lookup_qualified_hint(rvalue)
+                            if !conflict && let Some((name, score)) = self.guarded_lookup_qualified_hint(rvalue)
                             {
                                 self.set_hint(local, name, score);
                             }
@@ -5216,11 +5540,11 @@ impl Namer {
                     self.set_hint_str(&numeric_for.counter, "i", 40);
                 }
                 Statement::GenericFor(generic_for) => {
-                    let names = iterator_names(&generic_for.right);
+                    let names = iterator_names(&generic_for.right, &self.callee_aliases);
                     // The element (second) variable can be named after the
                     // collection it iterates: `for index, crop in crops`.
                     let element_name = self.collection_element_name(&generic_for.right).or_else(|| {
-                        generic_for.right.first().and_then(|value| match unwrap_iter_arg(value) {
+                        generic_for.right.first().and_then(|value| match unwrap_iter_arg(value, &self.callee_aliases) {
                             RValue::Local(local) if self.usage.get(&local_ptr(local)).is_some_and(|usage| usage.typeof_conflict) => Some("item".to_string()),
                             _ => None,
                         })
@@ -5236,6 +5560,9 @@ impl Namer {
                         {
                             self.set_hint(res_local, element_name.clone(), 47);
                             continue;
+                        }
+                        if index == 1 && self.iterates_bare_collection(&generic_for.right) {
+                            self.set_hint_str(res_local, "item", 30);
                         }
                         let base = names
                             .as_ref()
@@ -5784,6 +6111,7 @@ fn name_locals_impl<const REFERENCE: bool>(
     let mut namer = Namer {
         rename,
         dont_reuse_var: options.dont_reuse_var,
+        vector_global: options.vector_spelling.global(),
         module_hint: script_name.and_then(script_module_hint),
         reserved: FxHashSet::default(),
         used_file_names: FxHashSet::default(),
@@ -5964,6 +6292,38 @@ mod tests {
             assert_eq!(actual.class_signal_locals, classes, "classes, seed {seed}");
             assert_eq!(Arc::count(&class.0.0), owners, "preparation retained a local owner");
         }
+    }
+
+    /// What a function named for what it gives returns on every path is
+    /// that: `getScanRoots` returns `scanRoots`; a function returning two
+    /// locals names neither.
+    #[test]
+    fn a_getter_names_the_local_it_returns() {
+        let run = |name: &str, two: bool| {
+            let roots = RcLocal::default();
+            let other = RcLocal::default();
+            let mut body = vec![
+                declare(&roots, RValue::Table(Table::default())),
+                Statement::Call(Call::new(global("fill"), vec![RValue::Local(roots.clone())])),
+            ];
+            if two {
+                body.push(declare(&other, RValue::Table(Table::default())));
+                body.push(If::new(global("flag"), Block(vec![ret(vec![RValue::Local(other.clone())])]), Block::default()).into());
+            }
+            body.push(ret(vec![RValue::Local(roots.clone())]));
+            let function = Function { name: Some(name.into()), body: Block(body), ..Default::default() };
+            let mut block = Block(vec![Return::new(vec![Closure {
+                node_origin: Default::default(),
+                function: ByAddress(Arc::new(Mutex::new(function))),
+                upvalues: vec![],
+            }.into()]).into()]);
+            name_locals(&mut block, true);
+            name_of(&roots)
+        };
+        assert_eq!(run("getScanRoots", false), "scanRoots");
+        assert_eq!(run("createButton", false), "button");
+        assert_ne!(run("getScanRoots", true), "scanRoots");
+        assert_ne!(run("update", false), "update");
     }
 
     #[test]
@@ -6874,6 +7234,133 @@ mod tests {
     }
 
     #[test]
+    fn incoming_parameter_and_conflicting_getter_results_keep_neutral_names() {
+        for assigned in [Index::new(global("model"), string("Head")).into(),
+            Call::new(Index::new(global("Instance"), string("new")).into(), vec![string("Part")]).into()]
+        {
+            let value = RcLocal::default();
+            let function = Function { parameters: vec![value.clone()], body: Block(vec![
+                If::new(global("condition"), Block(vec![Assign::new(vec![value.clone().into()],
+                    vec![assigned]).into()]), Block::default()).into(),
+                use_local(&value), Return::new(vec![value.clone().into()]).into(),
+            ]), ..Default::default() };
+            let mut block = Block(vec![Return::new(vec![closure_of(function)]).into()]);
+            name_locals(&mut block, true);
+            assert_eq!(name_of(&value), "p");
+        }
+
+        let value = RcLocal::default();
+        let mut block = Block(vec![declare(&value, Call::new(global("getHead"), vec![]).into()),
+            Assign::new(vec![value.clone().into()], vec![Call::new(global("getTail"), vec![]).into()]).into(),
+            use_local(&value)]);
+        name_locals(&mut block, true);
+        assert_eq!(name_of(&value), "v");
+    }
+
+    #[test]
+    fn branch_rhs_names_require_consensus_before_publication() {
+        for (first, second, expected) in [
+            ("Head", "Tail", "v"), ("Tail", "Head", "v"), ("Head", "Head", "head"),
+        ] {
+            let value = RcLocal::default();
+            let write = |key| Assign::new(vec![value.clone().into()],
+                vec![Index::new(global("model"), string(key)).into()]).into();
+            let mut block = Block(vec![declare(&value, Literal::Nil.into()),
+                If::new(global("condition"), Block(vec![write(first)]), Block(vec![write(second)])).into(),
+                use_local(&value), use_local(&value)]);
+            let report = super::name_locals_with_evidence(&mut block, true, None, Default::default(), true);
+            assert_eq!(name_of(&value), expected);
+            let row = report.bindings.iter().find(|row| row.id == value.stable_id()).unwrap();
+            assert_eq!(row.invalidations.contains(&"conflicting_assignment_names"), first != second);
+        }
+    }
+
+    #[test]
+    fn arithmetic_updates_keep_the_noun_but_a_new_role_still_vetoes_it() {
+        for operation in [None, Some(BinaryOperation::Add), Some(BinaryOperation::Sub),
+            Some(BinaryOperation::Mul), Some(BinaryOperation::Div), Some(BinaryOperation::IDiv),
+            Some(BinaryOperation::Mod), Some(BinaryOperation::Pow)]
+        {
+            for conflict in [false, true] {
+                let value = RcLocal::default();
+                let update = match operation {
+                    None => Unary::new(value.clone().into(), UnaryOperation::Negate).into(),
+                    Some(op) => Binary::new(value.clone().into(), number(2.0), op).into(),
+                };
+                let mut block = Block(vec![declare(&value, Index::new(global("model"), string("Weight")).into()),
+                    Assign::new(vec![value.clone().into()], vec![update]).into(), use_local(&value)]);
+                if conflict {
+                    block.push(Assign::new(vec![value.clone().into()],
+                        vec![Index::new(global("model"), string("Height")).into()]).into());
+                }
+                name_locals(&mut block, true);
+                assert_eq!(name_of(&value), if conflict { "v" } else { "weight" });
+            }
+        }
+        let value = RcLocal::default();
+        let mut block = Block(vec![declare(&value, MethodCall::new(global("model"), "Dot".into(), vec![number(1.0)]).into()),
+            Assign::new(vec![value.clone().into()], vec![Unary::new(value.clone().into(), UnaryOperation::Negate).into()]).into(),
+            use_local(&value)]);
+        name_locals(&mut block, true);
+        assert_eq!(name_of(&value), "dot");
+    }
+
+    #[test]
+    fn unknown_rhs_and_tuple_writes_veto_narrow_names_but_keep_literal_roles() {
+        for tuple in [false, true] {
+            for literal_role in [false, true] {
+                let value = RcLocal::default();
+                let unknown = RcLocal::default();
+                let first = Assign::new(vec![value.clone().into()],
+                    vec![Index::new(global("model"), string("Head")).into()]).into();
+                let other = if tuple {
+                    Assign::new(vec![unknown.clone().into(), value.clone().into()],
+                        vec![Select::Call(Call::new(global("read"), vec![])).into()]).into()
+                } else { Assign::new(vec![value.clone().into()], vec![unknown.into()]).into() };
+                let mut block = Block(vec![declare(&value, Literal::Nil.into()),
+                    If::new(global("condition"), Block(vec![first]), Block(vec![other])).into(),
+                    use_local(&value), use_local(&value)]);
+                if literal_role {
+                    block.push(Assign::new(vec![Index::new(value.clone().into(), string("Name")).into()],
+                        vec![string("Chosen")]).into());
+                }
+                name_locals(&mut block, true);
+                assert_eq!(name_of(&value), if literal_role { "chosen" } else { "v" });
+            }
+        }
+    }
+
+    #[test]
+    fn literal_object_names_need_unanimous_stores_and_yield_to_source_names() {
+        for kind in 0..7 {
+            let object = RcLocal::default();
+            let store = |key, value| Assign::new(vec![Index::new(object.clone().into(), key).into()], value).into();
+            let initial = if kind == 6 { Table::new(vec![(Some(string("Name")), string("Greeting"))]) }
+                else { Table::default() };
+            let mut block = Block(vec![declare(&object, initial.into()),
+                store(string("Name"), vec![string("Greeting")]), use_local(&object)]);
+            block.push(match kind {
+                0 | 5 | 6 => store(string("Name"), vec![string("Greeting")]),
+                1 => store(string("Name"), vec![string("Other")]),
+                2 => store(string("Name"), vec![global("unknown")]),
+                3 => store(global("key"), vec![string("Other")]),
+                _ => Assign::new(vec![global("ignored").as_global().unwrap().clone().into(),
+                    Index::new(object.clone().into(), string("Name")).into()],
+                    vec![Select::Call(Call::new(global("read"), vec![])).into()]).into(),
+            });
+            if kind == 5 {
+                object.0.lock().add_source_binding(crate::SourceBinding {
+                    name: "SourceObject".into(), origin: crate::BindingOrigin::DebugLocal {
+                        prototype: 0, register: 1, start_pc: 0, end_pc: 100,
+                    },
+                });
+            }
+            name_locals(&mut block, true);
+            assert_eq!(name_of(&object), match kind { 0 | 6 => "greeting", 5 => "SourceObject", _ => "v" });
+        }
+    }
+
+    #[test]
     fn non_instance_write_invalidates_constructor_consensus() {
         let value = RcLocal::default();
         let constructor = RValue::Call(Call::new(
@@ -7064,7 +7551,8 @@ mod tests {
 
         name_locals_with_script_name(&mut block, true, Some("Collision.luau"));
 
-        assert_eq!(name_of(&module), "Foo");
+        // Reassignment no longer lets the original module's narrow RHS name win.
+        assert_eq!(name_of(&module), "v");
     }
 
     #[test]
@@ -7168,6 +7656,7 @@ mod tests {
             None,
             super::NameLocalOptions {
                 dont_reuse_var: true,
+                ..Default::default()
             },
         );
 
@@ -7245,6 +7734,7 @@ mod tests {
             None,
             super::NameLocalOptions {
                 dont_reuse_var: true,
+                ..Default::default()
             },
         );
 
@@ -7279,6 +7769,7 @@ mod tests {
             None,
             super::NameLocalOptions {
                 dont_reuse_var: true,
+                ..Default::default()
             },
         );
 
@@ -8221,10 +8712,9 @@ mod tests {
         assert_eq!(name_of(&v), "v");
     }
 
-    /// A Latin irregular plural (`indices`) must not become a non-word (`indice`);
-    /// the element variable falls back to the default.
+    /// A known irregular collection supplies the element's singular name.
     #[test]
-    fn iterator_element_refuses_latin_irregular() {
+    fn iterator_element_uses_irregular_plural() {
         let indices = RcLocal::default();
         let (k, v) = (RcLocal::default(), RcLocal::default());
         let for_body = Block(vec![use_local(&k), use_local(&v)]);
@@ -8242,7 +8732,172 @@ mod tests {
         ]);
         name_locals(&mut block, true);
         assert_eq!(name_of(&indices), "indices");
-        assert_eq!(name_of(&v), "v");
+        assert_eq!(name_of(&v), "index");
+    }
+
+    #[test]
+    fn saved_iterator_preserves_method_element_and_collection_names() {
+        for iterator in ["pairs", "ipairs"] {
+            for (method, element_name, collection_name) in [
+                ("GetChildren", "child", "children"),
+                ("GetDescendants", "descendant", "descendants"),
+            ] {
+                let (alias, collection, key, element) = (
+                    RcLocal::default(), RcLocal::default(), RcLocal::default(), RcLocal::default(),
+                );
+                let call = Call::new(RValue::Local(alias.clone()), vec![
+                    method_call(global("workspace"), method, vec![]),
+                ]);
+                let generator = if iterator == "pairs" {
+                    RValue::Select(Select::Call(call))
+                } else {
+                    RValue::Call(call)
+                };
+                let mut block = Block(vec![
+                    declare(&alias, global(iterator)),
+                    declare(&collection, RValue::Table(Table::default())),
+                    Statement::GenericFor(GenericFor::new(
+                        vec![key.clone(), element.clone()], vec![generator],
+                        Block(vec![
+                            use_local(&key),
+                            Statement::Call(Call::new(
+                                RValue::Index(Index::new(global("table"), string("insert"))),
+                                vec![RValue::Local(collection.clone()), RValue::Local(element.clone())],
+                            )),
+                        ]),
+                    )),
+                    use_local(&collection),
+                ]);
+                name_locals(&mut block, true);
+                assert_eq!(name_of(&key), "i");
+                assert_eq!(name_of(&element), element_name);
+                assert_eq!(name_of(&collection), collection_name);
+                let Statement::GenericFor(loop_) = &block[2] else { panic!() };
+                let (RValue::Call(call) | RValue::Select(Select::Call(call))) = &loop_.right[0] else { panic!() };
+                assert!(matches!(&*call.value, RValue::Local(local) if local == &alias));
+            }
+        }
+    }
+
+    #[test]
+    fn saved_iterator_preserves_collection_element_name() {
+        for (iterator, key_name) in [("pairs", "k"), ("ipairs", "i"), ("next", "k")] {
+            let (alias, crops, key, crop) = (
+                RcLocal::default(), RcLocal::default(), RcLocal::default(), RcLocal::default(),
+            );
+            let mut block = Block(vec![
+                declare(&alias, global(iterator)),
+                declare(&crops, RValue::Index(Index::new(global("data"), string("Crops")))),
+                Statement::GenericFor(GenericFor::new(
+                    vec![key.clone(), crop.clone()],
+                    vec![RValue::Call(Call::new(RValue::Local(alias), vec![RValue::Local(crops.clone())]))],
+                    Block(vec![use_local(&key), use_local(&crop)]),
+                )),
+            ]);
+            name_locals(&mut block, true);
+            assert_eq!(name_of(&key), key_name);
+            assert_eq!(name_of(&crop), "crop");
+        }
+    }
+
+    #[test]
+    fn iterator_alias_rejects_reassignments_members_and_copies() {
+        for variant in ["reassigned", "captured_write", "member", "copy"] {
+            let (alias, original, key, element) = (
+                RcLocal::default(), RcLocal::default(), RcLocal::default(), RcLocal::default(),
+            );
+            let mut block = Block(vec![declare(&original, global("pairs"))]);
+            block.push(declare(&alias, match variant {
+                "member" => RValue::Index(Index::new(global("custom"), string("pairs"))),
+                "copy" => RValue::Local(original),
+                _ => global("pairs"),
+            }));
+            let replacement = || Statement::Assign(Assign::new(
+                vec![LValue::Local(alias.clone())], vec![global("replacement")],
+            ));
+            match variant {
+                "reassigned" => block.push(replacement()),
+                "captured_write" => {
+                    let callback = RcLocal::default();
+                    block.push(declare(&callback, RValue::Closure(Closure {
+                        node_origin: Default::default(),
+                        function: ByAddress(Arc::new(Mutex::new(Function {
+                            body: Block(vec![replacement()]), ..Function::default()
+                        }))),
+                        upvalues: vec![Upvalue::Ref(alias.clone())],
+                    })));
+                    block.push(use_local(&callback));
+                }
+                _ => {}
+            }
+            block.push(Statement::GenericFor(GenericFor::new(
+                vec![key.clone(), element.clone()],
+                vec![RValue::Call(Call::new(RValue::Local(alias.clone()), vec![
+                    method_call(global("workspace"), "GetChildren", vec![]),
+                ]))],
+                Block(vec![use_local(&key), use_local(&element)]),
+            )));
+            name_locals(&mut block, true);
+            assert_ne!(name_of(&element), "child", "{variant}");
+        }
+    }
+
+    #[test]
+    fn captured_iterator_alias_keeps_nested_child_name_distinct() {
+        let outer_child = RcLocal::default();
+        let (alias, callback, key, child) = (
+            RcLocal::default(), RcLocal::default(), RcLocal::default(), RcLocal::default(),
+        );
+        let function = Function {
+            body: Block(vec![Statement::GenericFor(GenericFor::new(
+                vec![key.clone(), child.clone()],
+                vec![RValue::Call(Call::new(RValue::Local(alias.clone()), vec![
+                    method_call(global("workspace"), "GetChildren", vec![]),
+                ]))],
+                Block(vec![use_local(&key), use_local(&child), use_local(&outer_child)]),
+            ))]),
+            ..Function::default()
+        };
+        let mut block = Block(vec![
+            declare(&outer_child, RValue::Index(Index::new(global("state"), string("child")))),
+            declare(&alias, global("pairs")),
+            declare(&callback, RValue::Closure(Closure {
+                node_origin: Default::default(),
+                function: ByAddress(Arc::new(Mutex::new(function))),
+                upvalues: vec![Upvalue::Copy(alias), Upvalue::Ref(outer_child.clone())],
+            })),
+            use_local(&callback),
+        ]);
+        name_locals(&mut block, true);
+        assert_eq!(name_of(&outer_child), "child");
+        assert_eq!(name_of(&child), "child2");
+        assert!(block.to_string().contains("print(child)"));
+    }
+
+    #[test]
+    fn irregular_plural_names_roundtrip_without_guessing_ambiguous_words() {
+        for &(plural, singular) in super::IRREGULAR_PLURALS {
+            assert_eq!(super::singularize(plural).as_deref(), Some(singular));
+            assert_eq!(super::singularize(&plural.to_ascii_uppercase()).as_deref(), Some(singular));
+            assert_eq!(super::pluralize(singular).as_deref(), Some(plural));
+            assert_eq!(super::pluralize(plural).as_deref(), Some(plural));
+        }
+        for word in ["axes", "bases", "status", "species", "series", "data", "đứa trẻ"] {
+            assert_eq!(super::singularize(word), None, "{word}");
+        }
+    }
+
+    #[test]
+    fn element_names_of_collections() {
+        for (collection, element) in [("parts", "part"), ("modulesByName", "module"), ("zoneIdToZoneObj", "zoneObj"),
+            ("pointList", "point"), ("partsList", "part"), ("questArray", "quest"), ("dtorMap", "dtor")]
+        {
+            assert_eq!(super::element_name(collection).as_deref(), Some(element), "{collection}");
+        }
+        for collection in ["list", "historyToKeep", "standBy", "Map", "status"] {
+            assert_eq!(super::element_name(collection), None, "{collection}");
+        }
+        assert!(super::bare_collection("list2") && !super::bare_collection("lists"));
     }
 
     /// A config/props table that merely holds ONE nested element among scalar
@@ -9201,6 +9856,48 @@ mod tests {
         assert_eq!(name_of(&p), "dt");
     }
 
+    #[test]
+    fn event_parameter_role_beats_its_store_destination() {
+        for (event, expected) in [
+            ("CharacterAdded", &["character"][..]), ("PlayerAdded", &["player"][..]),
+            ("Triggered", &["player"][..]), ("PromptTriggered", &["prompt", "player"][..]),
+        ] {
+            let parameters: Vec<_> = expected.iter().map(|_| RcLocal::default()).collect();
+            let mut function = Function::default();
+            function.parameters = parameters.clone();
+            function.body = Block(parameters.iter().map(|parameter| Assign::new(
+                vec![Index::new(global("part"), string("Parent")).into()],
+                vec![RValue::Local(parameter.clone())],
+            ).into()).collect());
+            let mut block = Block(vec![MethodCall::new(
+                Index::new(global("signalOwner"), string(event)).into(),
+                "Connect".into(), vec![closure_of(function)],
+            ).into()]);
+            name_locals(&mut block, true);
+            for (parameter, expected) in parameters.iter().zip(expected) {
+                assert_eq!(name_of(parameter), *expected, "{event}");
+                assert_eq!(parameter.0.lock().4.name_tier, crate::NameTier::Evidence);
+            }
+        }
+    }
+
+    #[test]
+    fn vector_dimension_is_not_a_collision_counter() {
+        let a = RcLocal::default();
+        let b = RcLocal::default();
+        let c = RcLocal::default();
+        let mut block = Block(vec![
+            declare(&a, lib_call("Vector3", "new", vec![])),
+            declare(&b, lib_call("Vector2", "new", vec![])),
+            declare(&c, lib_call("Vector3", "new", vec![])),
+            use_local(&a), use_local(&b), use_local(&c),
+        ]);
+        name_locals(&mut block, true);
+        assert_eq!(name_of(&a), "vector3");
+        assert_eq!(name_of(&b), "vector2");
+        assert_eq!(name_of(&c), "vector3_2");
+    }
+
     /// An assigned `InputBegan:Connect(function(p, p2) ...)` names the params from
     /// the signature: `input`, `gameProcessed`.
     #[test]
@@ -9668,9 +10365,9 @@ mod tests {
 
     // ---- OOP class-table naming ----
 
-    /// An empty table with a metatable signal (`t.__index = t`) is named `class`.
+    /// An `__index` assignment alone does not establish a class role.
     #[test]
-    fn empty_table_with_index_signal_named_class() {
+    fn empty_table_with_only_index_signal_is_not_named_class() {
         let t = RcLocal::default();
         let index_assign: Statement = Assign::new(
             vec![LValue::Index(Index::new(
@@ -9686,7 +10383,7 @@ mod tests {
             use_local(&t),
         ]);
         name_locals(&mut block, true);
-        assert_eq!(name_of(&t), "class");
+        assert_ne!(name_of(&t), "class");
     }
 
     /// An empty table that is colon-invoked (`t:method()`) is a class even without
@@ -10850,6 +11547,52 @@ mod tests {
         assert_eq!(name_of(&v), "v");
     }
 
+    /// The documented roles of `workspace:Raycast(origin, direction, params)`.
+    #[test]
+    fn raycast_argument_roles() {
+        let (origin, direction) = (RcLocal::default(), RcLocal::default());
+        let cast = MethodCall::new(global("workspace"), "Raycast".into(), vec![RValue::Local(origin.clone()), RValue::Local(direction.clone())]);
+        name_param_fn(vec![origin.clone(), direction.clone()], vec![Statement::MethodCall(cast)]);
+        assert_eq!((name_of(&origin).as_str(), name_of(&direction).as_str()), ("origin", "direction"));
+    }
+
+    /// `local v = {}` stored only `v[child.Name] = true` -> `nameSet`.
+    #[test]
+    fn boolean_set() {
+        let set = RcLocal::default();
+        let key = RValue::Index(Index::new(global("child"), string("Name")));
+        let store = Assign::new(
+            vec![LValue::Index(Index::new(RValue::Local(set.clone()), key))],
+            vec![RValue::Literal(Literal::Boolean(true))],
+        );
+        let mut block = Block(vec![declare(&set, RValue::Table(Table::new(Vec::new()))), store.into(), use_local(&set)]);
+        name_locals(&mut block, true);
+        assert_eq!(name_of(&set), "nameSet");
+    }
+
+    /// `v = math.max(v, part.Size.X)` -> `maxX`; against a constant it is a
+    /// bound (`math.max(v, 0)`), named nothing.
+    #[test]
+    fn running_extremum() {
+        let extremum = |local: &RcLocal, other: RValue| -> Statement {
+            Assign::new(
+                vec![LValue::Local(local.clone())],
+                vec![lib_call("math", "max", vec![RValue::Local(local.clone()), other])],
+            )
+            .into()
+        };
+        let x = RValue::Index(Index::new(RValue::Index(Index::new(global("part"), string("Size"))), string("X")));
+        let largest = RcLocal::default();
+        let mut block = Block(vec![declare(&largest, number(0.0)), extremum(&largest, x), use_local(&largest)]);
+        name_locals(&mut block, true);
+        assert_eq!(name_of(&largest), "maxX");
+
+        let bounded = RcLocal::default();
+        let mut block = Block(vec![declare(&bounded, number(0.0)), extremum(&bounded, number(1.0)), use_local(&bounded)]);
+        name_locals(&mut block, true);
+        assert_eq!(name_of(&bounded), "v");
+    }
+
     /// `local v = parts[i]` -> `part`; a running sum (`v = v + dt`) -> `total`.
     #[test]
     fn indexed_element_and_accumulator() {
@@ -10876,6 +11619,23 @@ mod tests {
         ]);
         name_locals(&mut block, true);
         assert_eq!(name_of(&total), "total");
+
+        // Summing into `vector.create(0, 0, 0)` names the role, not the type.
+        let sum = RcLocal::default();
+        let update = Assign::new(
+            vec![LValue::Local(sum.clone())],
+            vec![RValue::Binary(Binary::new(RValue::Local(sum.clone()), global("offset"), BinaryOperation::Add))],
+        );
+        let zero = lib_call("vector", "create", vec![number(0.0), number(0.0), number(0.0)]);
+        let mean = RcLocal::default();
+        let length = RValue::Unary(Unary::new(global("points"), UnaryOperation::Length));
+        let mut block = Block(vec![
+            declare(&sum, zero), update.into(),
+            declare(&mean, RValue::Binary(Binary::new(RValue::Local(sum.clone()), length, BinaryOperation::Div))),
+            use_local(&mean),
+        ]);
+        name_locals(&mut block, true);
+        assert_eq!((name_of(&sum).as_str(), name_of(&mean).as_str()), ("total", "average"));
     }
 
     /// A bytecode-type hint names an otherwise anonymous local (`vector`), is
@@ -10887,11 +11647,13 @@ mod tests {
         let mut block = Block(declare_and_use(&typed, call));
         name_locals(&mut block, true);
         assert_eq!(name_of(&typed), "vector");
+        assert_eq!(typed.0.lock().4.name_tier, crate::NameTier::TypeFallback);
 
         let named = RcLocal::new(crate::Local::with_type_hint("vector".to_string()));
         let mut block = Block(declare_and_use(&named, lib_call("Vector3", "new", vec![])));
         name_locals(&mut block, true);
-        assert_eq!(name_of(&named), "vector");
+        assert_eq!(name_of(&named), "vector3");
+        assert_eq!(named.0.lock().4.name_tier, crate::NameTier::Evidence);
 
         let getter = RcLocal::new(crate::Local::with_type_hint("vector".to_string()));
         let mut block = Block(declare_and_use(
@@ -11054,6 +11816,126 @@ mod tests {
         ]);
         name_locals(&mut block, true);
         assert_eq!((name_of(&outer), name_of(&scope), name_of(&size)), ("outerScope".into(), "scope".into(), "size".into()));
+    }
+
+    #[test]
+    fn saved_api_callees_preserve_argument_roles() {
+        for (namespace, member, expected) in [
+            (Some("buffer"), "readstring", &["buf", "offset", "count"][..]),
+            (Some("buffer"), "writestring", &["buf", "offset", "str", "count"][..]),
+            (Some("buffer"), "copy", &["target", "targetOffset", "source", "sourceOffset", "count"][..]),
+            (Some("math"), "clamp", &["value", "min", "max"][..]),
+            (Some("task"), "delay", &["duration", "callback"][..]),
+            (Some("string"), "sub", &["value"][..]),
+            (None, "unpack", &["list"][..]),
+            (None, "require", &["moduleScript"][..]),
+            (None, "error", &["message"][..]),
+            (None, "pcall", &["callback"][..]),
+        ] {
+            let alias = RcLocal::default();
+            let parameters: Vec<_> = expected.iter().map(|_| RcLocal::default()).collect();
+            let callee = namespace.map_or_else(|| global(member), |namespace| {
+                RValue::Index(Index::new(global(namespace), string(member)))
+            });
+            name_param_fn(parameters.clone(), vec![
+                declare(&alias, callee),
+                Statement::Call(Call::new(RValue::Local(alias), parameters.iter().cloned().map(RValue::Local).collect())),
+            ]);
+            assert_eq!(parameters.iter().map(name_of).collect::<Vec<_>>(), expected, "{namespace:?}.{member}");
+        }
+    }
+
+    #[test]
+    fn saved_api_callees_preserve_numeric_and_collection_usage() {
+        for (namespace, member, name) in [("buffer", "create", "size"), ("string", "rep", "count")] {
+            let (alias, parameter, amount) = (RcLocal::default(), RcLocal::default(), RcLocal::default());
+            let mut arguments = vec![RValue::Local(amount.clone())];
+            if member == "rep" { arguments.insert(0, string(" ")); }
+            name_param_fn(vec![parameter.clone()], vec![
+                declare(&alias, RValue::Index(Index::new(global(namespace), string(member)))),
+                declare(&amount, RValue::Binary(Binary::new(RValue::Local(parameter.clone()), number(1.0), BinaryOperation::Add))),
+                ret(vec![RValue::Call(Call::new(RValue::Local(alias), arguments))]),
+            ]);
+            assert_eq!(name_of(&parameter), name);
+        }
+        let (alias, connections) = (RcLocal::default(), RcLocal::default());
+        let mut block = Block(vec![
+            declare(&alias, RValue::Index(Index::new(global("table"), string("insert")))),
+            declare(&connections, RValue::Table(Table::default())),
+            Statement::Call(Call::new(RValue::Local(alias.clone()), vec![
+                RValue::Local(connections.clone()), method_call(global("signal"), "Connect", vec![global("callback")]),
+            ])),
+            use_local(&connections),
+        ]);
+        name_locals(&mut block, true);
+        assert_eq!(name_of(&connections), "connections");
+        let Statement::Call(call) = &block[2] else { panic!() };
+        assert!(matches!(&*call.value, RValue::Local(local) if local == &alias));
+    }
+
+    #[test]
+    fn saved_api_roles_reject_mutation_shadowed_namespace_and_alias_chains() {
+        for variant in ["reassigned", "captured_write", "shadowed_namespace", "copy"] {
+            let (alias, original, namespace) = (RcLocal::default(), RcLocal::default(), RcLocal::default());
+            let parameters: Vec<_> = (0..5).map(|_| RcLocal::default()).collect();
+            let mut body = vec![declare(&namespace, global("custom"))];
+            body.push(declare(&original, RValue::Index(Index::new(global("buffer"), string("copy")))));
+            body.push(declare(&alias, match variant {
+                "shadowed_namespace" => RValue::Index(Index::new(RValue::Local(namespace), string("copy"))),
+                "copy" => RValue::Local(original),
+                _ => RValue::Index(Index::new(global("buffer"), string("copy"))),
+            }));
+            let overwrite = || Assign::new(vec![LValue::Local(alias.clone())], vec![global("replacement")]).into();
+            match variant {
+                "reassigned" => body.push(overwrite()),
+                "captured_write" => {
+                    let callback = RcLocal::default();
+                    body.push(declare(&callback, RValue::Closure(Closure {
+                        node_origin: Default::default(),
+                        function: ByAddress(Arc::new(Mutex::new(Function {
+                            body: Block(vec![overwrite()]), ..Function::default()
+                        }))),
+                        upvalues: vec![Upvalue::Ref(alias.clone())],
+                    })));
+                    body.push(use_local(&callback));
+                }
+                _ => {}
+            }
+            body.push(Statement::Call(Call::new(RValue::Local(alias.clone()), parameters.iter().cloned().map(RValue::Local).collect())));
+            name_param_fn(parameters.clone(), body);
+            for (parameter, role) in parameters.iter().zip(["target", "targetOffset", "source", "sourceOffset", "count"]) {
+                assert_ne!(name_of(parameter), role, "{variant}");
+            }
+        }
+    }
+
+    #[test]
+    fn captured_api_alias_keeps_outer_and_parameter_roles_distinct() {
+        let (outer_target, alias, callback, target) = (
+            RcLocal::default(), RcLocal::default(), RcLocal::default(), RcLocal::default(),
+        );
+        let function = Function {
+            parameters: vec![target.clone()],
+            body: Block(vec![
+                Statement::Call(Call::new(RValue::Local(alias.clone()), vec![
+                    RValue::Local(target.clone()), number(0.0), global("sourceBuffer"), number(0.0), number(1.0),
+                ])),
+                use_local(&outer_target),
+            ]),
+            ..Function::default()
+        };
+        let mut block = Block(vec![
+            declare(&outer_target, RValue::Index(Index::new(global("state"), string("target")))),
+            declare(&alias, RValue::Index(Index::new(global("buffer"), string("copy")))),
+            declare(&callback, RValue::Closure(Closure {
+                node_origin: Default::default(), function: ByAddress(Arc::new(Mutex::new(function))),
+                upvalues: vec![Upvalue::Copy(alias), Upvalue::Ref(outer_target.clone())],
+            })),
+            use_local(&callback),
+        ]);
+        name_locals(&mut block, true);
+        assert_eq!(name_of(&outer_target), "target");
+        assert_eq!(name_of(&target), "target2");
     }
 
     /// API-slot params: `innerScope(p)` -> `outerScope`, `peek(p)` -> `state`,

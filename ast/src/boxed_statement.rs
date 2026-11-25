@@ -90,7 +90,8 @@ mod tests {
     fn compact_layout_and_boxed_dispatch_preserve_payload_selectors() {
         assert!(std::mem::size_of::<Statement>() < std::mem::size_of::<NumForInit>());
         #[cfg(target_pointer_width = "64")]
-        assert_eq!(std::mem::size_of::<Statement>(), 128);
+        // Source line spans stay inline, without per-node allocations.
+        assert_eq!(std::mem::size_of::<Statement>(), 144);
         let a = RcLocal::default(); let b = RcLocal::default(); let c = RcLocal::default();
         let statements: Vec<Statement> = vec![
             NumForInit::new(a.clone(), b.clone(), c.clone()).into(),
@@ -119,6 +120,7 @@ mod tests {
         call.node_origin = crate::node_origins::Origin::synthesized("layout_fixture");
         call.reconstruction_event = 73;
         call.callee_after_arguments = true;
+        call.builtin_fastcall = Some((54, 2));
         let payload = NumericFor::new(call.into(), Literal::Number(-0.0).into(), Literal::Number(1.0).into(), local.clone(), Block::default());
         let debug = format!("NumericFor({payload:?})");
         let owners = (Arc::count(&local.0.0), Arc::strong_count(&function));
@@ -132,7 +134,7 @@ mod tests {
         assert!(copy_call.node_origin.0.as_ref().unwrap().cloned);
         assert!(!original_call.node_origin.0.as_ref().unwrap().cloned);
         assert_eq!(copy_call.node_origin.0.as_ref().unwrap().synthesized, Some("layout_fixture"));
-        assert_eq!((copy_call.reconstruction_event, copy_call.callee_after_arguments), (73, true));
+        assert_eq!((copy_call.reconstruction_event, copy_call.callee_after_arguments, copy_call.builtin_fastcall), (73, true, Some((54, 2))));
         assert_eq!(copy_call.value.as_closure().unwrap().function, original_call.value.as_closure().unwrap().function);
         assert_eq!(copy_call.arguments[0].as_literal().unwrap().as_number().unwrap().to_bits(), 0x7ff8_0000_0000_00a5);
         drop(cloned);

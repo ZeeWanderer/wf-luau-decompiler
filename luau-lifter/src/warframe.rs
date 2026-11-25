@@ -49,7 +49,7 @@ pub fn try_decompile_warframe_bytecode_with_symbols(
             .map(|(index, hash)| (*hash, string_count + index + 1))
             .collect();
         drop(parsed);
-        try_decompile_with_parser(bytecode, script_name, options, false, &|| {
+        try_decompile_with_parser(bytecode, false, script_name, options, false, &|| {
             let mut parsed = deserialize(bytecode)?;
             if let Bytecode::Chunk(chunk) = &mut parsed {
                 adapt_host_calls(chunk)?;

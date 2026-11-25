@@ -4,30 +4,73 @@ use crate::{
 
 use std::{fmt, iter};
 
+// shortcut: bound extra allocation syntax to 4096 entries; extend with large-allocation controls.
+pub(crate) const MAX_ALLOCATION_PADDING: usize = 4096;
+
 #[derive(Clone, PartialEq, Default)]
 pub struct Table(pub Vec<(Option<RValue>, RValue)>, pub crate::node_origins::Origin, pub TableShape);
 
 impl Table {
     pub fn new(fields: Vec<(Option<RValue>, RValue)>) -> Self { Self(fields, Default::default(), Default::default()) }
+
+    /// An explicit key that addresses the originally allocated array part.
+    pub fn array_index(&self, key: &RValue) -> Option<usize> {
+        if let TableShape::NewTable { array, .. } = self.2
+            && let RValue::Literal(Literal::Number(index)) = key
+            && *index >= 1.0 && *index <= f64::from(array) && index.fract() == 0.0
+        { Some(*index as usize) } else { None }
+    }
+
+    /// The keyed fields Luau sizes the hash part for: an explicit key in the
+    /// allocated array part counts there, unless list items share the
+    /// constructor (`{ [1] = a, [2] = b, Secret = c }` is hash 1, array 2).
+    pub(crate) fn hash_keys(&self) -> usize {
+        let has_list = self.0.iter().any(|(key, _)| key.is_none());
+        self.0.iter().filter(|(key, _)| key.as_ref().is_some_and(|key| has_list || self.array_index(key).is_none())).count()
+    }
+
+    /// Extra keyed syntax needed to preserve the original hash allocation.
+    /// None as the key means array slot 1, which already exists and is nil.
+    pub(crate) fn hash_padding(&self) -> Result<(usize, Option<&RValue>), &'static str> {
+        let TableShape::NewTable { hash, array } = self.2 else { return Ok((0, None)); };
+        // shortcut: preserve legacy empty-table output across compiler allocation
+        // prediction; upgrade when empty hash hints have an exact source encoding.
+        if hash == 0 || self.0.is_empty() { return Ok((0, None)); }
+        let listed = self.hash_keys();
+        if listed > hash as usize {
+            return Err("constructor fields exceed the original NEWTABLE hash allocation");
+        }
+        let padding = (hash as usize / 2 + 1).saturating_sub(listed);
+        if padding == 0 { return Ok((0, None)); }
+        if padding <= MAX_ALLOCATION_PADDING {
+            if array > 0 { return Ok((padding, None)); }
+            if let Some((Some(key), _)) = self.0.first()
+                && (matches!(key, RValue::Literal(Literal::String(_) | Literal::Boolean(_)))
+                    || matches!(key, RValue::Literal(Literal::Number(number)) if !number.is_nan()))
+            {
+                return Ok((padding, Some(key)));
+            }
+        }
+        // shortcut: no field can carry the padding; print the legacy constructor
+        // (as for empty hash hints) instead of refusing the script; `pairs` order
+        // can then differ from the input. Upgrade with an exact padding spelling.
+        Ok((0, None))
+    }
 }
 
 /// How the bytecode built a table, which decides the order `next` and
 /// `pairs` visit its keys in: the size of its hash part, and whether a store
 /// of `nil` leaves a key in it. A DUPTABLE copies a template whose keys all
-/// exist before any store, so a key stored `nil` keeps its node; a NEWTABLE
-/// of hash size `hash` gets a key only when a store of a value creates it.
+/// exist before any store; in a NEWTABLE of hash size `hash`, a node whose
+/// value was stored `nil` can be reused by a later colliding insertion.
 /// A table grown past its hash part rehashes, which moves its keys. Layout
-/// only: never part of AST equality.
-#[derive(Clone, Copy, Debug, Default)]
+/// is observable, so unlike source locations it participates in AST equality.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum TableShape {
     #[default]
     Unknown,
-    NewTable { hash: u32 },
+    NewTable { hash: u32, array: u32 },
     Template { keys: u32 },
-}
-
-impl PartialEq for TableShape {
-    fn eq(&self, _: &Self) -> bool { true }
 }
 
 impl TableShape {
@@ -38,25 +81,185 @@ impl TableShape {
 }
 
 /// Whether a store adding a key may fold into `table`'s constructor without
-/// changing the order `pairs` visits its keys in. A DUPTABLE's hash part has
+/// changing the order `pairs` visits its keys in. A NEWTABLE must keep its
+/// initial hash capacity, including zero; folding stores past it erases growth
+/// and rehash steps. A DUPTABLE's hash part has
 /// nodes for its template keys rounded up to a power of two; a store adding a
 /// key past that rehashes the table, and a constructor printing the key would
 /// be a larger template, laid out otherwise: `{a = 1, b = 2}; t.c = 3` is not
 /// `{a = 1, b = 2, c = 3}` under `pairs` (fr-t1110 F2).
-pub fn template_takes_another_key(table: &Table) -> bool {
-    let TableShape::Template { keys } = table.2 else { return true };
-    let listed = table.0.iter().filter(|(key, _)| key.is_some()).count();
-    u32::try_from(listed + 1).is_ok_and(|after| after <= TableShape::nodes(keys))
+pub fn table_takes_another_key(table: &Table, key: &RValue) -> bool {
+    let capacity = match table.2 {
+        TableShape::Unknown => return true,
+        TableShape::NewTable { hash, .. } => {
+            if let Some(index) = table.array_index(key) {
+                let slots = table.0.iter().filter(|(key, _)| key.as_ref().is_none_or(|key| table.array_index(key).is_some())).count();
+                let has_list = table.0.iter().any(|(key, _)| key.is_none());
+                if index == slots + 1 && !has_list { return true; }
+                // A nonsequential array key stays explicit and consumes hash syntax.
+                return (!has_list || index == slots + 1)
+                    && table.0.iter().filter(|(key, _)| key.is_some()).count() < hash as usize;
+            }
+            hash
+        }
+        TableShape::Template { keys } => {
+            // A larger template pre-seeds the added key before any nil store.
+            if table.0.iter().any(|(_, value)| !crate::return_types::is_proven_non_nil(value)) {
+                return false;
+            }
+            TableShape::nodes(keys)
+        }
+    };
+    // Mixed constructors cannot lower explicit array keys to list items:
+    // doing so shifts the later list stores. Luau counts those keys as hash fields.
+    u32::try_from(table.hash_keys() + 1).is_ok_and(|after| after <= capacity)
 }
 
-/// Whether `table` is a DUPTABLE copy: all its template keys exist before
-/// any store, in template order, so a constructor must keep each one in its
-/// place (no store may move a `nil` slot to the end).
-pub fn is_template_copy(table: &Table) -> bool {
-    matches!(table.2, TableShape::Template { .. })
+/// Replacing an earlier NEWTABLE value must not change whether its node can
+/// be reused by a later insertion. Templates already have every listed key.
+pub fn table_replaces_entry(table: &Table, position: usize, value: &RValue) -> bool {
+    !matches!(table.2, TableShape::NewTable { .. })
+        || position + 1 == table.0.len()
+        || (crate::return_types::is_proven_non_nil(&table.0[position].1)
+            && crate::return_types::is_proven_non_nil(value))
 }
+
+/// A nil NEWTABLE store can still create a key/node; dropping it before later
+/// insertions changes collision chains even though it contributes no live value.
+pub fn table_moves_entry_to_end(table: &Table, position: usize) -> bool {
+    match table.2 {
+        TableShape::Unknown => true,
+        TableShape::NewTable { .. } => position + 1 == table.0.len(),
+        TableShape::Template { .. } => false,
+    }
+}
+
+/// After field unification, the site's values also prove the helper's values.
+/// A NEWTABLE can match a template only if allocation and collision placement
+/// agree; matching keys and values alone is insufficient.
+pub fn compatible_table_layouts(pattern: &Table, site: &Table) -> bool {
+    match (pattern.2, site.2) {
+        (TableShape::Unknown, TableShape::Unknown) => true,
+        (TableShape::NewTable { hash: a, array: x }, TableShape::NewTable { hash: b, array: y }) => a == b && x == y,
+        (TableShape::Template { keys: a }, TableShape::Template { keys: b }) => {
+            TableShape::nodes(a) == TableShape::nodes(b)
+        }
+        (TableShape::NewTable { hash, array: 0 }, TableShape::Template { keys })
+        | (TableShape::Template { keys }, TableShape::NewTable { hash, array: 0 }) => {
+            hash == TableShape::nodes(keys)
+                && site.0.iter().all(|(key, _)| matches!(key, Some(RValue::Literal(Literal::String(_)))))
+                && site.0.iter().take(site.0.len().saturating_sub(1))
+                    .all(|(_, value)| crate::return_types::is_proven_non_nil(value))
+        }
+        _ => false,
+    }
+}
+
 impl fmt::Debug for Table {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result { f.debug_tuple("Table").field(&self.0).finish() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn table(shape: TableShape, values: Vec<RValue>) -> Table {
+        Table(values.into_iter().enumerate().map(|(index, value)| {
+            (Some(Literal::String(vec![b'a' + index as u8]).into()), value)
+        }).collect(), Default::default(), shape)
+    }
+
+    fn number() -> RValue { Literal::Number(1.0).into() }
+
+    #[test]
+    fn array_slots_are_separate_from_hash_capacity() {
+        let mut t = table(TableShape::NewTable { hash: 2, array: 3 }, vec![number()]);
+        assert!(table_takes_another_key(&t, &number()));
+        assert!(table_takes_another_key(&t, &Literal::Number(2.0).into()));
+        let full = table(TableShape::NewTable { hash: 1, array: 3 }, vec![number()]);
+        assert!(!table_takes_another_key(&full, &Literal::Number(2.0).into()));
+        assert!(table_takes_another_key(&t, &RcLocal::default().into()));
+        t.0.push((Some(number()), Literal::Nil.into()));
+        assert!(table_takes_another_key(&t, &Literal::Number(2.0).into()));
+        assert!(table_takes_another_key(&t, &Literal::String(b"b".to_vec()).into()));
+        let mut other = t.clone();
+        other.2 = TableShape::NewTable { hash: 2, array: 4 };
+        assert!(!compatible_table_layouts(&t, &other));
+    }
+
+    #[test]
+    fn explicit_array_keys_without_list_items_leave_the_hash_part_to_the_others() {
+        // `SellRewards = { [1] = ..., [5] = ..., Secret = ... }`: NEWTABLE hash 1, array 5.
+        let mut fields: Vec<(Option<RValue>, RValue)> = (1..=5).map(|index| (Some(Literal::Number(f64::from(index)).into()), number())).collect();
+        fields.push((Some(Literal::String(b"Secret".to_vec()).into()), number()));
+        let t = Table(fields, Default::default(), TableShape::NewTable { hash: 1, array: 5 });
+        assert_eq!(t.hash_keys(), 1);
+        assert_eq!(t.hash_padding(), Ok((0, None)));
+        assert!(t.to_string().contains("[5] = 1"));
+    }
+
+    #[test]
+    fn mixed_list_fields_keep_explicit_array_keys_in_the_hash_census() {
+        let mut t = Table(vec![
+            (Some(number()), number()),
+            (Some(Literal::Boolean(true).into()), number()),
+            (None, number()),
+        ], Default::default(), TableShape::NewTable { hash: 2, array: 1 });
+        assert!(!table_takes_another_key(&t, &Literal::String(b"extra".to_vec()).into()));
+        t.0.pop();
+        assert!(table_takes_another_key(&t, &Literal::String(b"extra".to_vec()).into()));
+
+        let mut t = Table(vec![(None, number()), (Some(Literal::Boolean(true).into()), number())],
+            Default::default(), TableShape::NewTable { hash: 1, array: 3 });
+        assert!(!table_takes_another_key(&t, &Literal::Number(2.0).into()));
+        assert!(!table_takes_another_key(&t, &number()));
+        t.2 = TableShape::NewTable { hash: 2, array: 3 };
+        assert!(table_takes_another_key(&t, &Literal::Number(2.0).into()));
+        assert!(!table_takes_another_key(&t, &Literal::Number(3.0).into()));
+    }
+
+    #[test]
+    fn empty_hash_hint_keeps_the_selected_compatibility_policy() {
+        let t = table(TableShape::NewTable { hash: 8, array: 0 }, vec![]);
+        assert_eq!(t.hash_padding().unwrap().0, 0);
+        assert_eq!(t.to_string(), "{}");
+    }
+
+    #[test]
+    fn append_preserves_capacity_and_template_nil_nodes() {
+        assert!(!table_takes_another_key(&table(TableShape::NewTable { hash: 0, array: 0 }, vec![]), &Literal::String(b"next".to_vec()).into()));
+        assert!(table_takes_another_key(&table(TableShape::NewTable { hash: 2, array: 0 }, vec![number()]), &Literal::String(b"next".to_vec()).into()));
+        assert!(!table_takes_another_key(&table(TableShape::NewTable { hash: 2, array: 0 }, vec![number(), number()]), &Literal::String(b"next".to_vec()).into()));
+        assert!(table_takes_another_key(&table(TableShape::Template { keys: 3 }, vec![number(), number(), number()]), &Literal::String(b"next".to_vec()).into()));
+        assert!(!table_takes_another_key(&table(TableShape::Template { keys: 3 }, vec![number(), number(), RcLocal::default().into()]), &Literal::String(b"next".to_vec()).into()));
+    }
+
+    #[test]
+    fn replacement_and_movement_do_not_change_nil_collision_history() {
+        let mut t = table(TableShape::NewTable { hash: 2, array: 0 }, vec![Literal::Nil.into(), number()]);
+        assert!(!table_replaces_entry(&t, 0, &number()));
+        assert!(!table_moves_entry_to_end(&t, 0));
+        assert!(table_replaces_entry(&t, 1, &Literal::Nil.into()));
+        t.0[0].1 = number();
+        assert!(table_replaces_entry(&t, 0, &number()));
+        assert!(!table_replaces_entry(&t, 0, &Literal::Nil.into()));
+        t.2 = TableShape::Template { keys: 2 };
+        assert!(table_replaces_entry(&t, 0, &Literal::Nil.into()));
+        assert!(!table_moves_entry_to_end(&t, 1));
+    }
+
+    #[test]
+    fn equality_and_helper_matching_keep_allocation_semantics() {
+        let a = table(TableShape::NewTable { hash: 2, array: 0 }, vec![number(), Literal::Nil.into()]);
+        let mut b = a.clone();
+        b.2 = TableShape::Template { keys: 2 };
+        assert_ne!(a, b);
+        assert!(compatible_table_layouts(&a, &b));
+        b.0[0].1 = RcLocal::default().into();
+        assert!(!compatible_table_layouts(&a, &b));
+        b.2 = TableShape::NewTable { hash: 4, array: 0 };
+        assert!(!compatible_table_layouts(&a, &b));
+    }
 }
 
 /// A DUPTABLE template field. The VM loader creates every template key with the

@@ -1,20 +1,18 @@
-//! Arguments fold back into builtin calls.
+//! Open builtin arguments print as the source wrote them.
 //!
 //! The accompanying source was compiled with Luau c2ec0d4:
 //! `luau-compile --binary -O2 -g0 --fflags=false fastcall_arguments.luau`.
-//! A builtin call compiles to FASTCALL: its arguments are evaluated first and
-//! the callee is imported after them, for the fallback CALL. Treating that
-//! import as an ordering barrier left every argument in a temporary
-//! (`local v3 = depth + 1; table.insert(out, ("  "):rep(v3))`).
+//! Its spreading `:rep` call runs before the FASTCALL fallback loads
+//! `table.insert`, which is how Luau compiles `table.insert(out, s:rep(n))`
+//! itself, so that spelling recompiles to the same order at this level.
 
 const BYTECODE: &[u8] = include_bytes!("fixtures/fastcall_arguments.luaubc");
 
 #[test]
-fn builtin_call_arguments_are_inlined() {
+fn spreading_builtin_arguments_keep_the_source_spelling() {
     let source = luau_lifter::try_decompile_bytecode_with_options(BYTECODE, 1, None, Default::default())
-        .expect("fixture decompiles");
-    // `local out = {}` is the only local: no argument needs a temporary.
-    assert_eq!(source.matches("local ").count(), 1, "{source}");
-    assert!(source.contains("table.insert(v, (tostring(k)))"), "{source}");
-    assert!(source.contains("string.format(\"%q\", (tostring(item)))"), "{source}");
+        .expect("a FASTCALL fallback only loads its callee");
+    assert!(source.contains(r#"table.insert(v, ("  "):rep(count + 1))"#), "{source}");
+    assert!(source.contains(r#"table.insert(v, string.format("%q", (tostring(item))))"#), "{source}");
+    assert!(!source.contains("local insert"), "{source}");
 }

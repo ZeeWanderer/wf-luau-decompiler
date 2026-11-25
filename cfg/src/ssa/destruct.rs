@@ -51,12 +51,6 @@ impl LastUses {
     }
 }
 
-#[derive(PartialEq, Eq)]
-enum RedOrBlue {
-    Red,
-    Blue,
-}
-
 /// Whether two congruence classes have members defined at the same point.
 fn share_definition_point(a: &CongruenceClass, b: &CongruenceClass) -> bool {
     let (small, large) = if a.members.len() <= b.members.len() { (a, b) } else { (b, a) };
@@ -331,6 +325,7 @@ pub struct Destructor<'a> {
     local_last_use: FxHashMap<RcLocal, LastUses>,
     /// Dominator-tree children per node index, in CFG node order.
     dominator_children: Vec<Vec<NodeIndex>>,
+    dominator_parent: Vec<Option<NodeIndex>>,
     // Half-open DFS intervals provide ancestor queries in O(1), with O(V)
     // storage instead of copying every ancestor on a deep dominator chain.
     /// Dominator-tree preorder interval per node index.
@@ -340,6 +335,9 @@ pub struct Destructor<'a> {
     terminal_block: Option<NodeIndex>,
     /// Bytecode register (lifter local) of each SSA version, when known.
     register_groups: Option<&'a FxHashMap<RcLocal, usize>>,
+    /// [`Self::coalesce_live_self_updates`] runs: off for a function Luau
+    /// inlined elsewhere, whose body must keep the shape of its copies.
+    live_self_updates: bool,
     /// Roots of the captured cells no closure writes.
     unwritten_cells: Option<&'a FxHashSet<RcLocal>>,
     /// Registers of the phi transports this destructor creates.
@@ -357,6 +355,14 @@ pub struct Destructor<'a> {
     /// targets. Recorded in [`Self::build_def_use`]: coalescing removes
     /// emptied statements, so positions looked up later would be stale.
     value_captures: FxHashSet<(u64, usize, usize)>,
+    /// Where closures copy each local: block and statement, recorded with
+    /// `local_defs` so positions compare ([`Self::breaks_copy_capture`]).
+    copy_captures: FxHashMap<RcLocal, Vec<(NodeIndex, usize)>>,
+    /// The blocks reachable from a block, filled as copies need them.
+    reach: FxHashMap<NodeIndex, FxHashSet<NodeIndex>>,
+    /// Value classes a trivial block parameter shares with its one incoming
+    /// value ([`Self::alias_trivial_param_values`]), by class address.
+    value_alias: FxHashMap<usize, usize>,
 }
 
 /// Terminal SSA still needs copy/capture coalescing and sequentialization,
@@ -498,17 +504,22 @@ impl<'a> Destructor<'a> {
             local_defs: FxHashMap::with_capacity_and_hasher(local_count, Default::default()),
             local_last_use: FxHashMap::default(),
             dominator_children: Vec::new(),
+            dominator_parent: Vec::new(),
             dominators: Vec::new(),
             liveness: Liveness::default(),
             undesirable_blocks: FxHashSet::default(),
             terminal_block,
             register_groups: None,
+            live_self_updates: false,
             unwritten_cells: None,
             transport_groups: FxHashMap::default(),
             transported: FxHashSet::default(),
             captured: None,
             unstable_cells: FxHashSet::default(),
             value_captures: FxHashSet::default(),
+            copy_captures: FxHashMap::default(),
+            reach: FxHashMap::default(),
+            value_alias: FxHashMap::default(),
         }
     }
 
@@ -518,6 +529,12 @@ impl<'a> Destructor<'a> {
     /// order. See [`Self::coalesce_copies`].
     pub fn with_register_groups(mut self, register_groups: &'a FxHashMap<RcLocal, usize>) -> Self {
         self.register_groups = Some(register_groups);
+        self
+    }
+
+    /// Lets in-place updates of a variable print as one (`offset += 1`).
+    pub fn with_live_self_updates(mut self, enabled: bool) -> Self {
+        self.live_self_updates = enabled;
         self
     }
 
@@ -671,6 +688,9 @@ impl<'a> Destructor<'a> {
 
         let phase = ast::telemetry::Span::new("SSA_VALUE_INTERFERENCE");
         self.compute_value_interference();
+        if !self.copy_captures.is_empty() {
+            self.alias_trivial_param_values();
+        }
         drop(phase);
 
         let phase = ast::telemetry::Span::new("SSA_COALESCE_MANDATORY");
@@ -680,6 +700,7 @@ impl<'a> Destructor<'a> {
         let phase = ast::telemetry::Span::new("SSA_COALESCE_COPIES");
         self.coalesce_copies();
         self.coalesce_dead_self_updates();
+        self.coalesce_live_self_updates();
         drop(phase);
         #[cfg(any(test, debug_assertions))]
         self.assert_captures_keep_their_values();
@@ -999,9 +1020,11 @@ impl<'a> Destructor<'a> {
             let dominators = crate::dominators::Dominators::new(self.function.graph(), self.function.entry().unwrap());
             let bound = self.function.graph().node_bound();
             self.dominator_children = vec![Vec::new(); bound];
+            self.dominator_parent = vec![None; bound];
             for node in self.function.graph().node_indices() {
                 if let Some(dominator) = dominators.immediate_dominator(node) {
                     self.dominator_children[dominator.index()].push(node);
+                    self.dominator_parent[node.index()] = Some(dominator);
                 }
             }
             self.dominators = vec![(0, 0); bound];
@@ -1071,9 +1094,12 @@ impl<'a> Destructor<'a> {
                 // A closure at any depth counts: `x = keep(function() ... end)`
                 // stores the closure before it can run, as `x = function() ...
                 // end` does.
-                if writes_local && self.function.may_hold_closures {
+                if self.function.may_hold_closures {
                     visit_value_captures(stat, &mut |local| {
-                        self.value_captures.insert((local.stable_id(), dominator_index, stat_index));
+                        if writes_local {
+                            self.value_captures.insert((local.stable_id(), dominator_index, stat_index));
+                        }
+                        self.copy_captures.entry(local.clone()).or_default().push((node, stat_index));
                     });
                 }
 
@@ -1359,6 +1385,87 @@ impl<'a> Destructor<'a> {
         }
     }
 
+    /// `v2 = v + 1` where the source updated one variable in place: the new
+    /// value reuses the operand's register and the operand is not read after
+    /// it (interference), so both versions can share one local and print as
+    /// `v += 1`. Standard copy-free coalescing, kept to simple update shapes
+    /// (`v op k`, `v or e`, `math.f(v, ...)`), to a result read at least twice
+    /// from an operand that is a parameter or read elsewhere too (a temporary
+    /// stays for `inline_temps` to fold), and away from every captured value.
+    fn coalesce_live_self_updates(&mut self) {
+        if !self.live_self_updates || self.register_groups.is_none() {
+            return;
+        }
+        let mut reads: FxHashMap<RcLocal, u32> = FxHashMap::default();
+        for (_, block) in self.function.blocks() {
+            for statement in block.iter() {
+                statement.visit_local_reads(&mut |read| {
+                    *reads.entry(read.clone()).or_default() += 1;
+                    true
+                });
+            }
+        }
+        let mut self_updates = Vec::new();
+        for (_, block) in self.function.blocks() {
+            for statement in block.iter() {
+                let ast::Statement::Assign(assign) = statement else { continue };
+                if assign.parallel || assign.left.len() != 1 || assign.right.len() != 1 {
+                    continue;
+                }
+                let Some(dst) = assign.left[0].as_local() else { continue };
+                if !self.local_last_use.contains_key(dst)
+                    || self.upvalues_in.contains(dst)
+                    || self.upvalue_to_group.contains_key(dst)
+                {
+                    continue;
+                }
+                let Some(operand) = update_operand(&assign.right[0]) else { continue };
+                let Some(group) = self.register_group(operand) else { continue };
+                // The result lands in the operand's register itself, or in a
+                // temporary that a copy coalesced with a version there
+                // (`MOVE R0 R2` after a call into R2).
+                let same_register = self.register_group(dst) == Some(group)
+                    || self.congruence_classes.get(dst).is_some_and(|class| {
+                        class.borrow().values().any(|version| self.register_group(version) == Some(group))
+                    });
+                if !same_register
+                    || self.upvalues_in.contains(operand)
+                    || self.upvalue_to_group.contains_key(operand)
+                {
+                    continue;
+                }
+                // The operand is the one version of the register the update reads.
+                let single = statement.visit_local_reads(&mut |read| self.register_group(read) != Some(group) || read == operand);
+                // A value read once, or an operand only this update reads, is a
+                // temporary `inline_temps` folds (`f(p - 1)`, `local v = g() or d`).
+                let read = |local: &RcLocal| reads.get(local).copied().unwrap_or(0);
+                let parameter = self.function.parameters.contains(operand);
+                if single && read(dst) >= 2 && (parameter || read(operand) >= 2) {
+                    self_updates.push((dst.clone(), operand.clone()));
+                }
+            }
+        }
+        self_updates.sort_by_key(|(dst, _)| self.local_defs.get(dst).map(|&(order, _, index)| (order, index)));
+        for (dst, operand) in self_updates {
+            if !dst.source_bindings_compatible(&operand) {
+                continue;
+            }
+            let update_class = self.get_congruence_class(dst).clone();
+            let operand_class = self.get_congruence_class(operand).clone();
+            if Rc::ptr_eq(&update_class, &operand_class)
+                || !operand_class.borrow().bindings().compatible(update_class.borrow().bindings())
+                || share_definition_point(&update_class.borrow(), &operand_class.borrow())
+                || operand_class.borrow().values().chain(update_class.borrow().values())
+                    .any(|version| self.upvalue_to_group.contains_key(version) || self.upvalues_in.contains(version))
+            {
+                continue;
+            }
+            if !self.check_interfere(&operand_class, &update_class) {
+                self.merge_congruence_classes(&operand_class, &update_class);
+            }
+        }
+    }
+
     fn try_coalesce_copy_by_value(&mut self, left: RcLocal, right: RcLocal) -> bool {
         if !left.source_bindings_compatible(&right) { return false; }
         let left_con_class = self.get_congruence_class(left).clone();
@@ -1454,6 +1561,9 @@ impl<'a> Destructor<'a> {
         red: &Rc<RefCell<CongruenceClass>>,
         blue: &Rc<RefCell<CongruenceClass>>,
     ) -> bool {
+        if self.breaks_copy_capture(red, blue) {
+            return true;
+        }
         let mut local_a = red.borrow().values().next().unwrap().clone();
         let mut local_b = blue.borrow().values().next().unwrap().clone();
         // assumes one of the blocks dominates the other
@@ -1517,13 +1627,137 @@ impl<'a> Destructor<'a> {
         }
     }
 
+    /// Whether joining `red` and `blue` gives a local a closure copies
+    /// another value later on the way out of the copy. Luau copies only a
+    /// variable nothing assigns again; printed with that write, the closure
+    /// would capture a cell and see it (`local final = cframe`, then `final
+    /// = cframe * offset`, joined to the copied `cframe`). A write in a loop
+    /// around the copy is the next iteration's, which the copy's own
+    /// snapshot local shows (`materialize_value_captures`).
+    fn breaks_copy_capture(&mut self, red: &Rc<RefCell<CongruenceClass>>, blue: &Rc<RefCell<CongruenceClass>>) -> bool {
+        if self.copy_captures.is_empty() {
+            return false;
+        }
+        let copies = |class: &Rc<RefCell<CongruenceClass>>| class.borrow().values().any(|local| self.copy_captures.contains_key(local));
+        if !copies(red) && !copies(blue) {
+            return false;
+        }
+        // A block parameter writes nothing: each edge's transport, a member
+        // too, writes its value, so neither it nor a copy of it is checked.
+        let merged_params = red.borrow().values().chain(blue.borrow().values())
+            .filter(|member| matches!(self.local_defs.get(*member), Some((_, _, ParamOrStatIndex::Param(_)))))
+            .filter_map(|member| self.copy_value(member))
+            .collect::<FxHashSet<_>>();
+        for (class, other) in [(red, blue), (blue, red)] {
+            let copied = class.borrow().values().filter(|local| self.copy_captures.contains_key(*local)).cloned().collect_vec();
+            for local in copied {
+                let value = self.copy_value(&local);
+                let others = other.borrow().values()
+                    .filter(|member| {
+                        let member_value = self.copy_value(member);
+                        (value.is_none() || member_value != value)
+                            && !member_value.is_some_and(|member_value| merged_params.contains(&member_value))
+                    })
+                    .cloned()
+                    .collect_vec();
+                for member in others {
+                    if self.defined_after_copy(&member, &local) {
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+
+    /// The value `local` holds, seen through trivial block parameters.
+    fn copy_value(&self, local: &RcLocal) -> Option<usize> {
+        let mut value = self.values.get(local).map(|class| Rc::as_ptr(class) as usize)?;
+        while let Some(&next) = self.value_alias.get(&value) {
+            value = next;
+        }
+        Some(value)
+    }
+
+    /// A block parameter every edge fills with one value or itself (a loop's
+    /// own version of a register it leaves alone, `φ(x, φ)`) holds that
+    /// value. Without this, a copied parameter could not join its loop
+    /// version ([`Self::breaks_copy_capture`]) and would print as a copy.
+    fn alias_trivial_param_values(&mut self) {
+        let blocks = self.function.graph().node_indices().collect_vec();
+        loop {
+            let mut changed = false;
+            for &node in &blocks {
+                let mut incoming = FxHashMap::<RcLocal, Vec<Option<RcLocal>>>::default();
+                for (_, edge) in self.function.edges_to_block(node) {
+                    for (param, argument) in &edge.arguments {
+                        incoming.entry(param.clone()).or_default().push(argument.as_local().cloned());
+                    }
+                }
+                for (param, arguments) in incoming {
+                    let Some(own) = self.copy_value(&param).filter(|_| !self.in_unstable_cell(&param)) else { continue };
+                    let mut value = None;
+                    let trivial = arguments.iter().all(|argument| {
+                        let Some(argument) = argument.as_ref().filter(|argument| !self.in_unstable_cell(argument)) else { return false };
+                        match self.copy_value(argument) {
+                            Some(found) if found == own => true,
+                            Some(found) if value.is_none_or(|value| value == found) => { value = Some(found); true }
+                            _ => false,
+                        }
+                    });
+                    if trivial && let Some(value) = value {
+                        self.value_alias.insert(own, value);
+                        changed = true;
+                    }
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
+    fn reachable_from(&mut self, node: NodeIndex) -> &FxHashSet<NodeIndex> {
+        if !self.reach.contains_key(&node) {
+            let mut reach = FxHashSet::default();
+            let mut stack = self.function.successor_blocks(node).collect_vec();
+            while let Some(next) = stack.pop() {
+                if reach.insert(next) {
+                    stack.extend(self.function.successor_blocks(next));
+                }
+            }
+            self.reach.insert(node, reach);
+        }
+        &self.reach[&node]
+    }
+
+    /// Whether `member` is defined after a closure copies `copied`, outside
+    /// any loop around both: later in the copying statement's block (the
+    /// statement itself included, as its closure reads what it wrote), or in
+    /// a block reachable from it that cannot reach it back.
+    fn defined_after_copy(&mut self, member: &RcLocal, copied: &RcLocal) -> bool {
+        let Some(&(_, block, position)) = self.local_defs.get(member) else { return true };
+        for (node, statement) in self.copy_captures[copied].clone() {
+            let later = if node == block {
+                matches!(position, ParamOrStatIndex::Stat(index) if index >= statement)
+            } else {
+                self.reachable_from(node).contains(&block)
+            };
+            if later && !self.reachable_from(block).contains(&node) {
+                return true;
+            }
+        }
+        false
+    }
+
     fn check_interfere(
         &mut self,
         red: &Rc<RefCell<CongruenceClass>>,
         blue: &Rc<RefCell<CongruenceClass>>,
     ) -> bool {
-        let mut dom = Vec::<(&RcLocal, RedOrBlue)>::new();
-
+        if self.breaks_copy_capture(red, blue) {
+            return true;
+        }
         let red = red.borrow();
         let blue = blue.borrow();
         // The walk below compares each member with the nearest member that
@@ -1552,75 +1786,102 @@ impl<'a> Destructor<'a> {
             }
             return false;
         }
-        let mut red_iter = red.iter().peekable();
-        let mut blue_iter = blue.iter().peekable();
-        let mut red_count = 0;
-        let mut blue_count = 0;
-
-        self.equal_ancestor_out.remove(red_iter.peek().unwrap().1);
-        self.equal_ancestor_out.remove(blue_iter.peek().unwrap().1);
-        // Keep the old per-iteration counter only as a test oracle. Release
-        // profiling derives exactly the consumed items from iterator lengths.
+        self.equal_ancestor_out.remove(red.values().next().unwrap());
+        self.equal_ancestor_out.remove(blue.values().next().unwrap());
+        // Members of both classes in dominator preorder, each compared with
+        // the nearest member that dominates it (the top of `dom`).
+        //
+        // Out-state made during this walk sits only on members some member
+        // of the smaller class dominates. So with none at the start, a member
+        // of the larger class met while no smaller-class member is on the
+        // stack is compared with its own class through absent out-state:
+        // nothing found, nothing changed. Those runs are skipped; a
+        // smaller-class member then takes the deepest larger-class member
+        // dominating it as its comparand, as the full walk would. A class
+        // grown one version or one small web at a time (a long `if` chain's
+        // phi web) is thus walked in its dominator depth, not its size.
+        let classes: [&CongruenceClass; 2] = [&red, &blue];
         #[cfg(test)]
-        let mut reference_visits = 0;
+        let skips = !copy_sharing_regressions::FULL_WALK.get();
+        #[cfg(not(test))]
+        let skips = true;
+        let small = (skips && self.equal_ancestor_out.is_empty() && !self.dominators.is_empty())
+            .then(|| usize::from(red.len() > blue.len()));
+        let mut members = classes.map(|class| class.range(..).peekable());
+        let mut counts = [0usize; 2];
+        let mut dom = Vec::<(&RcLocal, usize)>::new();
+        let mut visits = 0u64;
         loop {
-            #[cfg(test)]
-            { reference_visits += 1; }
-            let (curr, curr_class) = if blue_iter.peek().is_none()
-                || (red_iter.peek().is_some()
-                    && self.check_pre_dom_order(
-                        red_iter.peek().unwrap().1,
-                        blue_iter.peek().unwrap().1,
-                    )) {
-                red_count += 1;
-                (red_iter.next().unwrap().1, RedOrBlue::Red)
-            } else {
-                blue_count += 1;
-                (blue_iter.next().unwrap().1, RedOrBlue::Blue)
+            if let Some(small) = small
+                && counts[small] == 0
+                && let Some(&(&next, _)) = members[small].peek()
+                && members[1 - small].peek().is_some_and(|&(&key, _)| key < next)
+            {
+                members[1 - small] = classes[1 - small].range(next..).peekable();
+            }
+            visits += 1;
+            let [red_members, blue_members] = &mut members;
+            let side = match (red_members.peek(), blue_members.peek()) {
+                (Some(&(_, red)), Some(&(_, blue))) => usize::from(!self.check_pre_dom_order(red, blue)),
+                (Some(_), None) => 0,
+                _ => 1,
             };
+            let (_, curr) = members[side].next().unwrap();
 
-            while !dom.is_empty() && !self.dominates(dom.last().unwrap().0, curr) {
-                match dom.pop().unwrap().1 {
-                    RedOrBlue::Red => red_count -= 1,
-                    RedOrBlue::Blue => blue_count -= 1,
-                }
+            while let Some(&(top, top_side)) = dom.last()
+                && !self.dominates(top, curr)
+            {
+                dom.pop();
+                counts[top_side] -= 1;
+            }
+            if small == Some(side)
+                && let Some(ancestor) = self.deepest_dominating(classes[1 - side], curr)
+                && dom.last().is_none_or(|&(top, _)| self.check_pre_dom_order(top, ancestor))
+            {
+                dom.push((ancestor, 1 - side));
+                counts[1 - side] += 1;
             }
 
-            if !dom.is_empty()
-                && self.interference(
-                    curr,
-                    dom.last().unwrap().0,
-                    curr_class == dom.last().unwrap().1,
-                )
+            if let Some(&(top, top_side)) = dom.last()
+                && self.interference(curr, top, side == top_side)
             {
-                #[cfg(test)]
-                assert_eq!(red.len() - red_iter.len() + blue.len() - blue_iter.len(), reference_visits);
-                if ast::telemetry::enabled() {
-                    let visits = red.len() - red_iter.len() + blue.len() - blue_iter.len();
-                    ast::telemetry::count("destruct_interference_visits", visits as u64);
-                }
+                ast::telemetry::count("destruct_interference_visits", visits);
                 return true;
             }
 
-            dom.push((curr, curr_class));
+            dom.push((curr, side));
+            counts[side] += 1;
 
-            if (red_iter.peek().is_some() && blue_count > 0)
-                || (blue_iter.peek().is_some() && red_count > 0)
-                || (red_iter.peek().is_some() && blue_iter.peek().is_some())
+            let more = [members[0].peek().is_some(), members[1].peek().is_some()];
+            if (more[0] && counts[1] > 0) || (more[1] && counts[0] > 0) || (more[0] && more[1]) {
+                continue;
+            }
+            // A skipped larger-class member may still dominate `curr`.
+            if let Some(small) = small
+                && more[small]
+                && self.deepest_dominating(classes[1 - small], curr).is_some()
             {
                 continue;
             }
-
             break;
         }
 
-        #[cfg(test)]
-        assert_eq!(red.len() - red_iter.len() + blue.len() - blue_iter.len(), reference_visits);
-        if ast::telemetry::enabled() {
-            let visits = red.len() - red_iter.len() + blue.len() - blue_iter.len();
-            ast::telemetry::count("destruct_interference_visits", visits as u64);
-        }
+        ast::telemetry::count("destruct_interference_visits", visits);
         false
+    }
+
+    /// The member of `class` deepest in the dominator tree that dominates
+    /// `local`: earlier in its block, else in the nearest dominating block
+    /// holding one.
+    fn deepest_dominating<'c>(&self, class: &'c CongruenceClass, local: &RcLocal) -> Option<&'c RcLocal> {
+        let (dom_index, mut block, stat_index) = self.local_defs[local];
+        let mut found = class.range((dom_index, ParamOrStatIndex::Param(0))..(dom_index, stat_index)).next_back();
+        while found.is_none() {
+            block = self.dominator_parent[block.index()]?;
+            let index = self.dominators[block.index()].0;
+            found = class.range((index, ParamOrStatIndex::Param(0))..(index + 1, ParamOrStatIndex::Param(0))).next_back();
+        }
+        found.map(|(_, member)| member)
     }
 
     fn interference(&mut self, local_a: &RcLocal, local_b: &RcLocal, same_con_class: bool) -> bool {
@@ -1689,15 +1950,31 @@ impl<'a> Destructor<'a> {
         }
         let mut out_present = 0;
         let mut updates = 0;
-        for local in con_class_a.borrow().values() {
-            // Keep inspecting the complete class: failed interference attempts
-            // can leave relevant out-state on any member. Only omit writes
-            // that would reinstall the exact ancestor already held in `in`.
-            let Some(local_out) = self.equal_ancestor_out.get(local) else { continue; };
+        // Keep inspecting the complete class: failed interference attempts
+        // can leave relevant out-state on any member. Only the members with
+        // out-state can change, each on its own, so visit whichever of the
+        // class and the out-state is smaller: a phi web merged one version
+        // at a time would otherwise rescan its whole class per merge.
+        let class = con_class_a.borrow();
+        let members = if self.equal_ancestor_out.len() < class.len() {
+            self.equal_ancestor_out.iter()
+                .filter(|(local, _)| self.local_defs.get(*local)
+                    .is_some_and(|&(dom_index, _, stat_index)| class.get(&(dom_index, stat_index)) == Some(*local)))
+                .map(|(local, local_out)| (local.clone(), local_out.clone()))
+                .collect::<Vec<_>>()
+        } else {
+            class.values()
+                .filter_map(|local| Some((local.clone(), self.equal_ancestor_out.get(local)?.clone())))
+                .collect()
+        };
+        drop(class);
+        for (local, local_out) in members {
+            // Only omit writes that would reinstall the exact ancestor
+            // already held in `in`.
             out_present += 1;
-            if self.equal_ancestor_in.get(local).is_some_and(|local_in|
-                !self.check_pre_dom_order(local_in, local_out)) { continue; }
-            self.equal_ancestor_in.insert(local.clone(), local_out.clone());
+            if self.equal_ancestor_in.get(&local).is_some_and(|local_in|
+                !self.check_pre_dom_order(local_in, &local_out)) { continue; }
+            self.equal_ancestor_in.insert(local, local_out);
             updates += 1;
         }
         ast::telemetry::count("destruct_ancestor_out_present", out_present);
@@ -1934,6 +2211,15 @@ impl<'a> Destructor<'a> {
                     until not p
                     return v2, v1
                     */
+                    // A for step's edge into a body it alone enters runs exactly
+                    // when the body does: its copies open the body, as a split
+                    // block between the step and its body has no source spelling.
+                    if !is_unconditional && self.is_for_next(pred)
+                        && self.function.graph().neighbors_directed(node, petgraph::Direction::Incoming).count() == 1
+                    {
+                        self.function.block_mut(node).unwrap().insert(0, parallel_assign.into());
+                        continue;
+                    }
                     if !is_unconditional {
                         assign_block = self.function.new_block();
                         if self.is_for_next(self.function.graph().edge_endpoints(edge).unwrap().0) {
@@ -2053,6 +2339,99 @@ impl<'a> Destructor<'a> {
 #[cfg(test)]
 mod copy_sharing_regressions {
     use super::*;
+
+    thread_local! {
+        /// Makes [`Destructor::check_interfere`] walk every member.
+        pub(super) static FULL_WALK: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    /// Chains of diamonds whose blocks define literals and copies of the
+    /// values dominating them, with classes drawn at random: the walk that
+    /// skips the larger class must answer, and leave the ancestor state,
+    /// exactly as the walk over every member does.
+    #[test]
+    fn skipping_the_larger_class_matches_the_full_interference_walk() {
+        use ast::{Assign, If, Literal, RValue, Return};
+        let mut skipped_any = false;
+        for seed in 0..400u64 {
+            let mut state = seed;
+            let mut next = |bound: u64| {
+                state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                (state >> 33) % bound
+            };
+            let mut function = Function::new(0);
+            let entry = function.new_block();
+            function.set_entry(entry);
+            let flag = RcLocal::default();
+            function.parameters = vec![flag.clone()];
+            let mut locals = Vec::new();
+            // Values defined in blocks dominating every later one.
+            let mut dominating = vec![flag.clone()];
+            let mut define = |function: &mut Function, block, dominating: &mut Vec<RcLocal>, shared: bool, next: &mut dyn FnMut(u64) -> u64| {
+                let mut available = dominating.clone();
+                for _ in 0..1 + next(3) {
+                    let local = RcLocal::default();
+                    let value = if next(3) == 0 {
+                        RValue::Local(available[next(available.len() as u64) as usize].clone())
+                    } else {
+                        Literal::Number(next(4) as f64).into()
+                    };
+                    function.block_mut(block).unwrap().push(Assign::new(vec![local.clone().into()], vec![value]).into());
+                    available.push(local.clone());
+                    if shared {
+                        dominating.push(local.clone());
+                    }
+                    locals.push(local);
+                }
+            };
+            define(&mut function, entry, &mut dominating, true, &mut next);
+            let mut current = entry;
+            for _ in 0..2 + next(4) {
+                let [then_block, else_block, join] = std::array::from_fn(|_| function.new_block());
+                function.block_mut(current).unwrap().push(If::new(flag.clone().into(), Default::default(), Default::default()).into());
+                function.set_edges(current, vec![
+                    (then_block, BlockEdge::new(BranchType::Then)),
+                    (else_block, BlockEdge::new(BranchType::Else)),
+                ]);
+                for arm in [then_block, else_block] {
+                    define(&mut function, arm, &mut dominating.clone(), false, &mut next);
+                    function.set_edges(arm, vec![(join, BlockEdge::new(BranchType::Unconditional))]);
+                }
+                define(&mut function, join, &mut dominating, true, &mut next);
+                current = join;
+            }
+            let returned = locals.iter().filter(|_| next(3) != 0).cloned().map(Into::into).collect();
+            function.block_mut(current).unwrap().push(Return::new(returned).into());
+
+            let mut destructor = Destructor::new(&mut function, IndexMap::default(), FxHashSet::default(), locals.len());
+            destructor.liveness = Liveness::calculate(destructor.function);
+            destructor.build_def_use();
+            destructor.compute_value_interference();
+            let mut classes = locals.iter().map(|local| destructor.get_congruence_class(local.clone()).clone()).collect::<Vec<_>>();
+            for _ in 0..12 {
+                let red = classes[next(classes.len() as u64) as usize].clone();
+                let blue = classes[next(classes.len() as u64) as usize].clone();
+                if Rc::ptr_eq(&red, &blue) {
+                    continue;
+                }
+                skipped_any |= destructor.equal_ancestor_out.is_empty() && red.borrow().len() != blue.borrow().len();
+                let before = (destructor.equal_ancestor_in.clone(), destructor.equal_ancestor_out.clone());
+                FULL_WALK.set(true);
+                let full = destructor.check_interfere(&red, &blue);
+                FULL_WALK.set(false);
+                let full_state = (destructor.equal_ancestor_in.clone(), destructor.equal_ancestor_out.clone());
+                (destructor.equal_ancestor_in, destructor.equal_ancestor_out) = before;
+                let skipping = destructor.check_interfere(&red, &blue);
+                assert_eq!(full, skipping, "seed {seed}");
+                assert!(full_state == (destructor.equal_ancestor_in.clone(), destructor.equal_ancestor_out.clone()), "seed {seed}");
+                if !full {
+                    destructor.merge_congruence_classes(&red, &blue);
+                    classes.retain(|class| !Rc::ptr_eq(class, &blue));
+                }
+            }
+        }
+        assert!(skipped_any);
+    }
 
     #[test]
     fn compact_last_uses_match_hash_maps_for_sparse_blocks_and_repeated_reads() {
@@ -2381,5 +2760,33 @@ mod copy_sharing_regressions {
         }
         println!("REVIEW full SSA variants=40 failures={failures}");
         assert_eq!(failures, 0);
+    }
+}
+
+/// The local a simple in-place update reads: `v op k` / `k op v` for an
+/// arithmetic or concatenation operator and a literal or local `k`,
+/// `v or e`, or a `math` call taking `v` first (`math.clamp(v, 1, n)`).
+fn update_operand(value: &ast::RValue) -> Option<&RcLocal> {
+    use ast::BinaryOperation::*;
+    let simple = |value: &ast::RValue| matches!(value, ast::RValue::Literal(_) | ast::RValue::Local(_));
+    match value {
+        ast::RValue::Binary(binary) => match (binary.operation, binary.left.as_ref(), binary.right.as_ref()) {
+            (Add | Sub | Mul | Div | Mod | Pow | IDiv | Concat, ast::RValue::Local(operand), other)
+            | (Add | Mul | Concat, other, ast::RValue::Local(operand))
+                if simple(other) => Some(operand),
+            (Or, ast::RValue::Local(operand), _) => Some(operand),
+            _ => None,
+        },
+        ast::RValue::Call(call) | ast::RValue::Select(ast::Select::Call(call)) => {
+            let ast::RValue::Index(callee) = call.value.as_ref() else { return None };
+            let (ast::RValue::Global(library), ast::RValue::Literal(ast::Literal::String(_))) = (callee.left.as_ref(), callee.right.as_ref()) else {
+                return None;
+            };
+            match (library.0.as_slice(), call.arguments.first()) {
+                (b"math", Some(ast::RValue::Local(operand))) => Some(operand),
+                _ => None,
+            }
+        }
+        _ => None,
     }
 }

@@ -20,7 +20,8 @@ import time
 from bytecode_dataflow import compare_dataflow
 from bytecode_roundtrip import compare_chunks, parse_chunk
 from source_fidelity import compare_ast, conditional_count, parse_ast
-from output_quality import analyze_tree
+from output_quality import analyze_tree, readable_conditionals
+from expected_refusals import refusal_evidence
 
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -102,8 +103,20 @@ def check_case(args, case, root, work, opt, debug):
         bytecode = directory / "input.luaubc"
         bytecode.write_bytes(raw)
         command = [args.lifter, bytecode, "--strict-no-synthetic-control", *args.lifter_arg]
-        output, elapsed = checked(command, timeout=args.timeout)
+        decompiled, elapsed = run(command, timeout=args.timeout)
         row["decompile_seconds"] = elapsed
+        outcome = {"exit_code": decompiled.returncode,
+                   "stdout": decompiled.stdout.decode("utf-8", errors="replace"),
+                   "stderr": decompiled.stderr.decode("utf-8", errors="replace")}
+        profile = dict(opt=opt, debug=debug, bytecode_version=getattr(args, "bytecode_version", 9),
+                       compiler_flags=compiler_flags(args), lifter_args=args.lifter_arg)
+        refusal = refusal_evidence(case, row["source_sha256"], profile, outcome)
+        if refusal:
+            row.update(status="expected_refusal", refusal=refusal, output_bytes=0)
+            return row
+        if decompiled.returncode != 0:
+            raise RuntimeError(f"exit {decompiled.returncode}: {outcome['stderr'][:2000]}")
+        output = decompiled.stdout
         if not output.strip():
             raise RuntimeError("empty decompiler output")
         emitted = directory / "output.luau"
@@ -123,10 +136,11 @@ def check_case(args, case, root, work, opt, debug):
             row["source_fidelity"] = compare_ast(source_ast, output_ast)
             row["output_quality"] = analyze_tree(output_ast, output.decode('utf-8'))
             row["output_conditional_expressions"] = conditional_count(output_ast)
-            # `--style compact` writes scalar selects as if-expressions by design.
+            # Default permits only short atomic selects; compact also permits
+            # longer chains and non-atomic arms. Keep a real presentation gate.
             compact = any(arg in ("compact", "--style=compact") for arg in args.lifter_arg)
-            if row["output_conditional_expressions"] and not compact:
-                raise RuntimeError("statement output style gate failed")
+            if not compact and not readable_conditionals(output_ast, output.decode('utf-8')):
+                raise RuntimeError("readable if-expression style gate failed")
             if debug == 2 and "minimum_exact_names_g2" in case:
                 if row["source_fidelity"].get("exact_names", -1) < case["minimum_exact_names_g2"]:
                     raise RuntimeError("binding-aware debug-name recovery gate failed")
@@ -216,7 +230,7 @@ def main():
         args.keep.mkdir(parents=True, exist_ok=True)
     # A fresh child avoids stale output and never deletes caller-owned files.
     work = pathlib.Path(tempfile.mkdtemp(prefix="v2-", dir=args.keep))
-    report = {"schema_version": 1, "manifest_sha256": sha256(args.manifest),
+    report = {"schema_version": 1, "manifest_path": str(args.manifest.resolve()), "manifest_sha256": sha256(args.manifest),
               "compiler_commit_expected": manifest["compiler_commit"],
               "tools": {name: {"path": str(getattr(args, name)), "sha256": sha256(getattr(args, name))}
                         for name in ("compiler", "luau", "lifter")},
@@ -245,7 +259,8 @@ def main():
     args.report.parent.mkdir(parents=True, exist_ok=True)
     args.report.write_text(json.dumps(report, indent=2) + "\n", encoding="utf-8", newline="\n")
     print(json.dumps(report["summary"], indent=2))
-    return int(any(r["status"] != "passed" for r in [*rows, *report["controls"]]))
+    return int(any(r["status"] not in ("passed", "expected_refusal") for r in rows)
+               or any(r["status"] != "passed" for r in report["controls"]))
 
 
 if __name__ == "__main__":

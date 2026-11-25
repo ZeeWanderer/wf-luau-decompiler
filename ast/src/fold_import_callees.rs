@@ -1,11 +1,9 @@
 //! A callee read into a local before the arguments run, because they may
 //! run code: `local new = Vector2.new; ...; return new(f(x), g(y))`. Luau
 //! resolves a global path the script never assigns once, when it loads
-//! (`deinline_safety::CaptureSafety::constant_import`), and reads it again
-//! only after code calls getfenv/setfenv on the script's environment, which
-//! the output assumes no other script does (README, "Output and validation").
-//! The call may then name it in place: `Vector2.new(f(x), g(y))`, which
-//! compiles to the same read before the arguments.
+//! (`deinline_safety::CaptureSafety::constant_import`), so the call may name
+//! it in place: `Vector2.new(f(x), g(y))`. Other builtin imports fold only at
+//! an adjacent call whose evaluation-order proof preserves their lookup.
 use crate::{Block, LValue, RValue, RcLocal, Select, Statement, Traverse};
 
 pub fn fold_import_callees(body: &mut Block) {
@@ -13,39 +11,81 @@ pub fn fold_import_callees(body: &mut Block) {
     if census.dynamic_environment() {
         return;
     }
-    block(&mut body.0, &census);
+    block(&mut body.0, &census, true, false);
 }
 
-fn block(stmts: &mut Vec<Statement>, census: &crate::deinline_safety::CaptureSafety) {
+/// Normalize only imports newly admitted by the caller's exact-number spelling
+/// proof before helper patterns and candidate window lengths are cached.
+pub(crate) fn fold_literal_number_import_callees(body: &mut Block,
+    census: &crate::deinline_safety::CaptureSafety) -> bool {
+    if !census.literal_numbers() || !census.unique_function_bodies() || census.dynamic_environment() {
+        return false;
+    }
+    block(&mut body.0, census, true, true)
+}
+
+/// A specialized matching pattern owns its statement blocks, but closure
+/// literals still share their Function bodies with the real tree. Keep those
+/// untouched, and use the full module census for its remaining captured reads.
+pub(crate) fn fold_specialized_import_callees(stmts: &mut Vec<Statement>, census: &crate::deinline_safety::CaptureSafety) -> bool {
+    if census.dynamic_environment() { return false; }
+    block(stmts, census, false, false)
+}
+
+fn block(stmts: &mut Vec<Statement>, census: &crate::deinline_safety::CaptureSafety,
+    descend_functions: bool, literal_only: bool) -> bool {
+    let mut changed = false;
     for statement in stmts.iter_mut() {
-        nested_blocks(statement, &mut |nested| block(nested, census));
-        statement.traverse_rvalues(&mut |value| {
-            if let RValue::Closure(closure) = value {
-                block(&mut closure.function.0.lock().body.0, census);
-            }
-        });
+        nested_blocks(statement, &mut |nested| { changed |= block(nested, census, descend_functions, literal_only); });
+        if descend_functions {
+            statement.traverse_rvalues(&mut |value| {
+                if let RValue::Closure(closure) = value {
+                    changed |= block(&mut closure.function.0.lock().body.0, census, true, literal_only);
+                }
+            });
+        }
     }
     let mut i = 0;
     while i < stmts.len() {
-        if let Some((alias, path)) = import_alias(&stmts[i], census)
+        if let Some((alias, path)) = import_alias(&stmts[i])
+            && (!literal_only || !alias.preserve_binding())
             && crate::deinline::count_local_reads(&stmts[i + 1..], &alias) == 1
             && !written(&stmts[i + 1..], &alias)
-            && name_callee(&mut stmts[i + 1..], &alias, &path)
+            && if !literal_only && census.constant_import(&path) {
+                // Resolved once when the script loads, it names the same value at any later call.
+                stmts[i + 1..].iter_mut().any(|statement| name_callee(statement, &alias, &path))
+            } else {
+                // shortcut: only cross comments/empty statements; extend with an explicit intervening-motion proof.
+                (i + 1..stmts.len()).find(|&at| !matches!(stmts[at], Statement::Comment(_) | Statement::Empty(_)))
+                    .is_some_and(|next| can_fold(&stmts[next], &alias, &path, census, literal_only)
+                        && name_callee(&mut stmts[next], &alias, &path))
+            }
         {
             stmts.remove(i);
+            changed = true;
             continue;
         }
         i += 1;
     }
+    changed
 }
 
-/// `local alias = Global.path`, a constant import.
-fn import_alias(statement: &Statement, census: &crate::deinline_safety::CaptureSafety) -> Option<(RcLocal, RValue)> {
+fn can_fold(statement: &Statement, alias: &RcLocal, path: &RValue,
+    census: &crate::deinline_safety::CaptureSafety, literal_only: bool) -> bool {
+    let captured = |local: &RcLocal| !census.uncaptured(local);
+    let ordinary = crate::evaluation_order::can_sink(statement, alias, path, &captured);
+    if literal_only {
+        !ordinary && crate::evaluation_order::can_sink_with_literal_numbers(statement, alias, path, &captured)
+    } else { ordinary }
+}
+
+/// Restrict this presentation pass to builtin names; this is no purity proof.
+fn import_alias(statement: &Statement) -> Option<(RcLocal, RValue)> {
     let Statement::Assign(assign) = statement else { return None };
     let ([LValue::Local(alias)], [path]) = (assign.left.as_slice(), assign.right.as_slice()) else {
         return None;
     };
-    (assign.prefix && census.constant_import(path)).then(|| (alias.clone(), path.clone()))
+    (assign.prefix && crate::deinline_safety::library_import(path)).then(|| (alias.clone(), path.clone()))
 }
 
 fn written(stmts: &[Statement], local: &RcLocal) -> bool {
@@ -56,7 +96,7 @@ fn written(stmts: &[Statement], local: &RcLocal) -> bool {
 
 /// Replaces the call of `alias` outside closures with a call of `path`;
 /// false if `alias` is not called there.
-fn name_callee(stmts: &mut [Statement], alias: &RcLocal, path: &RValue) -> bool {
+fn name_callee(statement: &mut Statement, alias: &RcLocal, path: &RValue) -> bool {
     let rename = |call: &mut crate::Call| {
         let calls_alias = matches!(&*call.value, RValue::Local(local) if local == alias);
         if calls_alias {
@@ -64,26 +104,18 @@ fn name_callee(stmts: &mut [Statement], alias: &RcLocal, path: &RValue) -> bool 
         }
         calls_alias
     };
-    for statement in stmts {
-        let mut done = match statement {
-            Statement::Call(call) => rename(call),
-            _ => false,
-        };
-        if !done {
-            statement.traverse_rvalues(&mut |value| {
-                if !done && let RValue::Call(call) | RValue::Select(Select::Call(call)) = value {
-                    done = rename(call);
-                }
-            });
-        }
-        if !done {
-            nested_blocks(statement, &mut |nested| done = done || name_callee(nested, alias, path));
-        }
-        if done {
-            return true;
-        }
+    let mut done = match statement {
+        Statement::Call(call) => rename(call),
+        _ => false,
+    };
+    if !done {
+        statement.traverse_rvalues(&mut |value| {
+            if !done && let RValue::Call(call) | RValue::Select(Select::Call(call)) = value {
+                done = rename(call);
+            }
+        });
     }
-    false
+    done
 }
 
 fn nested_blocks(statement: &mut Statement, visit: &mut impl FnMut(&mut Vec<Statement>)) {
@@ -129,8 +161,153 @@ mod tests {
     #[test]
     fn an_import_read_once_as_a_callee_is_named_in_place() {
         let (new, declaration) = alias("new");
+        let value = Call::new(new.into(), vec![Literal::Number(1.0).into()]).into();
+        let output = run(vec![declaration, Return::new(vec![value]).into()]);
+        assert_eq!(output, "return Vector2.new(1)");
+    }
+
+    #[test]
+    fn literal_number_import_normalization_is_explicit_and_narrow() {
+        for literal_numbers in [false, true] {
+            for number in [1.0, std::f64::consts::PI, -std::f64::consts::PI, f64::INFINITY, f64::NEG_INFINITY, f64::NAN] {
+                let saved = RcLocal::default();
+                let path = Index::new(Global::from("math").into(), Literal::String(b"max".to_vec()).into()).into();
+                let mut declaration = Assign::new(vec![saved.clone().into()], vec![path]);
+                declaration.prefix = true;
+                let mut body = Block(vec![declaration.into(),
+                    Return::new(vec![Call::new(saved.into(), vec![Literal::Number(number).into()]).into()]).into()]);
+                let before = body.to_string();
+                let census = crate::deinline_safety::CaptureSafety::new(&body).with_literal_numbers(literal_numbers);
+                let expected = literal_numbers && number != 1.0;
+                assert_eq!(fold_literal_number_import_callees(&mut body, &census), expected);
+                if expected {
+                    assert_eq!(body.len(), 1);
+                    assert!(body.to_string().contains("return math.max("));
+                } else { assert_eq!(body.to_string(), before); }
+            }
+        }
+    }
+
+    #[test]
+    fn literal_number_import_normalization_keeps_unproved_snapshots() {
+        for mode in ["key_error", "effect", "protected", "reused", "written", "environment", "shared", "budget"] {
+            let saved = RcLocal::default();
+            if mode == "protected" { saved.0.0.lock().4.conditional_result = true; }
+            let path = Index::new(Global::from("string").into(), Literal::String(b"format".to_vec()).into()).into();
+            let mut declaration = Assign::new(vec![saved.clone().into()], vec![path]);
+            declaration.prefix = true;
+            let argument = match mode {
+                "key_error" => crate::Table::new(vec![(Some(Literal::Number(f64::NAN).into()), Literal::Nil.into())]).into(),
+                "effect" => Call::new(Global::from("change").into(), vec![]).into(),
+                _ => Literal::Number(std::f64::consts::PI).into(),
+            };
+            let mut body = Block(vec![declaration.into(),
+                Return::new(vec![Call::new(saved.clone().into(), vec![argument]).into()]).into()]);
+            match mode {
+                "reused" => body.0.push(Return::new(vec![saved.clone().into()]).into()),
+                "written" => body.0.push(Assign::new(vec![saved.into()], vec![Literal::Nil.into()]).into()),
+                "environment" => body.0.push(Call::new(Global::from("getfenv").into(), vec![]).into()),
+                "shared" => {
+                    let closure = Closure { node_origin: Default::default(),
+                        function: ByAddress(Arc::new(Mutex::new(Function::default()))), upvalues: vec![] };
+                    body.0.push(Return::new(vec![closure.clone().into(), closure.into()]).into());
+                }
+                _ => {}
+            }
+            let before = body.to_string();
+            let census = if mode == "budget" { crate::deinline_safety::CaptureSafety::exhausted_for_tests() }
+                else { crate::deinline_safety::CaptureSafety::new(&body) }.with_literal_numbers(true);
+            assert!(!fold_literal_number_import_callees(&mut body, &census), "{mode}");
+            assert_eq!(body.to_string(), before, "{mode}");
+        }
+    }
+
+    #[test]
+    fn a_constant_import_is_named_past_effectful_or_captured_arguments() {
+        // Resolved when the script loads, the callee reads the same value after them.
+        let (new, declaration) = alias("new");
         let output = run(vec![declaration, Return::new(vec![call(&new)]).into()]);
-        assert_eq!(output, "return Vector2.new(f())");
+        assert!(output.starts_with("return Vector2.new("), "{output}");
+
+        let (new, declaration) = alias("new");
+        let cell = RcLocal::new(Local::new(Some("cell".into())));
+        let writer = Function { body: Block(vec![
+            Assign::new(vec![cell.clone().into()], vec![Literal::Number(20.0).into()]).into(),
+        ]), ..Default::default() };
+        let closure = Closure { node_origin: Default::default(),
+            function: ByAddress(Arc::new(Mutex::new(writer))), upvalues: vec![crate::Upvalue::Ref(cell.clone())] };
+        let value = Call::new(new.into(), vec![cell.into()]).into();
+        let output = run(vec![declaration, Return::new(vec![value, closure.into()]).into()]);
+        assert!(output.starts_with("return Vector2.new(cell)"), "{output}");
+    }
+
+    #[test]
+    fn specialized_import_folding_uses_the_full_capture_census() {
+        let cell = RcLocal::new(Local::new(Some("cell".into())));
+        let writer = Closure { node_origin: Default::default(),
+            function: ByAddress(Arc::new(Mutex::new(Function {
+                body: Block(vec![Assign::new(vec![cell.clone().into()], vec![Literal::Number(20.0).into()]).into()]),
+                ..Default::default()
+            }))), upvalues: vec![crate::Upvalue::Ref(cell.clone())] };
+        let module = Block(vec![Return::new(vec![writer.into()]).into()]);
+        let census = crate::deinline_safety::CaptureSafety::new(&module);
+        // A constant import reads the same value past any argument.
+        for (argument, allowed) in [
+            (Literal::Number(1.0).into(), true),
+            (cell.into(), true),
+            (Global::from("external").into(), true),
+            (Call::new(Global::from("change").into(), vec![]).into(), true),
+        ] {
+            let (new, declaration) = alias("new");
+            let mut pattern = vec![declaration, Return::new(vec![Call::new(new.into(), vec![argument]).into()]).into()];
+            let before = format!("{pattern:?}");
+            assert_eq!(fold_specialized_import_callees(&mut pattern, &census), allowed);
+            if !allowed { assert_eq!(format!("{pattern:?}"), before); }
+        }
+        let (new, declaration) = alias("new");
+        let mut pattern = vec![declaration, Return::new(vec![Call::new(new.into(), vec![Literal::Number(1.0).into()]).into()]).into()];
+        assert!(!fold_specialized_import_callees(&mut pattern,
+            &crate::deinline_safety::CaptureSafety::exhausted_for_tests()));
+        assert_eq!(pattern.len(), 2);
+    }
+
+    #[test]
+    fn specialized_import_folding_owns_blocks_but_never_changes_shared_functions() {
+        let make_body = || {
+            let (new, declaration) = alias("new");
+            Block(vec![declaration, Return::new(vec![Call::new(new.into(), vec![Literal::Number(1.0).into()]).into()]).into()])
+        };
+        let function = ByAddress(Arc::new(Mutex::new(Function { body: make_body(), ..Default::default() })));
+        let closure = Closure { node_origin: Default::default(), function: function.clone(), upvalues: vec![] };
+        let original = Block(vec![crate::If::new(Global::from("condition").into(),
+            make_body(), Block(vec![Return::new(vec![closure.into()]).into()])).into()]);
+        let census = crate::deinline_safety::CaptureSafety::new(&original);
+        let before = original.to_string();
+        let function_before = function.lock().body.to_string();
+        let mut pattern = crate::deinline::canon(&original.0);
+        assert!(fold_specialized_import_callees(&mut pattern, &census));
+        assert_eq!(original.to_string(), before);
+        assert_eq!(function.lock().body.to_string(), function_before);
+        assert!(Block(pattern).to_string().contains("return Vector2.new(1)"));
+    }
+
+    #[test]
+    fn a_constant_import_crosses_statements_but_not_into_blocks_or_past_a_module_write() {
+        for mode in ["lookup", "mutation", "branch"] {
+            let (new, declaration) = alias("new");
+            let result = Return::new(vec![Call::new(new.into(), vec![Literal::Number(1.0).into()]).into()]).into();
+            let statements = match mode {
+                "branch" => vec![declaration, crate::If::new(Global::from("flag").into(), Block(vec![result]), Block::default()).into()],
+                "mutation" => {
+                    let path = Index::new(Global::from("Vector2").into(), Literal::String(b"new".to_vec()).into());
+                    vec![declaration, Assign::new(vec![path.into()], vec![Literal::Nil.into()]).into(), result]
+                }
+                _ => vec![declaration, Call::new(Global::from("observe").into(), vec![]).into(), result],
+            };
+            let output = run(statements);
+            // shortcut: a call inside a nested block keeps its alias; fold there when it shows up in output.
+            assert_eq!(output.starts_with("local new = Vector2.new"), mode != "lookup", "{output}");
+        }
     }
 
     #[test]

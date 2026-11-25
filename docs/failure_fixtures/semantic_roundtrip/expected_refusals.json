@@ -1,0 +1,6 @@
+{
+  "schema_version": 1,
+  "compiler_commit": "c2ec0d4e5ca50796ba174a7565298f59aa572268",
+  "contract": "Reviewed source/profile refusals retain their denominator and never count as runtime passes. A successful recovery must pass the ordinary checks. Any new source, option or diagnostic failure requires review.",
+  "cases": []
+}
